@@ -1,0 +1,148 @@
+# CI workflow for NET_DELAYACCT
+# NOTE: This file is authored at ci/ci.yml per project layout.
+# To enable it on GitHub, symlink or copy it to .github/workflows/ci.yml.
+name: net-delayacct-ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+env:
+  KERNEL_TAG: v6.6
+  LINUX_SRC: ${{ github.workspace }}/linux-6.6
+
+jobs:
+  checkpatch:
+    name: checkpatch on kernel patches
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libelf-dev libssl-dev \
+            bison flex libncurses-dev libmnl-dev ccache perl
+
+      - name: Checkout linux-stable (shallow)
+        run: |
+          git clone --depth 1 --branch "$KERNEL_TAG" \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            "$LINUX_SRC"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ccache
+            ~/.cache/ccache
+          key: ccache-checkpatch-${{ runner.os }}-${{ env.KERNEL_TAG }}
+
+      - name: Run checkpatch.pl on patches
+        run: |
+          set -e
+          cp_dir="$LINUX_SRC/scripts"
+          fail=0
+          shopt -s nullglob
+          patches=(kernel-patches/*.patch)
+          if [ "${#patches[@]}" -eq 0 ]; then
+            echo "No patches found in kernel-patches/, skipping."
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo "::group::checkpatch $p"
+            if ! perl "$cp_dir/checkpatch.pl" --no-tree --strict -f "$p"; then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$fail"
+
+  build-kernel:
+    name: Build kernel with CONFIG_NET_DELAYACCT
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libelf-dev libssl-dev \
+            bison flex libncurses-dev libmnl-dev ccache bc
+
+      - name: Checkout linux-stable (shallow)
+        run: |
+          git clone --depth 1 --branch "$KERNEL_TAG" \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            "$LINUX_SRC"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ccache
+            ~/.cache/ccache
+          key: ccache-kernel-${{ runner.os }}-${{ env.KERNEL_TAG }}-${{ hashFiles('kernel-patches/*.patch', 'ci/kernel.config.fragment') }}
+          restore-keys: |
+            ccache-kernel-${{ runner.os }}-${{ env.KERNEL_TAG }}-
+
+      - name: Apply kernel patches
+        run: |
+          set -e
+          cd "$LINUX_SRC"
+          shopt -s nullglob
+          patches=("$GITHUB_WORKSPACE"/kernel-patches/*.patch)
+          if [ "${#patches[@]}" -eq 0 ]; then
+            echo "No patches to apply."
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo "Applying $p"
+            git apply "$p" || patch -p1 < "$p"
+          done
+
+      - name: Configure kernel with fragment
+        run: |
+          cd "$LINUX_SRC"
+          make defconfig
+          scripts/kconfig/merge_config.sh -m .config \
+            "$GITHUB_WORKSPACE/ci/kernel.config.fragment"
+          make olddefconfig
+          grep -E 'CONFIG_(NET|NET_DELAYACCT)=' .config || true
+
+      - name: Build kernel
+        run: |
+          cd "$LINUX_SRC"
+          make -j"$(nproc)" CC="ccache gcc" bzImage modules
+
+  build-tool:
+    name: Build userspace get_sockdelays
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libmnl-dev ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ccache
+            ~/.cache/ccache
+          key: ccache-tool-${{ runner.os }}
+
+      - name: Build tool
+        run: make tool CC="ccache gcc"
+
+      - name: Smoke test binary
+        run: |
+          test -x userspace/get_sockdelays/get_sockdelays
+          ./userspace/get_sockdelays/get_sockdelays -h || true

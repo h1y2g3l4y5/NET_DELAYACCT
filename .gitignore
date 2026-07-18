@@ -1,0 +1,79 @@
+# Object files / 编译产物
+*.o
+*.o.d
+*.obj
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.symvers
+*.order
+
+# Kernel build artifacts / 内核构建产物
+.tmp_versions/
+vmlinux
+vmlinux.a
+vmlinux.o
+vmlinux.symvers
+bzImage
+zImage
+vmlinuz
+modules.order
+Module.symvers
+modules.builtin
+modules.builtin.modinfo
+*.dtb
+*.dtb.S
+
+# Userspace tool binary / 用户态工具产物
+userspace/get_sockdelays/get_sockdelays
+get_sockdelays
+
+# Build directories / 构建目录
+build/
+out/
+build-*/
+
+# Editor swap & backup files / 编辑器交换与备份文件
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+
+# IDE files / IDE 配置
+.vscode/
+.idea/
+*.iml
+.project
+.cproject
+.settings/
+.cache/
+.clangd
+compile_commands.json
+
+# OS files / 操作系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python / Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test reports & logs / 测试报告与日志
+tests/reports/*.log
+tests/reports/*.xml
+tests/reports/*.json
+tests/reports/*.txt
+*.log
+test-results/
+*.tap
+
+# Patch artifacts / 补丁中间产物
+*.patch.rej
+*.patch.orig

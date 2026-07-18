@@ -1,0 +1,2 @@
+# Add this line to net/core/Makefile, near other obj-$(CONFIG_*) lines.
+obj-$(CONFIG_NET_DELAYACCT) += net-delayacct.o

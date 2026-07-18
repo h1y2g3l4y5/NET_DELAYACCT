@@ -1,0 +1,64 @@
+/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
+/* Copyright (c) 2026 h1y2g3l4y5 */
+#ifndef _UAPI_LINUX_NET_DELAYACCT_H
+#define _UAPI_LINUX_NET_DELAYACCT_H
+
+#include <linux/types.h>
+
+/**
+ * struct net_delayacct_stats - per-socket delay accounting statistics
+ * @rx_total_ns: cumulative receive latency in nanoseconds
+ * @rx_count:    number of received packets accounted
+ * @tx_total_ns: cumulative send latency in nanoseconds
+ * @tx_count:    number of sent packets accounted
+ *
+ * RX latency is measured from the time a packet enters the network stack
+ * (typically at __netif_receive_skb_core) until a process reads it into
+ * user space (via tcp_recvmsg / __skb_recv_udp).
+ *
+ * TX latency is measured from the time a process calls send/sendmsg
+ * (entering tcp_sendmsg / udp_sendmsg) until the packet reaches the
+ * network device driver (via dev_hard_start_xmit).
+ *
+ * Average latency for a socket is computed as total_ns / count.
+ */
+struct net_delayacct_stats {
+	__u64 rx_total_ns;
+	__u64 rx_count;
+	__u64 tx_total_ns;
+	__u64 tx_count;
+};
+
+/* Generic Netlink commands */
+enum {
+	NET_DELAYACCT_CMD_UNSPEC,
+	NET_DELAYACCT_CMD_GET_BY_PID,	/* attr: NET_DELAYACCT_A_PID (u32) */
+	NET_DELAYACCT_CMD_GET_BY_INODE,	/* attr: NET_DELAYACCT_A_INODE (u64) */
+	NET_DELAYACCT_CMD_RESET,
+
+	__NET_DELAYACCT_CMD_MAX,
+};
+#define NET_DELAYACCT_CMD_MAX		(__NET_DELAYACCT_CMD_MAX - 1)
+
+/* Generic Netlink attributes */
+enum {
+	NET_DELAYACCT_A_UNSPEC,
+	NET_DELAYACCT_A_TYPE,		/* u8: IPPROTO_TCP / IPPROTO_UDP */
+	NET_DELAYACCT_A_LADDR,		/* binary: in_addr or in6_addr */
+	NET_DELAYACCT_A_LPORT,		/* u16, host byte order */
+	NET_DELAYACCT_A_RADDR,		/* binary: in_addr or in6_addr */
+	NET_DELAYACCT_A_RPORT,		/* u16, host byte order */
+	NET_DELAYACCT_A_COMM,		/* string: task comm */
+	NET_DELAYACCT_A_PID,		/* u32: owning PID */
+	NET_DELAYACCT_A_RX_TOTAL_NS,	/* u64 */
+	NET_DELAYACCT_A_RX_COUNT,	/* u64 */
+	NET_DELAYACCT_A_TX_TOTAL_NS,	/* u64 */
+	NET_DELAYACCT_A_TX_COUNT,	/* u64 */
+	NET_DELAYACCT_A_INODE,		/* u64: socket inode */
+	NET_DELAYACCT_A_FAMILY,		/* u8: AF_INET / AF_INET6 */
+
+	__NET_DELAYACCT_A_MAX,
+};
+#define NET_DELAYACCT_A_MAX		(__NET_DELAYACCT_A_MAX - 1)
+
+#endif /* _UAPI_LINUX_NET_DELAYACCT_H */

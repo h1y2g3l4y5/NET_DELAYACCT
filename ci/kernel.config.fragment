@@ -1,0 +1,8 @@
+# Kernel config fragment for NET_DELAYACCT
+# Merge into .config via:
+#   scripts/kconfig/merge_config.sh -m .config ci/kernel.config.fragment
+#
+# Dependencies: CONFIG_NET is the base networking subsystem and is required.
+
+CONFIG_NET=y
+CONFIG_NET_DELAYACCT=y

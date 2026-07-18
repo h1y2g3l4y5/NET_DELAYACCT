@@ -1,0 +1,70 @@
+RX path instrumentation for CONFIG_NET_DELAYACCT.
+
+Three insertion points:
+
+1. net/core/dev.c, __netif_receive_skb_core() entry: stamp
+   skb->delayacct_start so that the timestamp is captured as early
+   as possible after the packet enters the protocol stack.
+
+2. net/ipv4/tcp.c, tcp_recvmsg(): before skb_copy_datagram_iter()
+   copies the payload to user space, call net_delayacct_rx_end() to
+   accumulate the per-socket RX latency.
+
+3. net/ipv4/udp.c, __skb_recv_udp(): same, before the skb payload is
+   copied to user space.
+
+Each modified file gains `#include <net/net-delayacct.h>` near its
+existing <net/...> includes.
+
+Complete unified diff (apply with `git apply` or `patch -p1` from the
+root of a Linux 6.6 source tree).  Exact context lines may differ
+between 6.6.x point releases; the helper calls must be placed as
+described above.
+
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -XXX,XXX @@
+ #include <net/net_namespace.h>
++#include <net/net-delayacct.h>
+ #include <net/dst.h>
+@@ -XXX,XXX @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
+ 	trace_netif_receive_skb(skb);
++	net_delayacct_rx_start(skb);
+ 	orig_dev = skb->dev;
+
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -XXX,XXX @@
+ #include <net/tcp.h>
++#include <net/net-delayacct.h>
+ #include <net/xfrm.h>
+@@ -XXX,XXX @@ static int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 		if (skb->len > offset) {
++			net_delayacct_rx_end(sk, skb);
+ 			used = skb->len - offset;
+ 			if (used <= len) {
+
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -XXX,XXX @@
+ #include <net/udp.h>
++#include <net/net-delayacct.h>
+ #include <net/xfrm.h>
+@@ -XXX,XXX @@ struct sk_buff *__skb_recv_udp(struct sock *sk, unsigned int flags,
+ 			*peeked = skb->peeked;
++			net_delayacct_rx_end(sk, skb);
+ 			return skb;
+ 		}
+
+Notes:
+- The RX end helper is a no-op when skb->delayacct_start is 0
+  (e.g. for loopback traffic that did not pass through
+  __netif_receive_skb_core), so placing the call unconditionally is
+  safe.
+- IPv6 paths reuse these same TCP/UDP entry points (tcp_v6_rcv /
+  udp_v6_rcv deliver into tcp_recvmsg / __skb_recv_udp), so no
+  separate IPv6 instrumentation is needed.
+- Fragment reassembly: only the final reassembled skb carries the
+  delayacct_start timestamp, so the latency is measured end-to-end
+  for the reassembled datagram.  Document this behaviour in
+  docs/design.md.

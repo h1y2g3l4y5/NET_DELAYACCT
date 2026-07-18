@@ -1,0 +1,19 @@
+# Add this block to net/Kconfig, near other net options (e.g., after
+# the top-level "config NET" block).
+
+config NET_DELAYACCT
+	bool "Per-socket network delay accounting"
+	depends on NET
+	default n
+	help
+	  This option enables per-socket network delay accounting, which
+	  measures the receive latency (from packet entering the network
+	  stack to a process reading it to user space) and send latency
+	  (from a process calling send/sendmsg to the packet reaching the
+	  network device driver) for each TCP/UDP socket.
+
+	  The accumulated statistics can be queried via the generic
+	  netlink "net_delayacct" family, either by PID or by socket
+	  inode, using the user-space tool get_sockdelays.
+
+	  If unsure, say N.
