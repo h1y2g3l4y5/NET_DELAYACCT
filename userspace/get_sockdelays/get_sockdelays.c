@@ -83,7 +83,7 @@ static int resolve_family_id(struct mnl_socket *nl)
 {
 	char buf[MNL_SOCKET_BUFFER_SIZE];
 	struct nlmsghdr *nlh;
-	unsigned int seq, portid;
+	unsigned int seq;
 	int ret;
 
 	nlh = mnl_nlmsg_put_header(buf);
@@ -98,7 +98,6 @@ static int resolve_family_id(struct mnl_socket *nl)
 
 	mnl_attr_put_strz(nlh, CTRL_ATTR_FAMILY_NAME, NET_DELAYACCT_GENL_NAME);
 
-	portid = mnl_socket_get_portid(nl);
 	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
 		perror("mnl_socket_sendto");
 		return -errno;
@@ -132,7 +131,7 @@ static int resolve_family_id(struct mnl_socket *nl)
 	mnl_attr_for_each(attr, nlh, GENL_HDRLEN) {
 		if (mnl_attr_type_valid(attr, CTRL_ATTR_MAX) < 0)
 			continue;
-		if (mnl_attr_type(attr) == CTRL_ATTR_FAMILY_ID) {
+		if (mnl_attr_get_type(attr) == CTRL_ATTR_FAMILY_ID) {
 			if (mnl_attr_validate(attr, MNL_TYPE_U16) < 0)
 				return -EINVAL;
 			return mnl_attr_get_u16(attr);
@@ -187,7 +186,7 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 	__u8 family = 0, proto = 0;
 	__u16 lport = 0, rport = 0;
 	__u32 pid = 0;
-	__u64 inode = 0, rx_total = 0, rx_count = 0, tx_total = 0, tx_count = 0;
+	uint64_t inode = 0, rx_total = 0, rx_count = 0, tx_total = 0, tx_count = 0;
 	const void *laddr = NULL, *raddr = NULL;
 	int laddr_len = 0, raddr_len = 0;
 
@@ -202,7 +201,7 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 
 	genl = mnl_nlmsg_get_payload(nlh);
 	mnl_attr_for_each(attr, nlh, GENL_HDRLEN) {
-		switch (mnl_attr_type(attr)) {
+		switch (mnl_attr_get_type(attr)) {
 		case NET_DELAYACCT_A_TYPE:
 			proto = mnl_attr_get_u8(attr); break;
 		case NET_DELAYACCT_A_FAMILY:
