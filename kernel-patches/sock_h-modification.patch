@@ -28,7 +28,7 @@ index a6944844553a..8965e4ec7d5f 100644
  #include <uapi/linux/socket.h>
 @@ -434,6 +435,9 @@ struct sock {
  	int			sk_disconnects;
- 
+
  	struct sk_filter __rcu	*sk_filter;
 +#ifdef CONFIG_NET_DELAYACCT
 +	struct net_delayacct	sk_net_delayacct;
@@ -36,6 +36,4 @@ index a6944844553a..8965e4ec7d5f 100644
  	union {
  		struct socket_wq __rcu	*sk_wq;
  		/* private: */
--- 
-2.34.1
 

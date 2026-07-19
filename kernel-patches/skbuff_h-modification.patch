@@ -31,6 +31,4 @@ index 1a91645fa249..3ab9b676fe51 100644
  	/*
  	 * This is the control buffer. It is free to use for every
  	 * layer. Please put your private variables there. If you
--- 
-2.34.1
 

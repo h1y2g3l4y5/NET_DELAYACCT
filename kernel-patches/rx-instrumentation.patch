@@ -29,13 +29,13 @@ index 405b448bd91f..3edf7f85b16d 100644
  #include <net/gro.h>
  #include <net/pkt_sched.h>
 @@ -5446,6 +5447,8 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
- 
+
  	trace_netif_receive_skb(skb);
- 
+
 +	net_delayacct_rx_start(skb);
 +
  	orig_dev = skb->dev;
- 
+
  	skb_reset_network_header(skb);
 diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
 index 5b1fbb0ca2ff..5528207c569c 100644
@@ -50,7 +50,7 @@ index 5b1fbb0ca2ff..5528207c569c 100644
  #include <net/xfrm.h>
  #include <net/ip.h>
 @@ -2504,6 +2505,7 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
- 
+
  found_ok_skb:
  		/* Ok so how much can we use? */
 +		net_delayacct_rx_end(sk, skb);
@@ -72,12 +72,10 @@ index 384b9f0f8a15..d027957923a4 100644
 @@ -1838,6 +1839,8 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
  	if (!skb)
  		return err;
- 
+
 +	net_delayacct_rx_end(sk, skb);
 +
  	ulen = udp_skb_len(skb);
  	copied = len;
  	if (copied > ulen - off)
--- 
-2.34.1
 
