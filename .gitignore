@@ -27,7 +27,7 @@ modules.builtin.modinfo
 
 # Userspace tool binary / 用户态工具产物
 userspace/get_sockdelays/get_sockdelays
-get_sockdelays
+/userspace/get_sockdelays/get_sockdelays
 
 # Build directories / 构建目录
 build/
