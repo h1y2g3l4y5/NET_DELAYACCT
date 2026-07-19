@@ -1,12 +1,21 @@
-Add CONFIG_NET_DELAYACCT field to struct sock.
+From 966dc2b8664d7391a5f722b9a38c5d685c7de512 Mon Sep 17 00:00:00 2001
+From: laiguo-liang <2909269677@qq.com>
+Date: Sun, 19 Jul 2026 17:36:08 +0800
+Subject: [PATCH] net-delayacct: add CONFIG_NET_DELAYACCT field to struct sock
 
-Embeds struct net_delayacct into struct sock, #ifdef-protected so
+Embed struct net_delayacct into struct sock, #ifdef-protected so
 kernels without the option see no ABI change or memory growth.
-The per-socket spinlock is independent of sk->sk_lock.slock to avoid
-lock-ordering issues with the socket lock taken in RX/TX paths.
+The per-socket spinlock is independent of sk->sk_lock.slock to
+avoid lock-ordering issues with the socket lock taken in RX/TX
+paths.
 
-Applies to Linux 6.6 (linux-6.6.y).
+Signed-off-by: laiguo-liang <2909269677@qq.com>
+---
+ include/net/sock.h | 4 ++++
+ 1 file changed, 4 insertions(+)
 
+diff --git a/include/net/sock.h b/include/net/sock.h
+index a6944844553a..8965e4ec7d5f 100644
 --- a/include/net/sock.h
 +++ b/include/net/sock.h
 @@ -66,6 +66,7 @@
@@ -17,7 +26,7 @@ Applies to Linux 6.6 (linux-6.6.y).
  #include <linux/net_tstamp.h>
  #include <net/l3mdev.h>
  #include <uapi/linux/socket.h>
-@@ -434,6 +435,9 @@
+@@ -434,6 +435,9 @@ struct sock {
  	int			sk_disconnects;
  
  	struct sk_filter __rcu	*sk_filter;
@@ -27,3 +36,6 @@ Applies to Linux 6.6 (linux-6.6.y).
  	union {
  		struct socket_wq __rcu	*sk_wq;
  		/* private: */
+-- 
+2.34.1
+

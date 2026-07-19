@@ -1,14 +1,25 @@
-Add per-skb delayacct_start timestamp to struct sk_buff.
+From 31ba61a471895424723c7cfefee4b443ed5ffb42 Mon Sep 17 00:00:00 2001
+From: laiguo-liang <2909269677@qq.com>
+Date: Sun, 19 Jul 2026 17:36:10 +0800
+Subject: [PATCH] net-delayacct: add delayacct_start timestamp to struct
+ sk_buff
 
-Carries the start-of-delay timestamp from protocol-stack entry
+Add a per-skb __u64 delayacct_start field to struct sk_buff to
+carry the start-of-delay timestamp from protocol-stack entry
 through to the RX/TX accounting end point. #ifdef-protected so
-kernels without CONFIG_NET_DELAYACCT see no growth in struct sk_buff.
+kernels without CONFIG_NET_DELAYACCT see no growth in struct
+sk_buff.
 
-Applies to Linux 6.6 (linux-6.6.y).
+Signed-off-by: laiguo-liang <2909269677@qq.com>
+---
+ include/linux/skbuff.h | 5 +++++
+ 1 file changed, 5 insertions(+)
 
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 1a91645fa249..3ab9b676fe51 100644
 --- a/include/linux/skbuff.h
 +++ b/include/linux/skbuff.h
-@@ -867,6 +867,11 @@
+@@ -867,6 +867,11 @@ struct sk_buff {
  		ktime_t		tstamp;
  		u64		skb_mstamp_ns; /* earliest departure time */
  	};
@@ -20,3 +31,6 @@ Applies to Linux 6.6 (linux-6.6.y).
  	/*
  	 * This is the control buffer. It is free to use for every
  	 * layer. Please put your private variables there. If you
+-- 
+2.34.1
+

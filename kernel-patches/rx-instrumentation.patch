@@ -1,12 +1,23 @@
-RX path instrumentation for CONFIG_NET_DELAYACCT.
+From 43759593a71e22bd3797a26e4c174b608ca26ff3 Mon Sep 17 00:00:00 2001
+From: laiguo-liang <2909269677@qq.com>
+Date: Sun, 19 Jul 2026 17:36:11 +0800
+Subject: [PATCH] net-delayacct: add RX path instrumentation
 
-Stamps skb->delayacct_start at __netif_receive_skb_core() entry and
-accumulates per-socket RX latency in tcp_recvmsg()/udp_recvmsg()
+Stamp skb->delayacct_start at __netif_receive_skb_core() entry
+and accumulate per-socket RX latency in tcp_recvmsg()/udp_recvmsg()
 before the payload is copied to user space.
 
-Applies to Linux 6.6 (linux-6.6.y). Apply after sock_h and skbuff_h
-patches.
+Apply after the sock_h and skbuff_h patches.
 
+Signed-off-by: laiguo-liang <2909269677@qq.com>
+---
+ net/core/dev.c | 3 +++
+ net/ipv4/tcp.c | 2 ++
+ net/ipv4/udp.c | 3 +++
+ 3 files changed, 8 insertions(+)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 405b448bd91f..3edf7f85b16d 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
 @@ -101,6 +101,7 @@
@@ -17,7 +28,7 @@ patches.
  #include <net/dst_metadata.h>
  #include <net/gro.h>
  #include <net/pkt_sched.h>
-@@ -5446,6 +5447,8 @@
+@@ -5446,6 +5447,8 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
  
  	trace_netif_receive_skb(skb);
  
@@ -26,6 +37,8 @@ patches.
  	orig_dev = skb->dev;
  
  	skb_reset_network_header(skb);
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 5b1fbb0ca2ff..5528207c569c 100644
 --- a/net/ipv4/tcp.c
 +++ b/net/ipv4/tcp.c
 @@ -272,6 +272,7 @@
@@ -36,7 +49,7 @@ patches.
  #include <net/mptcp.h>
  #include <net/xfrm.h>
  #include <net/ip.h>
-@@ -2504,6 +2505,7 @@
+@@ -2504,6 +2505,7 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
  
  found_ok_skb:
  		/* Ok so how much can we use? */
@@ -44,6 +57,8 @@ patches.
  		used = skb->len - offset;
  		if (len < used)
  			used = len;
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 384b9f0f8a15..d027957923a4 100644
 --- a/net/ipv4/udp.c
 +++ b/net/ipv4/udp.c
 @@ -105,6 +105,7 @@
@@ -54,7 +69,7 @@ patches.
  #include <trace/events/udp.h>
  #include <linux/static_key.h>
  #include <linux/btf_ids.h>
-@@ -1838,6 +1839,8 @@
+@@ -1838,6 +1839,8 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
  	if (!skb)
  		return err;
  
@@ -63,3 +78,6 @@ patches.
  	ulen = udp_skb_len(skb);
  	copied = len;
  	if (copied > ulen - off)
+-- 
+2.34.1
+

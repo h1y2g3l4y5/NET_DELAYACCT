@@ -1,15 +1,38 @@
-TX path instrumentation for CONFIG_NET_DELAYACCT.
+From a6917b4bed7e7f035dab4471d698adfa104ccb6a Mon Sep 17 00:00:00 2001
+From: laiguo-liang <2909269677@qq.com>
+Date: Sun, 19 Jul 2026 17:36:12 +0800
+Subject: [PATCH] net-delayacct: add TX path instrumentation
 
-Stamps skb->delayacct_start when a new skb is allocated in
-tcp_sendmsg_locked()/udp_sendmsg() and accumulates per-socket TX
+Stamp skb->delayacct_start when a new skb is allocated in
+tcp_sendmsg_locked()/udp_sendmsg() and accumulate per-socket TX
 latency in dev_hard_start_xmit() before the driver xmit callback.
 
-Applies to Linux 6.6 (linux-6.6.y). Apply after rx-instrumentation
-patch (which adds the include to dev.c/tcp.c/udp.c).
+Apply after the rx-instrumentation patch.
 
+Signed-off-by: laiguo-liang <2909269677@qq.com>
+---
+ net/core/dev.c | 1 +
+ net/ipv4/tcp.c | 1 +
+ net/ipv4/udp.c | 4 +++-
+ 3 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 3edf7f85b16d..7738bfa0cffe 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3658,6 +3658,7 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *de
+ 		struct sk_buff *next = skb->next;
+ 
+ 		skb_mark_not_on_list(skb);
++		net_delayacct_tx_end(skb->sk, skb);
+ 		rc = xmit_one(skb, dev, txq, next != NULL);
+ 		if (unlikely(!dev_xmit_complete(rc))) {
+ 			skb->next = next;
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 5528207c569c..2208728ac582 100644
 --- a/net/ipv4/tcp.c
 +++ b/net/ipv4/tcp.c
-@@ -1166,6 +1166,7 @@
+@@ -1167,6 +1167,7 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
  			skb->decrypted = !!(flags & MSG_SENDPAGE_DECRYPTED);
  #endif
  			tcp_skb_entail(sk, skb);
@@ -17,9 +40,11 @@ patch (which adds the include to dev.c/tcp.c/udp.c).
  			copy = size_goal;
  
  			/* All packets are restored as if they have
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index d027957923a4..7315b3d82a3c 100644
 --- a/net/ipv4/udp.c
 +++ b/net/ipv4/udp.c
-@@ -1266,8 +1266,10 @@
+@@ -1267,8 +1267,10 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
  				  sizeof(struct udphdr), &ipc, &rt,
  				  &cork, msg->msg_flags);
  		err = PTR_ERR(skb);
@@ -31,13 +56,6 @@ patch (which adds the include to dev.c/tcp.c/udp.c).
  		goto out;
  	}
  
---- a/net/core/dev.c
-+++ b/net/core/dev.c
-@@ -3657,6 +3657,7 @@
- 		struct sk_buff *next = skb->next;
- 
- 		skb_mark_not_on_list(skb);
-+		net_delayacct_tx_end(skb->sk, skb);
- 		rc = xmit_one(skb, dev, txq, next != NULL);
- 		if (unlikely(!dev_xmit_complete(rc))) {
- 			skb->next = next;
+-- 
+2.34.1
+

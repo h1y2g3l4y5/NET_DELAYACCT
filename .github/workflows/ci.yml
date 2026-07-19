@@ -54,7 +54,7 @@ jobs:
           fi
           for p in "${patches[@]}"; do
             echo "::group::checkpatch $p"
-            if ! perl "$cp_dir/checkpatch.pl" --no-tree --strict -f "$p"; then
+            if ! perl "$cp_dir/checkpatch.pl" --no-tree --strict "$p"; then
               fail=1
             fi
             echo "::endgroup::"
