@@ -1,81 +1,43 @@
 TX path instrumentation for CONFIG_NET_DELAYACCT.
 
-Three insertion points:
+Stamps skb->delayacct_start when a new skb is allocated in
+tcp_sendmsg_locked()/udp_sendmsg() and accumulates per-socket TX
+latency in dev_hard_start_xmit() before the driver xmit callback.
 
-1. net/ipv4/tcp.c, tcp_sendmsg() / tcp_sendmsg_locked(): when a new
-   skb is allocated to carry the user data, stamp
-   skb->delayacct_start via net_delayacct_tx_start().
-
-2. net/ipv4/udp.c, udp_sendmsg(): when the skb is built for the
-   outgoing datagram, stamp skb->delayacct_start.
-
-3. net/core/dev.c, dev_hard_start_xmit(): immediately before the
-   driver xmit callback is invoked, call net_delayacct_tx_end() with
-   skb->sk (if non-NULL) to accumulate the per-socket TX latency.
-
-Each modified file gains `#include <net/net-delayacct.h>` near its
-existing <net/...> includes (dev.c already gains the include from the
-RX instrumentation patch; if applied standalone, add it).
-
-Complete unified diff (apply with `git apply` or `patch -p1` from the
-root of a Linux 6.6 source tree).  Exact context lines may differ
-between 6.6.x point releases; the helper calls must be placed as
-described above.
+Applies to Linux 6.6 (linux-6.6.y). Apply after rx-instrumentation
+patch (which adds the include to dev.c/tcp.c/udp.c).
 
 --- a/net/ipv4/tcp.c
 +++ b/net/ipv4/tcp.c
-@@ -XXX,XXX @@
- #include <net/tcp.h>
-+#include <net/net-delayacct.h>
- #include <net/xfrm.h>
-@@ -XXX,XXX @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size,
- 		if (!skb) {
- 			skb = sk_stream_alloc_skb(sk, ...);
- 			if (!skb)
- 				goto wait_for_memory;
+@@ -1166,6 +1166,7 @@
+ 			skb->decrypted = !!(flags & MSG_SENDPAGE_DECRYPTED);
+ #endif
+ 			tcp_skb_entail(sk, skb);
 +			net_delayacct_tx_start(skb);
- 		}
-
+ 			copy = size_goal;
+ 
+ 			/* All packets are restored as if they have
 --- a/net/ipv4/udp.c
 +++ b/net/ipv4/udp.c
-@@ -XXX,XXX @@
- #include <net/udp.h>
-+#include <net/net-delayacct.h>
- #include <net/xfrm.h>
-@@ -XXX,XXX @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
- 	skb = ip_make_skb(sk, fl4, getfrag, msg, ulen,
- 			  sizeof(struct udphdr), &ipc, &rt,
- 			  corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
- 	if (IS_ERR(skb)) {
+@@ -1266,8 +1266,10 @@
+ 				  sizeof(struct udphdr), &ipc, &rt,
+ 				  &cork, msg->msg_flags);
  		err = PTR_ERR(skb);
+-		if (!IS_ERR_OR_NULL(skb))
++		if (!IS_ERR_OR_NULL(skb)) {
++			net_delayacct_tx_start(skb);
+ 			err = udp_send_skb(skb, fl4, &cork);
++		}
  		goto out;
  	}
-+	net_delayacct_tx_start(skb);
- 	err = udp_send_skb(skb, fl4, &corkreq);
-
+ 
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
-@@ -XXX,XXX @@
- #include <net/net_namespace.h>
-+#include <net/net-delayacct.h>
- #include <net/dst.h>
-@@ -XXX,XXX @@ static inline int dev_hard_start_xmit(struct sk_buff *first, struct net_device *
- 		} else {
- 			skb = next;
- 		}
-+		net_delayacct_tx_end(prev->sk, prev);
- 		skb = next;
-
-Notes:
-- The TX end helper is a no-op when skb->delayacct_start is 0
-  (e.g. for locally-generated ARP, or for paths that do not pass
-  through tcp_sendmsg/udp_sendmsg).
-- skb->sk may be NULL for some paths (e.g. link-layer traffic); the
-  helper handles this case.
-- GSO/TSO: a GSO skb is stamped once at tcp_sendmsg/udp_sendmsg and
-  the stamp is propagated to the segmentation-produced child skbs via
-  skb->cb.  However, the simplest and most conservative policy is to
-  count one TX event per GSO skb (i.e. per sendmsg call), which is
-  what this instrumentation does.  Document this in design.md.
-- IPv6 paths reuse tcp_sendmsg / udp_sendmsg, so no separate IPv6
-  instrumentation is needed.
+@@ -3657,6 +3657,7 @@
+ 		struct sk_buff *next = skb->next;
+ 
+ 		skb_mark_not_on_list(skb);
++		net_delayacct_tx_end(skb->sk, skb);
+ 		rc = xmit_one(skb, dev, txq, next != NULL);
+ 		if (unlikely(!dev_xmit_complete(rc))) {
+ 			skb->next = next;

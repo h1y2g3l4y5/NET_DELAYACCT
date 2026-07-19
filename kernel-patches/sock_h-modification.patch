@@ -1,39 +1,29 @@
-Add the following to include/net/sock.h.
+Add CONFIG_NET_DELAYACCT field to struct sock.
 
-Near the top of the file, alongside the other includes:
-
-	#include <net/net-delayacct.h>
-
-Inside struct sock, near other accounting-related fields (for example
-after `struct sk_filter __rcu *sk_filter;` or in the trailing
-#ifdef-protected section), add:
-
-	#ifdef CONFIG_NET_DELAYACCT
-	struct net_delayacct		sk_net_delayacct;
-	#endif
-
-Rationale: keeping the field #ifdef-protected means a kernel compiled
-without CONFIG_NET_DELAYACCT sees no ABI change and no memory growth.
+Embeds struct net_delayacct into struct sock, #ifdef-protected so
+kernels without the option see no ABI change or memory growth.
 The per-socket spinlock is independent of sk->sk_lock.slock to avoid
-lock-ordering issues with the socket lock taken in the RX/TX paths.
+lock-ordering issues with the socket lock taken in RX/TX paths.
 
-The complete unified diff (apply with `git apply` or `patch -p1`
-from the root of a Linux 6.6 source tree):
+Applies to Linux 6.6 (linux-6.6.y).
 
 --- a/include/net/sock.h
 +++ b/include/net/sock.h
-@@ -XXX,XXX @@
+@@ -66,6 +66,7 @@
+ #include <net/dst.h>
+ #include <net/checksum.h>
  #include <net/tcp_states.h>
- #include <net/net_namespace.h>
 +#include <net/net-delayacct.h>
- #include <net/net_namespace.h>
-@@ -XXX,XXX @@ struct sock {
+ #include <linux/net_tstamp.h>
+ #include <net/l3mdev.h>
+ #include <uapi/linux/socket.h>
+@@ -434,6 +435,9 @@
+ 	int			sk_disconnects;
+ 
  	struct sk_filter __rcu	*sk_filter;
 +#ifdef CONFIG_NET_DELAYACCT
 +	struct net_delayacct	sk_net_delayacct;
 +#endif
- 	struct socket_wq __rcu	*sk_wq;
-
-Note: the exact context lines may vary slightly between 6.6.x point
-releases.  When applying, locate struct sk_filter in include/net/sock.h
-and add the new field immediately after it.
+ 	union {
+ 		struct socket_wq __rcu	*sk_wq;
+ 		/* private: */

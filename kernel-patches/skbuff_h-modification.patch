@@ -1,41 +1,22 @@
-Add a per-skb timestamp field to struct sk_buff in
-include/linux/skbuff.h, used to carry the start-of-delay timestamp
-from the protocol-stack entry point through to the RX/TX accounting
-end point.
+Add per-skb delayacct_start timestamp to struct sk_buff.
 
-Field choice: we cannot reuse skb->tstamp (already used by
-SO_TIMESTAMPNS / packet scheduling) and skb->cb is owned by each
-layer.  A dedicated __u64 delayacct_start is the cleanest option.
+Carries the start-of-delay timestamp from protocol-stack entry
+through to the RX/TX accounting end point. #ifdef-protected so
+kernels without CONFIG_NET_DELAYACCT see no growth in struct sk_buff.
 
-The field is #ifdef-protected so kernels without
-CONFIG_NET_DELAYACCT see no growth in struct sk_buff.
-
-The complete unified diff (apply with `git apply` or `patch -p1`
-from the root of a Linux 6.6 source tree):
+Applies to Linux 6.6 (linux-6.6.y).
 
 --- a/include/linux/skbuff.h
 +++ b/include/linux/skbuff.h
-@@ -XXX,XXX @@ struct sk_buff {
- 	/* receive queue (rarely used field) */
- 	__u32			rxhash;
-
+@@ -867,6 +867,11 @@
+ 		ktime_t		tstamp;
+ 		u64		skb_mstamp_ns; /* earliest departure time */
+ 	};
++
 +#ifdef CONFIG_NET_DELAYACCT
 +	/* start time for net-delayacct, in ns; 0 = not stamped */
 +	__u64			delayacct_start;
 +#endif
- 	/* private: */
- 	__u32			headers_end[0];
-
-Alternative placement (near skb->tstamp):
-
-@@ -XXX,XXX @@ struct sk_buff {
- 	ktime_t			tstamp;
-+#if IS_ENABLED(CONFIG_NET_DELAYACCT)
-+	__u64			delayacct_start;
-+#endif
- 	/* private: */
-
-Note: the exact context lines may vary slightly between 6.6.x point
-releases.  When applying, pick any cache-line-friendly spot inside
-struct sk_buff; the field is accessed only in the net-delayacct
-helpers, so its exact offset does not matter functionally.
+ 	/*
+ 	 * This is the control buffer. It is free to use for every
+ 	 * layer. Please put your private variables there. If you
