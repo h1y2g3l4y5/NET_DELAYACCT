@@ -66,25 +66,13 @@ static inline void net_delayacct_rx_start(struct sk_buff *skb)
  * to the per-socket RX total.  If skb->delayacct_start is 0 (the
  * start point was not hit, e.g. for locally generated loopback
  * traffic), the call is a no-op.
+ *
+ * Defined out-of-line in net/core/net-delayacct.c because it touches
+ * sk->sk_net_delayacct and thus requires the full definition of
+ * struct sock, which is not available when this header is included
+ * from include/net/sock.h.
  */
-static inline void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb)
-{
-	struct net_delayacct *n;
-	u64 start = skb->delayacct_start;
-	u64 delta;
-
-	if (!start)
-		return;
-
-	delta = ktime_get_ns() - start;
-	skb->delayacct_start = 0;
-
-	n = &sk->sk_net_delayacct;
-	spin_lock(&n->lock);
-	n->stats.rx_total_ns += delta;
-	n->stats.rx_count++;
-	spin_unlock(&n->lock);
-}
+void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb);
 
 /**
  * net_delayacct_tx_start - stamp TX start time on an skb
@@ -105,25 +93,11 @@ static inline void net_delayacct_tx_start(struct sk_buff *skb)
  *
  * Computes the delta from skb->delayacct_start to "now" and adds it
  * to the per-socket TX total.  Called from dev_hard_start_xmit.
+ *
+ * Defined out-of-line in net/core/net-delayacct.c (see
+ * net_delayacct_rx_end for the reason).
  */
-static inline void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
-{
-	struct net_delayacct *n;
-	u64 start = skb->delayacct_start;
-	u64 delta;
-
-	if (!start || !sk)
-		return;
-
-	delta = ktime_get_ns() - start;
-	skb->delayacct_start = 0;
-
-	n = &sk->sk_net_delayacct;
-	spin_lock(&n->lock);
-	n->stats.tx_total_ns += delta;
-	n->stats.tx_count++;
-	spin_unlock(&n->lock);
-}
+void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb);
 
 /**
  * net_delayacct_get_stats - read a snapshot of the per-socket stats
@@ -131,29 +105,19 @@ static inline void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
  * @out: destination for the snapshot
  *
  * Returns a consistent copy under the per-socket spinlock.
+ *
+ * Defined out-of-line in net/core/net-delayacct.c.
  */
-static inline void net_delayacct_get_stats(struct sock *sk,
-					   struct net_delayacct_stats *out)
-{
-	struct net_delayacct *n = &sk->sk_net_delayacct;
-
-	spin_lock(&n->lock);
-	*out = n->stats;
-	spin_unlock(&n->lock);
-}
+void net_delayacct_get_stats(struct sock *sk,
+			     struct net_delayacct_stats *out);
 
 /**
  * net_delayacct_reset - zero the per-socket statistics
  * @sk: target socket
+ *
+ * Defined out-of-line in net/core/net-delayacct.c.
  */
-static inline void net_delayacct_reset(struct sock *sk)
-{
-	struct net_delayacct *n = &sk->sk_net_delayacct;
-
-	spin_lock(&n->lock);
-	memset(&n->stats, 0, sizeof(n->stats));
-	spin_unlock(&n->lock);
-}
+void net_delayacct_reset(struct sock *sk);
 
 #else	/* CONFIG_NET_DELAYACCT */
 

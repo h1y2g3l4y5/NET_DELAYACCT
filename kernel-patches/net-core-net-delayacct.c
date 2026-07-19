@@ -90,7 +90,7 @@ static struct genl_family net_delayacct_genl_family __ro_after_init = {
 	.netnsok	= true,
 	.module		= THIS_MODULE,
 	.ops		= net_delayacct_ops,
-	.nops		= ARRAY_SIZE(net_delayacct_ops),
+	.n_ops          = ARRAY_SIZE(net_delayacct_ops),
 	.policy		= net_delayacct_policy,
 };
 
@@ -112,7 +112,6 @@ static int net_delayacct_fill_sock(struct sk_buff *skb, struct sock *sk,
 	u16 lport, rport;
 	int addr_len;
 	void *laddr, *raddr;
-	struct in6_addr empty6 = {};
 
 	/* Snapshot the stats under the per-socket spinlock. */
 	net_delayacct_get_stats(sk, &stats);
@@ -208,7 +207,7 @@ static int net_delayacct_emit_done(struct genl_info *info)
 {
 	struct sk_buff *msg;
 
-	msg = nlmsg_new(NLMSG_DONE_SIZE, GFP_KERNEL);
+	msg = nlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
 	if (!msg)
 		return -ENOMEM;
 
@@ -298,10 +297,10 @@ static int net_delayacct_iter_task_sockets(struct task_struct *task,
 	comm = NULL;	/* task->comm is only safe under task_lock */
 
 	task_lock(task);
-	comm = get_task_comm(task);
+	comm = task->comm;
 	files = task->files;
 	if (files)
-		get_files_struct(files);
+		atomic_inc(&files->count);
 	task_unlock(task);
 
 	if (!files)
@@ -405,7 +404,7 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 		task_lock(task);
 		files = task->files;
 		if (files)
-			get_files_struct(files);
+			atomic_inc(&files->count);
 		task_unlock(task);
 		if (!files)
 			continue;
@@ -461,7 +460,7 @@ static int net_delayacct_cmd_reset(struct sk_buff *skb,
 		task_lock(task);
 		files = task->files;
 		if (files)
-			get_files_struct(files);
+			atomic_inc(&files->count);
 		task_unlock(task);
 		if (!files)
 			continue;
@@ -494,7 +493,70 @@ static int net_delayacct_cmd_reset(struct sk_buff *skb,
 	return 0;
 }
 
-static int __init net_delayacct_init(void)
+/*
+ * Out-of-line implementations of the helpers that touch
+ * sk->sk_net_delayacct.  They cannot live in the header because it is
+ * included from include/net/sock.h before struct sock is fully
+ * defined.
+ */
+void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb)
+{
+	struct net_delayacct *n;
+	u64 start = skb->delayacct_start;
+	u64 delta;
+
+	if (!start)
+		return;
+
+	delta = ktime_get_ns() - start;
+	skb->delayacct_start = 0;
+
+	n = &sk->sk_net_delayacct;
+	spin_lock(&n->lock);
+	n->stats.rx_total_ns += delta;
+	n->stats.rx_count++;
+	spin_unlock(&n->lock);
+}
+
+void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
+{
+	struct net_delayacct *n;
+	u64 start = skb->delayacct_start;
+	u64 delta;
+
+	if (!start || !sk)
+		return;
+
+	delta = ktime_get_ns() - start;
+	skb->delayacct_start = 0;
+
+	n = &sk->sk_net_delayacct;
+	spin_lock(&n->lock);
+	n->stats.tx_total_ns += delta;
+	n->stats.tx_count++;
+	spin_unlock(&n->lock);
+}
+
+void net_delayacct_get_stats(struct sock *sk,
+			     struct net_delayacct_stats *out)
+{
+	struct net_delayacct *n = &sk->sk_net_delayacct;
+
+	spin_lock(&n->lock);
+	*out = n->stats;
+	spin_unlock(&n->lock);
+}
+
+void net_delayacct_reset(struct sock *sk)
+{
+	struct net_delayacct *n = &sk->sk_net_delayacct;
+
+	spin_lock(&n->lock);
+	memset(&n->stats, 0, sizeof(n->stats));
+	spin_unlock(&n->lock);
+}
+
+static int __init net_delayacct_mod_init(void)
 {
 	int ret;
 
@@ -515,7 +577,7 @@ static void __exit net_delayacct_exit(void)
 	pr_info("net_delayacct: framework unregistered\n");
 }
 
-module_init(net_delayacct_init);
+module_init(net_delayacct_mod_init);
 module_exit(net_delayacct_exit);
 
 MODULE_LICENSE("GPL v2");

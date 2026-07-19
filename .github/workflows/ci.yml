@@ -105,6 +105,28 @@ jobs:
             git apply "$p" || patch -p1 < "$p"
           done
 
+      - name: Install new NET_DELAYACCT source files
+        run: |
+          set -e
+          kp="$GITHUB_WORKSPACE/kernel-patches"
+          # Copy new files into the kernel tree at their canonical paths.
+          # File names use '-' to represent directory separators so they
+          # sit flat in kernel-patches/ (no subdirectories).
+          install -m 0644 "$kp/include-net-net-delayacct.h"        "$LINUX_SRC/include/net/net-delayacct.h"
+          install -m 0644 "$kp/include-uapi-linux-net-delayacct.h" "$LINUX_SRC/include/uapi/linux/net-delayacct.h"
+          install -m 0644 "$kp/net-core-net-delayacct.c"           "$LINUX_SRC/net/core/net-delayacct.c"
+          # Append Makefile/Kconfig fragments.
+          cat "$kp/Makefile-fragment" >> "$LINUX_SRC/net/core/Makefile"
+          cat "$kp/Kconfig-fragment"  >> "$LINUX_SRC/net/Kconfig"
+          echo "=== Installed files ==="
+          ls -la "$LINUX_SRC/include/net/net-delayacct.h" \
+                 "$LINUX_SRC/include/uapi/linux/net-delayacct.h" \
+                 "$LINUX_SRC/net/core/net-delayacct.c"
+          echo "=== Makefile tail ==="
+          tail -3 "$LINUX_SRC/net/core/Makefile"
+          echo "=== Kconfig tail ==="
+          tail -15 "$LINUX_SRC/net/Kconfig"
+
       - name: Configure kernel with fragment
         run: |
           cd "$LINUX_SRC"
