@@ -161,6 +161,12 @@ jobs:
             ~/.cache/ccache
           key: ccache-tool-${{ runner.os }}
 
+      - name: Install UAPI header
+        run: |
+          sudo install -m 0644 -D \
+            kernel-patches/include-uapi-linux-net-delayacct.h \
+            /usr/include/linux/net-delayacct.h
+
       - name: Build tool
         run: make tool CC="ccache gcc"
 
