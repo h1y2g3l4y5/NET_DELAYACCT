@@ -43,7 +43,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== test_reset: get_sockdelays -r ==="
+echo "=== test_reset: get_sockdelays -R ==="
 
 # 步骤 1：产生网络流量以累积时延计数
 iperf3 -s -D -p "$IPERF_PORT" 2>/dev/null || true
@@ -64,7 +64,7 @@ echo "$PRE_RESET_OUTPUT" | head -5
 
 # 步骤 3：执行重置
 echo "Executing reset..."
-"$GET_SOCKDELAYS" -r 2>&1 || true
+"$GET_SOCKDELAYS" -R 2>&1 || true
 sleep 1
 
 # 步骤 4：查询重置后的计数

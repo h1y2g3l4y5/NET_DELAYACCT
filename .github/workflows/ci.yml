@@ -180,6 +180,8 @@ jobs:
     runs-on: self-hosted
     if: github.event_name == 'push'
     timeout-minutes: 60
+    permissions:
+      contents: write
     env:
       LINUX_SRC: /home/lai/Code/linux-6.6
       ROOTFS_IMG: /home/lai/Code/qemu-rootfs.img
