@@ -37,6 +37,10 @@ if grep -q "net_delayacct" /proc/net/genetlink 2>/dev/null; then
 	echo "genl family registered OK"
 else
 	echo "WARNING: net_delayacct genl family not found in /proc/net/genetlink"
+	echo "Kernel messages for net_delayacct:"
+	dmesg | grep -i "net_delayacct\|net-delayacct\|net_delay" || echo "  (no messages found)"
+	echo "Checking if module is loaded:"
+	lsmod | grep delayacct 2>/dev/null || echo "  (not found in lsmod)"
 fi
 
 # --- Find and run test scripts ---

@@ -287,7 +287,7 @@ extract_results() {
 	fi
 
 	sudo umount "$mnt"
-	rmdir "$mnt"
+	sudo rmdir "$mnt"
 }
 
 # Commit and push test results back to the repo.
@@ -304,10 +304,10 @@ commit_results() {
 		fi
 	fi
 
-	git add "$REPORT_DIR/"
-	git commit -m "test: qemu test results $(date +%Y-%m-%d)" --allow-empty || true
-	git push origin "$BRANCH" 2>&1 | tail -3 || log "WARNING: git push failed (check network)"
-	log "Results pushed to remote"
+	GIT_TERMINAL_PROMPT=0 git add "$REPORT_DIR/"
+	GIT_TERMINAL_PROMPT=0 git commit -m "test: qemu test results $(date +%Y-%m-%d)" --allow-empty || true
+	GIT_TERMINAL_PROMPT=0 git push origin "$BRANCH" 2>&1 | tail -3 || log "WARNING: git push failed (check network/credentials)"
+	log "Results commit done"
 }
 
 # ============================================================================
