@@ -28,6 +28,8 @@ set -euo pipefail
 # ============================================================================
 # Configuration
 # ============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Auto-detect NETDELAY_REPO by walking up from SCRIPT_DIR
 NETDELAY_REPO=""
 for d in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$SCRIPT_DIR/../.."; do
@@ -45,7 +47,6 @@ QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
 BRANCH="${BRANCH:-main}"
 LAST_TESTED_FILE="$NETDELAY_REPO/.qemu_last_tested"
 REPORT_DIR="$NETDELAY_REPO/tests/reports/qemu"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL_PATCH_DIR="$NETDELAY_REPO/kernel-patches"
 
 # ============================================================================
