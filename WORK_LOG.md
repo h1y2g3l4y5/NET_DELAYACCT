@@ -78,3 +78,5 @@
 - 仓库 `.github/workflows/ci.yml` 已配置 `qemu-test` 任务，push 时自动触发
 - 网络问题修复：切换至桥接模式获取稳定 IP (10.36.128.232)，摆脱 VMware NAT 不稳定问题
 - 创建 `ci/qemu/fix-network.sh` 一键网络修复脚本
+- 解决 sudo 权限问题：配置 `lai ALL=(ALL) NOPASSWD: ALL`，CI 结束后 `chown` 修复 root 文件
+- Workflow 添加 `permissions: contents: write` 解决 git push 403 错误
