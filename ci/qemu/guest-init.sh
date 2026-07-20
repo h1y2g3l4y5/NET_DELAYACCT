@@ -31,21 +31,15 @@ ip link set lo up 2>/dev/null || true
 # --- Load net_delayacct if compiled as module ---
 modprobe net-delayacct 2>/dev/null || true
 
-# --- Verify genl family is registered ---
+# --- Verify genl family is registered by actually calling get_sockdelays ---
 echo "Checking net_delayacct genl family..."
-# Try exact match first, then flexible search, then show raw content
-if grep -q "net_delayacct" /proc/net/genetlink 2>/dev/null; then
-	echo "genl family registered OK"
-elif grep -qi "net.delayacct\|delayacct" /proc/net/genetlink 2>/dev/null; then
-	echo "genl family found (fuzzy match):"
-	grep -i "net.delayacct\|delayacct" /proc/net/genetlink
+if /usr/local/bin/get_sockdelays -p 1 >/dev/null 2>&1; then
+	echo "genl family accessible (get_sockdelays works)"
 else
-	echo "WARNING: net_delayacct genl family not found in /proc/net/genetlink"
-	echo "/proc/net/genetlink first 10 lines:"
-	head -10 /proc/net/genetlink 2>/dev/null || echo "  (file empty or unreadable)"
-	echo ""
-	echo "Kernel messages for net_delayacct:"
-	dmesg | grep -i "net_delayacct\|net-delayacct\|net_delay" || echo "  (no messages found)"
+	# get_sockdelays failed — try to diagnose
+	/usr/local/bin/get_sockdelays -p 1 2>&1 | head -3
+	echo "dmesg:"
+	dmesg | grep -i "net_delayacct\|net-delayacct" || echo "  (no kernel messages)"
 fi
 
 # --- Find and run test scripts ---

@@ -318,6 +318,14 @@ main() {
 
 	check_prereqs
 
+	# Ensure remote URL uses HTTPS (fixes stale/damaged URLs from sudo)
+	cd "$NETDELAY_REPO"
+	GIT_REMOTE_URL="https://github.com/h1y2g3l4y5/NET_DELAYACCT.git"
+	if [ "$(git remote get-url origin 2>/dev/null)" != "$GIT_REMOTE_URL" ]; then
+		git remote set-url origin "$GIT_REMOTE_URL"
+		log "Fixed git remote URL"
+	fi
+
 	# Fetch latest from remote
 	cd "$NETDELAY_REPO"
 	git fetch origin "$BRANCH" 2>&1 | tail -1
