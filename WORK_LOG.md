@@ -69,3 +69,12 @@
 | f5c6a31 | fix: improve genl family detection |
 | 5db78b2 | fix: auto-fix git remote URL and verify genl via get_sockdelays |
 | 60add19 | feat: enable CONFIG_TASK_DELAY_ACCT and build getdelays |
+| d9cf918 | fix: require_net_delayacct_family uses get_sockdelays instead of /proc/net/genetlink |
+| 44ae2f4 | feat: register GitHub self-hosted runner, add network fix script |
+
+### GitHub Actions 自托管 Runner
+- 在 VMware Linux VM 上注册了 GitHub 自托管 runner
+- Runner 安装为 systemd 服务，开机自启
+- 仓库 `.github/workflows/ci.yml` 已配置 `qemu-test` 任务，push 时自动触发
+- 网络问题修复：切换至桥接模式获取稳定 IP (10.36.128.232)，摆脱 VMware NAT 不稳定问题
+- 创建 `ci/qemu/fix-network.sh` 一键网络修复脚本
