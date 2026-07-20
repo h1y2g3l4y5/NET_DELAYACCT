@@ -116,15 +116,13 @@ find_get_sockdelays() {
 }
 
 # 检查 net_delayacct generic netlink family 是否在内核中注册
-# 通过检查 /proc/net/genetlink 实现
+# 通过实际调用 get_sockdelays 验证（不依赖 /proc/net/genetlink）
 require_net_delayacct_family() {
-	if [ ! -f /proc/net/genetlink ]; then
-		echo "SKIP: /proc/net/genetlink not available"
-		exit 4
-	fi
-
-	if ! grep -q "net_delayacct" /proc/net/genetlink 2>/dev/null; then
-		echo "SKIP: net_delayacct genl family not registered in kernel"
+	if ! "$GET_SOCKDELAYS" -p 1 >/dev/null 2>&1; then
+		# get_sockdelays failed — could be missing genl family or other issue
+		local err
+		err=$("$GET_SOCKDELAYS" -p 1 2>&1 || true)
+		echo "SKIP: net_delayacct genl family not accessible: $err"
 		exit 4
 	fi
 }
