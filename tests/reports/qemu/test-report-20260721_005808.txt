@@ -1,0 +1,77 @@
+=== QEMU Test Run: Mon Jul 20 16:58:21 UTC 2026 ===
+Kernel: 6.6.39-dirty
+
+get_sockdelays binary: OK
+--- Running test_netdelayacct.sh ---
+============================================
+  net-delayacct selftest
+  Binary: /usr/local/bin/get_sockdelays
+============================================
+
+--- Test 1: query own PID ---
+[PASS] own PID query executed without crash
+--- Test 2: nc listener PID query ---
+[PASS] nc listener (pid 83) found in output
+--- Test 3: inode query ---
+[FAIL] inode query output does not contain inode 1454
+
+--- Running test_inode_query.sh ---
+=== test_inode_query: get_sockdelays -i ===
+Found socket inode: 403 (pid=114)
+[FAIL] output does not contain inode 403
+  Output was: (no matching sockets)
+[PASS] output has exactly 1 data line
+
+=== Summary: PASS=1 FAIL=1 ===
+
+--- Running test_multi_socket.sh ---
+=== test_multi_socket: single process, multiple sockets ===
+Client PID: 136
+[FAIL] output has 1 data line(s), expected >= 3
+  Output was:
+(no matching sockets)
+[PASS] all lines have the same PID
+
+=== Summary: PASS=1 FAIL=1 ===
+
+--- Running test_pid_query.sh ---
+=== test_pid_query: get_sockdelays -p ===
+Querying PID: 174
+[PASS] output has 1 line(s)
+[FAIL] output does not contain TCP type
+  Output was: (no matching sockets)
+
+=== Summary: PASS=1 FAIL=1 ===
+
+--- Running test_reset.sh ---
+=== test_reset: get_sockdelays -R ===
+reset-test-traffic
+Pre-reset output:
+(no matching sockets)
+Executing reset...
+all per-socket statistics reset
+Post-reset output:
+(no matching sockets)
+[PASS] all counters are zero/N/A after reset
+[PASS] pre-reset output was non-empty (traffic was recorded)
+
+=== Summary: PASS=2 FAIL=0 ===
+
+--- Running test_tcp_udp.sh ---
+=== test_tcp_udp: TCP and UDP path validation ===
+
+--- TCP test ---
+[FAIL] TCP path: output does not contain TCP type
+  Output: (no matching sockets)
+
+--- UDP test ---
+[FAIL] UDP path: output does not contain UDP type
+  Output: (no matching sockets)
+
+=== Summary: PASS=0 FAIL=2 ===
+
+
+=== Test run finished: Mon Jul 20 16:59:10 UTC 2026 ===
+
+=== Kernel net_delayacct messages (post-test) ===
+[    6.273619] net_delayacct: framework registered (family=28)
