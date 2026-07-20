@@ -86,9 +86,9 @@ else
 	# Use TUNA mirror for faster clone inside mainland China.
 	# Fallback to kernel.org if the mirror is unavailable.
 	KERNEL_URL="https://mirrors.tuna.tsinghua.edu.cn/git/linux-stable.git"
-	if ! git clone --depth 1 --branch linux-6.6.y "$KERNEL_URL" "$LINUX_SRC" 2>/dev/null; then
+	if ! git clone --progress --depth 1 --branch linux-6.6.y "$KERNEL_URL" "$LINUX_SRC"; then
 		log "Mirror failed, falling back to kernel.org..."
-		git clone --depth 1 --branch linux-6.6.y \
+		git clone --progress --depth 1 --branch linux-6.6.y \
 			https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
 			"$LINUX_SRC"
 	fi
