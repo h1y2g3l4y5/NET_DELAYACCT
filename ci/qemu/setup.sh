@@ -82,10 +82,17 @@ if [ -d "$LINUX_SRC/.git" ]; then
 	cd "$LINUX_SRC"
 	git fetch origin linux-6.6.y
 else
-	log "Cloning linux-6.6.y (this will take a few minutes)..."
-	git clone --depth 1 --branch linux-6.6.y \
-		https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
-		"$LINUX_SRC"
+	log "Cloning linux-6.6.y from mirror (this will take a few minutes)..."
+	# Use TUNA mirror for faster clone inside mainland China.
+	# Fallback to kernel.org if the mirror is unavailable.
+	local KERNEL_URL
+	KERNEL_URL="https://mirrors.tuna.tsinghua.edu.cn/git/linux-stable.git"
+	if ! git clone --depth 1 --branch linux-6.6.y "$KERNEL_URL" "$LINUX_SRC" 2>/dev/null; then
+		log "Mirror failed, falling back to kernel.org..."
+		git clone --depth 1 --branch linux-6.6.y \
+			https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+			"$LINUX_SRC"
+	fi
 fi
 
 # Fix ownership
@@ -137,8 +144,10 @@ mount -o loop "$ROOTFS_IMG" "$mnt"
 
 # Bootstrap Debian
 log "Bootstrapping Debian $DEBIAN_RELEASE (this will take several minutes)..."
+# Use TUNA mirror for faster bootstrap inside mainland China.
+local DEBIAN_MIRROR="http://mirrors.tuna.tsinghua.edu.cn/debian"
 debootstrap --include=systemd,net-tools,iproute2,procps,util-linux,bash \
-	"$DEBIAN_RELEASE" "$mnt" http://deb.debian.org/debian/ 2>&1 | tail -5
+	"$DEBIAN_RELEASE" "$mnt" "$DEBIAN_MIRROR" 2>&1 | tail -5
 
 [ -d "$mnt/bin" ] || die "debootstrap failed"
 
@@ -151,6 +160,13 @@ mount --bind /sys  "$mnt/sys"
 
 # Copy resolv.conf for network inside chroot
 cp /etc/resolv.conf "$mnt/etc/resolv.conf"
+
+# Replace apt sources with mirror for faster installs inside China
+local DEBIAN_MIRROR="http://mirrors.tuna.tsinghua.edu.cn/debian"
+cat > "$mnt/etc/apt/sources.list" << APTEOF
+deb $DEBIAN_MIRROR $DEBIAN_RELEASE main
+deb $DEBIAN_MIRROR $DEBIAN_RELEASE-updates main
+APTEOF
 
 # Install test dependencies
 chroot "$mnt" /bin/bash -c "
