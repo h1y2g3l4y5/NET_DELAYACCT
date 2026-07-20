@@ -107,7 +107,11 @@ log "=== Step 3: Cloning NET_DELAYACCT repo ==="
 if [ -d "$NETDELAY_REPO/.git" ]; then
 	log "Repo already exists at $NETDELAY_REPO, fetching latest..."
 	cd "$NETDELAY_REPO"
-	git fetch origin
+	git fetch origin 2>/dev/null || log "Fetch failed (non-fatal), using existing code"
+elif [ -d "$(dirname "$0")/../../.git" ]; then
+	# Fallback: symlink the repo we are running from
+	log "Linking repo from $(dirname "$0")/../.. to $NETDELAY_REPO"
+	ln -sfn "$(cd "$(dirname "$0")/../.." && pwd)" "$NETDELAY_REPO"
 else
 	log "Cloning NET_DELAYACCT..."
 	git clone https://github.com/h1y2g3l4y5/NET_DELAYACCT.git "$NETDELAY_REPO"
