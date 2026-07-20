@@ -85,6 +85,9 @@ RESULT_FILE="/root/test-output.txt"
 
 	echo ""
 	echo "=== Test run finished: $(date -u) ==="
+	echo ""
+	echo "=== Kernel net_delayacct messages (post-test) ==="
+	dmesg | grep -i "net_delayacct" || echo "  (none)"
 } > "$RESULT_FILE" 2>&1
 
 # --- Sync and power off ---

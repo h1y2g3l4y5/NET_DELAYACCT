@@ -87,6 +87,9 @@ endlog
 log "Configuring and building kernel"
 cd "$LINUX_SRC"
 
+# Force rebuild of net-delayacct module to pick up changes
+rm -f net/core/net-delayacct.o
+
 make defconfig 2>&1 | tail -1
 
 "$LINUX_SRC/scripts/kconfig/merge_config.sh" -m .config \
