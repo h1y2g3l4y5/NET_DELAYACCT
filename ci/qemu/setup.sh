@@ -83,11 +83,13 @@ if [ -d "$LINUX_SRC/.git" ]; then
 	git fetch origin linux-6.6.y
 else
 	log "Cloning linux-6.6.y (this will take a few minutes)..."
-	# Only two known-working sources:
-	#   TUNA mirror (fast from China, but often queued)
-	#   kernel.org (slow from China, but always available)
+	# Verified mirrors (order by proximity):
+	#   1. USTC    — mirrors.ustc.edu.cn/linux.git
+	#   2. TUNA    — mirrors.tuna.tsinghua.edu.cn/git/linux-stable.git
+	#   3. kernel.org — original source (slow from China)
 	CLONED=0
 	for url in \
+		"https://mirrors.ustc.edu.cn/linux.git" \
 		"https://mirrors.tuna.tsinghua.edu.cn/git/linux-stable.git" \
 		"https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"; do
 		log "Trying: $url"
