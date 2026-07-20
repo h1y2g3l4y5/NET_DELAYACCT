@@ -26,7 +26,6 @@ Signed-off-by: laiguo-liang <2909269677@qq.com>
  1 file changed, 1 insertion(+)
 
 diff --git a/net/core/sock.c b/net/core/sock.c
-index 000000000000..000000000000 100644
 --- a/net/core/sock.c
 +++ b/net/core/sock.c
 @@ -1770,6 +1770,7 @@ static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
@@ -35,5 +34,5 @@ index 000000000000..000000000000 100644
  		sk_tx_queue_clear(sk);
 +		net_delayacct_init(&sk->sk_net_delayacct);
  	}
- 
+
  	return sk;
