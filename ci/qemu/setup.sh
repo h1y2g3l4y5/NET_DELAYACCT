@@ -83,11 +83,12 @@ if [ -d "$LINUX_SRC/.git" ]; then
 	git fetch origin linux-6.6.y
 else
 	log "Cloning linux-6.6.y (this will take a few minutes)..."
-	# Try mirrors in order: USTC, kernel.org, TUNA (last resort)
+	# Try mirrors in order: USTC, NetEase, Aliyun, TUNA (last resort)
 	CLONED=0
 	for url in \
 		"https://mirrors.ustc.edu.cn/linux-stable.git" \
-		"https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" \
+		"https://mirrors.163.com/linux-stable.git" \
+		"https://mirrors.aliyun.com/linux-stable.git" \
 		"https://mirrors.tuna.tsinghua.edu.cn/git/linux-stable.git"; do
 		log "Trying: $url"
 		if git clone --progress --depth 1 --branch linux-6.6.y "$url" "$LINUX_SRC"; then
@@ -148,12 +149,24 @@ mount -o loop "$ROOTFS_IMG" "$mnt"
 
 # Bootstrap Debian
 log "Bootstrapping Debian $DEBIAN_RELEASE (this will take several minutes)..."
-# Use TUNA mirror for faster bootstrap inside mainland China.
-DEBIAN_MIRROR="http://mirrors.tuna.tsinghua.edu.cn/debian"
-debootstrap --include=systemd,net-tools,iproute2,procps,util-linux,bash \
-	"$DEBIAN_RELEASE" "$mnt" "$DEBIAN_MIRROR" 2>&1 | tail -5
+# Try mirrors in order: USTC, NetEase, Aliyun, TUNA (last resort)
+BOOTSTRAPPED=0
+for deb_mir in \
+	"http://mirrors.ustc.edu.cn/debian" \
+	"http://mirrors.163.com/debian" \
+	"http://mirrors.aliyun.com/debian" \
+	"http://mirrors.tuna.tsinghua.edu.cn/debian"; do
+	log "Trying debootstrap mirror: $deb_mir"
+	if debootstrap --include=systemd,net-tools,iproute2,procps,util-linux,bash \
+		"$DEBIAN_RELEASE" "$mnt" "$deb_mir" 2>&1 | tail -3; then
+		[ -d "$mnt/bin" ] && BOOTSTRAPPED=1 && break
+	fi
+	log "Failed, trying next mirror..."
+done
+[ "$BOOTSTRAPPED" -eq 1 ] || die "debootstrap failed with all mirrors"
 
-[ -d "$mnt/bin" ] || die "debootstrap failed"
+# Use the successful mirror for chroot apt too
+DEBIAN_MIRROR="$deb_mir"
 
 # Install additional packages inside the rootfs
 log "Installing packages inside rootfs..."
