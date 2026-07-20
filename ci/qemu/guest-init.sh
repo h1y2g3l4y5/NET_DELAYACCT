@@ -17,13 +17,13 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo "=== QEMU guest boot: $(date -u) ==="
 
-# --- Mount essential filesystems ---
-mount -t proc  proc  /proc  -o nosuid,noexec,nodev
-mount -t sysfs sysfs /sys   -o nosuid,noexec,nodev
-mount -t devtmpfs dev /dev -o mode=0755,nosuid
+# --- Mount essential filesystems (idempotent — skip if already mounted) ---
+mountpoint -q /proc  || mount -t proc  proc  /proc  -o nosuid,noexec,nodev
+mountpoint -q /sys   || mount -t sysfs sysfs /sys   -o nosuid,noexec,nodev
+mountpoint -q /dev   || mount -t devtmpfs dev /dev -o mode=0755,nosuid
 mkdir -p /dev/pts /dev/shm
-mount -t devpts devpts /dev/pts -o mode=0620,gid=5
-mount -t tmpfs  tmpfs  /dev/shm
+mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts -o mode=0620,gid=5
+mountpoint -q /dev/shm || mount -t tmpfs  tmpfs  /dev/shm
 
 # --- Bring up loopback ---
 ip link set lo up 2>/dev/null || true
