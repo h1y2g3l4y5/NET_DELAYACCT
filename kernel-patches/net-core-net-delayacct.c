@@ -273,7 +273,17 @@ static struct sock *sock_from_file_safe(struct file *file)
 		return NULL;
 
 	sock = SOCKET_I(inode);
-	return sock ? sock->sk : NULL;
+	if (!sock) {
+		pr_info_ratelimited("net_delayacct: sock_from_file_safe: SOCKET_I returned NULL for inode %lu\n",
+				    inode->i_ino);
+		return NULL;
+	}
+	if (!sock->sk) {
+		pr_info_ratelimited("net_delayacct: sock_from_file_safe: sock->sk is NULL for inode %lu\n",
+				    inode->i_ino);
+		return NULL;
+	}
+	return sock->sk;
 }
 
 /* Iterate every socket fd of @task and emit a reply for each
@@ -308,6 +318,8 @@ static int net_delayacct_iter_task_sockets(struct task_struct *task,
 
 	spin_lock(&files->file_lock);
 	fdt = files_fdtable(files);
+	pr_info("net_delayacct: iter_task_sockets pid=%u max_fds=%u\n",
+		pid, fdt->max_fds);
 	for (fd = 0; fd < fdt->max_fds; fd++) {
 		struct file *file = fdt->fd[fd];
 		struct sock *sk;
@@ -315,8 +327,18 @@ static int net_delayacct_iter_task_sockets(struct task_struct *task,
 		if (!file)
 			continue;
 		sk = sock_from_file_safe(file);
-		if (!is_inet_tcp_udp(sk))
+		if (!sk)
 			continue;
+		if (!is_inet_tcp_udp(sk)) {
+			pr_info("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u SKIPPED\n",
+				fd, (unsigned long long)sock_inode_for(sk),
+				sk->sk_family, sk->sk_protocol);
+			continue;
+		}
+
+		pr_info("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u FOUND\n",
+			fd, (unsigned long long)sock_inode_for(sk),
+			sk->sk_family, sk->sk_protocol);
 
 		/* Hold a reference while we drop file_lock to send. */
 		get_file(file);
@@ -361,6 +383,8 @@ static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
 		return -EINVAL;
 
 	pid = nla_get_u32(info->attrs[NET_DELAYACCT_A_PID]);
+
+	pr_info("net_delayacct: cmd_get_by_pid: querying pid=%u\n", pid);
 
 	rcu_read_lock();
 	pidp = find_get_pid(pid);

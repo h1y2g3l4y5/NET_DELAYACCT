@@ -38,9 +38,11 @@ if /usr/local/bin/get_sockdelays -p 1 >/dev/null 2>&1; then
 else
 	# get_sockdelays failed — try to diagnose
 	/usr/local/bin/get_sockdelays -p 1 2>&1 | head -3
-	echo "dmesg:"
-	dmesg | grep -i "net_delayacct\|net-delayacct" || echo "  (no kernel messages)"
 fi
+
+# Always show kernel net_delayacct messages for debugging
+echo "Kernel net_delayacct messages:"
+dmesg | grep -i "net_delayacct" || echo "  (no net_delayacct kernel messages)"
 
 # --- Find and run test scripts ---
 TEST_ROOT="/opt/net_delayacct_tests"
