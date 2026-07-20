@@ -50,8 +50,8 @@ USER_NAME="${SUDO_USER:-$USER}"
 # Adjust workdir for root's perspective
 if [ "$USER_NAME" != "root" ] && [ -n "$USER_NAME" ]; then
 	WORKDIR="/home/$USER_NAME"
-	LINUX_SRC="${LINUX_SRC:-$WORKDIR/linux-6.6}"
-	ROOTFS_IMG="${ROOTFS_IMG:-$WORKDIR/qemu-rootfs.img}"
+	LINUX_SRC="$WORKDIR/linux-6.6"
+	ROOTFS_IMG="$WORKDIR/qemu-rootfs.img"
 fi
 
 # ============================================================================
