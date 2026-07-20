@@ -28,8 +28,6 @@ die()  { log "FATAL: $*"; exit 1; }
 # ============================================================================
 # Configuration — override via environment
 # ============================================================================
-# Auto-detect repo
-# ============================================================================
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 for d in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$SCRIPT_DIR/../.."; do
 	if [ -f "$d/../userspace/get_sockdelays/get_sockdelays.c" ]; then
@@ -37,22 +35,14 @@ for d in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$SCRIPT_DIR/../.."; do
 		break
 	fi
 done
-NETDELAY_REPO="${NETDELAY_REPO:-$WORKDIR/NET_DELAYACCT}"
+NETDELAY_REPO="${NETDELAY_REPO:-$HOME/NET_DELAYACCT}"
 
-WORKDIR="${WORKDIR:-$HOME}"   # Will be adjusted for root below
-# (NETDELAY_REPO already set above if detected)
-LINUX_SRC="${LINUX_SRC:-$WORKDIR/linux-6.6}"
-ROOTFS_IMG="${ROOTFS_IMG:-$WORKDIR/qemu-rootfs.img}"
+# Derived paths: everything lives alongside the repo
+LINUX_SRC="${LINUX_SRC:-$NETDELAY_REPO/../linux-6.6}"
+ROOTFS_IMG="${ROOTFS_IMG:-$NETDELAY_REPO/../qemu-rootfs.img}"
 ROOTFS_SIZE="${ROOTFS_SIZE:-2G}"
 DEBIAN_RELEASE="${DEBIAN_RELEASE:-bookworm}"
 USER_NAME="${SUDO_USER:-$USER}"
-
-# Adjust workdir for root's perspective
-if [ "$USER_NAME" != "root" ] && [ -n "$USER_NAME" ]; then
-	WORKDIR="/home/$USER_NAME"
-	LINUX_SRC="$WORKDIR/linux-6.6"
-	ROOTFS_IMG="$WORKDIR/qemu-rootfs.img"
-fi
 
 # ============================================================================
 # Step 1: Install system dependencies
@@ -92,16 +82,21 @@ if [ -d "$LINUX_SRC/.git" ]; then
 	cd "$LINUX_SRC"
 	git fetch origin linux-6.6.y
 else
-	log "Cloning linux-6.6.y from mirror (this will take a few minutes)..."
-	# Use TUNA mirror for faster clone inside mainland China.
-	# Fallback to kernel.org if the mirror is unavailable.
-	KERNEL_URL="https://mirrors.tuna.tsinghua.edu.cn/git/linux-stable.git"
-	if ! git clone --progress --depth 1 --branch linux-6.6.y "$KERNEL_URL" "$LINUX_SRC"; then
-		log "Mirror failed, falling back to kernel.org..."
-		git clone --progress --depth 1 --branch linux-6.6.y \
-			https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
-			"$LINUX_SRC"
-	fi
+	log "Cloning linux-6.6.y (this will take a few minutes)..."
+	# Try mirrors in order: USTC, kernel.org, TUNA (last resort)
+	CLONED=0
+	for url in \
+		"https://mirrors.ustc.edu.cn/linux-stable.git" \
+		"https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" \
+		"https://mirrors.tuna.tsinghua.edu.cn/git/linux-stable.git"; do
+		log "Trying: $url"
+		if git clone --progress --depth 1 --branch linux-6.6.y "$url" "$LINUX_SRC"; then
+			CLONED=1
+			break
+		fi
+		log "Failed, trying next mirror..."
+	done
+	[ "$CLONED" -eq 1 ] || die "All mirrors failed, cannot clone kernel source"
 fi
 
 # Fix ownership
@@ -147,7 +142,7 @@ dd if=/dev/zero of="$ROOTFS_IMG" bs=1 count=0 seek="$ROOTFS_SIZE" status=none
 mkfs.ext4 -F "$ROOTFS_IMG" 2>&1 | tail -1
 
 # Mount it
-local mnt="/tmp/qemu-rootfs-create-$$"
+mnt="/tmp/qemu-rootfs-create-$$"
 mkdir -p "$mnt"
 mount -o loop "$ROOTFS_IMG" "$mnt"
 
