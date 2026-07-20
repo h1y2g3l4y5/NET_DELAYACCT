@@ -68,66 +68,87 @@ check_prereqs() {
 }
 
 # Apply project patches into the kernel source tree.
-# Idempotent — will git reset first.
+# Uses a build marker to avoid full reset when nothing changed.
 apply_patches() {
 	log "Applying NET_DELAYACCT patches to kernel source..."
 	cd "$LINUX_SRC"
 
-	# Reset any previous changes first
-	git checkout -- . 2>/dev/null || true
-	git clean -fd 2>/dev/null || true
+	local current_kernel="$(git rev-parse HEAD)"
+	local current_repo="$(cd "$NETDELAY_REPO" && git rev-parse HEAD)"
+	local marker="$LINUX_SRC/.netdelay_build_marker"
+	local full_reset=1
 
-	# Install new source files
+	# Check marker: if kernel + repo commits unchanged, skip full reset
+	if [ -f "$marker" ]; then
+		local saved_kernel saved_repo
+		saved_kernel="$(head -1 "$marker")"
+		saved_repo="$(tail -1 "$marker")"
+		if [ "$saved_kernel" = "$current_kernel" ] && [ "$saved_repo" = "$current_repo" ]; then
+			full_reset=0
+			log "  Kernel source unchanged from last build, using incremental mode"
+		else
+			log "  Kernel or repo changed, doing full reset"
+		fi
+	fi
+
+	if [ "$full_reset" -eq 1 ]; then
+		git checkout -- . 2>/dev/null || true
+		git clean -fd 2>/dev/null || true
+
+		# Append Kconfig/Makefile fragments
+		if ! grep -q "CONFIG_NET_DELAYACCT" net/Kconfig 2>/dev/null; then
+			cat "$KERNEL_PATCH_DIR/Kconfig-fragment" >> net/Kconfig
+		fi
+		if ! grep -q "net-delayacct" net/core/Makefile 2>/dev/null; then
+			cat "$KERNEL_PATCH_DIR/Makefile-fragment" >> net/core/Makefile
+		fi
+		log "  Appended Kconfig/Makefile fragments"
+
+		# Apply .patch files
+		shopt -s nullglob
+		local patches=("$KERNEL_PATCH_DIR/"*.patch)
+		for p in "${patches[@]}"; do
+			log "  Applying $(basename "$p")..."
+			if ! git apply "$p" 2>/dev/null; then
+				if ! patch -p1 --fuzz=3 < "$p" 2>/dev/null; then
+					log "  WARNING: failed to apply $(basename "$p"), trying to continue..."
+				fi
+			fi
+		done
+	else
+		log "  Skipping full reset — only updating net-delayacct source files"
+	fi
+
+	# Always re-install source files (catches changes to the .c/.h files)
 	sudo install -m 0644 "$KERNEL_PATCH_DIR/include-net-net-delayacct.h"        include/net/net-delayacct.h
 	sudo install -m 0644 "$KERNEL_PATCH_DIR/include-uapi-linux-net-delayacct.h" include/uapi/linux/net-delayacct.h
 	sudo install -m 0644 "$KERNEL_PATCH_DIR/net-core-net-delayacct.c"           net/core/net-delayacct.c
 
-	# Append Kconfig/Makefile fragments (idempotent — check if already present)
-	if ! grep -q "CONFIG_NET_DELAYACCT" net/Kconfig 2>/dev/null; then
-		cat "$KERNEL_PATCH_DIR/Kconfig-fragment" >> net/Kconfig
-		log "  Appended Kconfig fragment"
-	else
-		log "  Kconfig fragment already present, skipped"
-	fi
+	# Save build marker
+	echo "$current_kernel" > "$marker"
+	echo "$current_repo" >> "$marker"
 
-	if ! grep -q "net-delayacct" net/core/Makefile 2>/dev/null; then
-		cat "$KERNEL_PATCH_DIR/Makefile-fragment" >> net/core/Makefile
-		log "  Appended Makefile fragment"
-	else
-		log "  Makefile fragment already present, skipped"
-	fi
-
-	# Apply .patch files
-	local apply_failed=0
-	shopt -s nullglob
-	local patches=("$KERNEL_PATCH_DIR/"*.patch)
-	for p in "${patches[@]}"; do
-		log "  Applying $(basename "$p")..."
-		if ! git apply "$p" 2>/dev/null; then
-			if ! patch -p1 --fuzz=3 < "$p" 2>/dev/null; then
-				log "  WARNING: failed to apply $(basename "$p"), trying to continue..."
-				apply_failed=1
-			fi
-		fi
-	done
-
-	return $apply_failed
+	return 0
 }
 
 # Configure and build the kernel.
+# Keeps .config between runs for incremental builds.
 build_kernel() {
-	log "Configuring kernel..."
 	cd "$LINUX_SRC"
 
-	# Start from defconfig for a clean but functional base
-	make defconfig 2>&1 | tail -1
+	if [ -f .config ]; then
+		log "Kernel config exists — incremental build (skipping defconfig)"
+	else
+		log "Configuring kernel (first time)..."
+		make defconfig 2>&1 | tail -1
 
-	# Merge our config fragments
-	"$LINUX_SRC/scripts/kconfig/merge_config.sh" -m .config \
-		"$NETDELAY_REPO/ci/kernel.config.fragment" \
-		"$SCRIPT_DIR/kernel-qemu.config" 2>&1 | tail -3
+		# Merge our config fragments
+		"$LINUX_SRC/scripts/kconfig/merge_config.sh" -m .config \
+			"$NETDELAY_REPO/ci/kernel.config.fragment" \
+			"$SCRIPT_DIR/kernel-qemu.config" 2>&1 | tail -3
 
-	make olddefconfig 2>&1 | tail -1
+		make olddefconfig 2>&1 | tail -1
+	fi
 
 	# Verify critical configs
 	log "Verifying config:"
