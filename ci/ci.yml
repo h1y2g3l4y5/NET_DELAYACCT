@@ -105,6 +105,27 @@ jobs:
             git apply "$p" || patch -p1 < "$p"
           done
 
+      - name: Install new NET_DELAYACCT source files
+        run: |
+          set -e
+          kp="$GITHUB_WORKSPACE/kernel-patches"
+          install -m 0644 "$kp/include-net-net-delayacct.h"        "$LINUX_SRC/include/net/net-delayacct.h"
+          install -m 0644 "$kp/include-uapi-linux-net-delayacct.h" "$LINUX_SRC/include/uapi/linux/net-delayacct.h"
+          install -m 0644 "$kp/net-core-net-delayacct.c"           "$LINUX_SRC/net/core/net-delayacct.c"
+          cat "$kp/Makefile-fragment" >> "$LINUX_SRC/net/core/Makefile"
+          cat "$kp/Kconfig-fragment"  >> "$LINUX_SRC/net/Kconfig"
+          echo "=== Installed files ==="
+          ls -la "$LINUX_SRC/include/net/net-delayacct.h" \
+                 "$LINUX_SRC/include/uapi/linux/net-delayacct.h" \
+                 "$LINUX_SRC/net/core/net-delayacct.c"
+
+      - name: Initialize sk_net_delayacct in sk_prot_alloc
+        run: |
+          sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&sk->sk_net_delayacct);/' \
+            "$LINUX_SRC/net/core/sock.c"
+          echo "=== sock.c after init insertion ==="
+          grep -A1 'sk_tx_queue_clear' "$LINUX_SRC/net/core/sock.c"
+
       - name: Configure kernel with fragment
         run: |
           cd "$LINUX_SRC"

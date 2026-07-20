@@ -76,6 +76,9 @@ for p in "$KERNEL_PATCH_DIR/"*.patch; do
 		}
 	fi
 done
+log "  Initializing sk_net_delayacct in sk_prot_alloc (Bug1 fix)"
+sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&sk->sk_net_delayacct);/' net/core/sock.c
+grep -A1 'sk_tx_queue_clear' net/core/sock.c
 endlog
 
 # ============================================================================

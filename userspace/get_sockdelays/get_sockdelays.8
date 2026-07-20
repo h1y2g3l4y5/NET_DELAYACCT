@@ -1,0 +1,138 @@
+.TH GET_SOCKDELAYS 8 "2026-07-13" "Linux 6.6" "System Administration"
+.SH NAME
+get_sockdelays \- display per-socket network delay statistics
+.SH SYNOPSIS
+.B get_sockdelays
+.RB [ \-p
+.IR pid ]
+.RB [ \-i
+.IR inode ]
+.RB [ \-r ]
+.RB [ \-n ]
+.RB [ \-h ]
+.SH DESCRIPTION
+.B get_sockdelays
+queries the kernel "net_delayacct" generic netlink family (provided
+by the
+.B CONFIG_NET_DELAYACCT
+option) to retrieve per-socket network delay statistics.
+.PP
+It is the socket-level counterpart of
+.BR getdelays (8),
+which queries the
+.B taskstats
+family for per-task delay accounting.
+.PP
+For each TCP/UDP socket held by a target process, the kernel returns:
+.IP \(bu 2
+socket type (TCP/UDP) and address family (IPv4/IPv6)
+.IP \(bu 2
+local and remote IP addresses and ports
+.IP \(bu 2
+owning task comm and PID
+.IP \(bu 2
+socket inode number
+.IP \(bu 2
+cumulative receive and send latencies (in nanoseconds) and the
+corresponding packet counts
+.PP
+The average latency is computed by the tool as
+.I total_ns / count
+and is displayed in microseconds by default (or nanoseconds with
+.BR \-n ).
+When the packet count is zero, the average is shown as
+.IR N/A .
+.SH OPTIONS
+Exactly one of
+.BR \-p , " \-i , " " \-r "
+must be specified.
+.TP
+.BR \-p " " \fIpid\fR
+Display statistics for every TCP/UDP socket held by the process with
+PID
+.IR pid .
+Each socket is printed on its own line.
+.TP
+.BR \-i " " \fIinode\fR
+Display statistics only for the socket whose inode number matches
+.IR inode .
+.TP
+.BR \-r
+Reset all per-socket delay statistics in the kernel to zero. Requires
+.B CAP_NET_ADMIN
+(equivalently, root).
+.TP
+.BR \-n
+Print latencies in nanoseconds (default: microseconds, two decimal
+places).
+.TP
+.BR \-h
+Print a usage message and exit.
+.SH OUTPUT
+The tool prints a header line followed by one line per socket. Fields
+are (in order):
+.RS
+.TS
+lb l.
+TYPE	protocol: TCP or UDP
+FAMILY	address family: INET (IPv4) or INET6 (IPv6)
+LADDR	local IP address
+LPORT	local port (host byte order)
+RADDR	remote IP address
+RPORT	remote port (host byte order)
+COMM	owning task comm
+PID	owning task PID
+INODE	socket inode number
+AVG_RX	average receive latency (us, or ns with \-n; N/A if count==0)
+AVG_TX	average send latency (us, or ns with \-n; N/A if count==0)
+.TE
+.RE
+.SH EXAMPLES
+.TP
+Show all sockets of PID 1234:
+.B get_sockdelays -p 1234
+.TP
+Show the socket with inode 8765432:
+.B get_sockdelays -i 8765432
+.TP
+Reset all statistics:
+.B get_sockdelays -r
+.TP
+Display latencies in nanoseconds:
+.B get_sockdelays -p 1234 -n
+.SH FILES
+.TP
+.I /proc/net/genetlink
+Lists registered generic netlink families; the
+.I net_delayacct
+family appears here when the kernel option is enabled.
+.TP
+.I /proc/<pid>/fd
+Used to discover socket inode numbers for use with
+.BR \-i .
+.SH SEE ALSO
+.BR getdelays (8),
+.BR ss (8),
+.BR iperf3 (1),
+.BR netperf (1),
+.BR delay-accounting (7),
+.BR taskstats (7)
+.SH AVAILABILITY
+The
+.B get_sockdelays
+source is shipped under
+.I tools/net/get_sockdelays/
+in the project tree. The corresponding kernel framework lives in
+.I net/core/net-delayacct.c
+and is enabled by the
+.B CONFIG_NET_DELAYACCT
+Kconfig option.
+.SH AUTHOR
+h1y2g3l4y5 <h1y2g3l4y5@example.com>
+.SH COPYRIGHT
+Copyright \(co 2026 h1y2g3l4y5.
+.br
+License GPL-2.0-only
+.br
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.

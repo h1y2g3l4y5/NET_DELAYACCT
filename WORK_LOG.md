@@ -81,76 +81,14 @@
 - 解决 sudo 权限问题：配置 `lai ALL=(ALL) NOPASSWD: ALL`，CI 结束后 `chown` 修复 root 文件
 - Workflow 添加 `permissions: contents: write` 解决 git push 403 错误
 
----
-
-## 2026-07-20（下午）— 代码 Bug 分析与修复
-
-### 工作总结
-对内核态 net-delayacct 框架的完整代码进行静态分析（涉及 4 个 patch 文件 + 3 个内核源码文件 + 用户态工具 + 测试脚本），定位 socket 延迟数据无法采集的根因，并完成 P0 级别修复。
-
-### Bug 1（P0 / 致命）：`sk_net_delayacct` 从未被初始化
-
-**定位文件：**
-- [sock_h-modification.patch](kernel-patches/sock_h-modification.patch) — 在 `struct sock` 中嵌入了 `struct net_delayacct sk_net_delayacct`
-- [include-net-net-delayacct.h](kernel-patches/include-net-net-delayacct.h#L41-L45) — 定义了 `net_delayacct_init()` 初始化函数
-
-**根因：** `struct net_delayacct` 包含 `spinlock_t lock` 和 `struct net_delayacct_stats stats`。spinlock 必须通过 `spin_lock_init()` 初始化才能使用，stats 必须清零。但 `net_delayacct_init()` 在整个内核的 sock 分配路径（`sk_prot_alloc` / `sk_alloc` / `sock_init_data`）中从未被调用。内核通过 `kmem_cache_alloc` 分配的 sock 内存不保证清零，因此 `sk_net_delayacct.lock` 中包含随机垃圾值。后续所有 `spin_lock(&n->lock)` 操作行为未定义，tx/rx count 和 total_ns 永远为 0。
-
-**修复方案：** 在 `net/core/sock.c` 的 `sk_prot_alloc()` 中，sock 分配成功后立即调用 `net_delayacct_init(&sk->sk_net_delayacct)`。该函数在 `CONFIG_NET_DELAYACCT=n` 时是空实现，无需 ifdef 保护。详见新增的 [sock-init-net-delayacct.patch](kernel-patches/sock-init-net-delayacct.patch)。
-
-**影响范围：** 所有 TCP/UDP socket 的 RX/TX 延迟统计全部为 0。
-
----
-
-### Bug 2（P0 / 致命）：GRO 合并导致 RX 路径 `delayacct_start` 丢失
-
-**定位文件：**
-- [rx-instrumentation.patch](kernel-patches/rx-instrumentation.patch) — RX 打点：`net_delayacct_rx_start(skb)` 在 `__netif_receive_skb_core` 入口
-- [net-core-net-delayacct.c](kernel-patches/net-core-net-delayacct.c#L502-L519) — `net_delayacct_rx_end()` 中 `if (!start) return;` 提前退出
-
-**根因：** TCP GRO（Generic Receive Offload）会在 `napi_gro_receive` → `tcp_gro_receive` 路径中将多个到达的 skb 合并为一个。被合并的原始 skb（带有 `delayacct_start` 时间戳）被 `kfree_skb` 释放掉，仅保留合并后的 GRO skb。GRO skb 的 `delayacct_start` 只继承第一个 skb 的值，后续合并进来的 skb 的时间戳全部丢失。当 `tcp_recvmsg_locked` 最终从接收队列取出 skb 调用 `net_delayacct_rx_end(sk, skb)` 时：
-- 对于后续合并的包：`delayacct_start == 0` → 函数直接 return，数据丢失
-- 对于第一个包：延迟测量为"第一个包到达时间"而非"当前包到达时间"，数据不准确
-
-**设计缺陷：** 把时间戳存在 `sk_buff` 上本质上是不可靠的，因为 skb 在内核中会被 clone、merge、split、free。本框架需要的是 per-socket 级别的状态追踪，而不是 per-skb。
-
-**影响范围：** 非 loopback 场景下（如真实网卡、virtio-net），RX 延迟数据大量丢失。loopback 场景下无 GRO，不受影响。
-
-**待修复。**
-
----
-
-### Bug 3（P1 / 重要）：Genl dump 机制设计错误
-
-**定位文件：**
-- [net-core-net-delayacct.c](kernel-patches/net-core-net-delayacct.c#L68-L84) — 所有 genl ops 都用 `.doit` 回调
-- [get_sockdelays.c](userspace/get_sockdelays/get_sockdelays.c#L308-L309) — 用户态发送 `NLM_F_REQUEST | NLM_F_DUMP`
-
-**根因：** 内核 genl 框架中，`NLM_F_DUMP`（多消息回复）应与 `.dumpit` 回调搭配使用，并配合 `netlink_dump_start` 机制。但当前代码使用 `.doit` 回调手动逐个发送多消息 + NLMSG_DONE 终结符，这不是标准的内核 dump 流程。可能引起：
-- 用户态接收超时或数据不完整
-- netlink 消息乱序（.doit 不走 dump 专用 socket）
-
-**影响范围：** 多 socket 查询场景下（如 `get_sockdelays -p <pid>` 返回多个 socket），用户态可能接收到不完整的数据（部分 socket 被截断或丢失）。
-
-**待修复。**
-
----
-
-### 代码审查总结
-
-| 组件 | 状态 | 说明 |
-|------|------|------|
-| `sock_h-modification.patch` | 正确 | `struct sock` 中正确嵌入了 `sk_net_delayacct` |
-| `skbuff_h-modification.patch` | 正确 | `struct sk_buff` 中正确添加了 `delayacct_start` |
-| `rx-instrumentation.patch` | 打点位置正确，但受 Bug2 影响 | `__netif_receive_skb_core` 入口 + `tcp/udp_recvmsg` 出口 |
-| `tx-instrumentation.patch` | 打点位置正确 | `tcp_sendmsg_locked`/`udp_sendmsg` 入口 + `dev_hard_start_xmit` 出口 |
-| `net-core-net-delayacct.c` | 逻辑正确 | genl family 注册、sock 遍历、netlink 回复均正确 |
-| `net_delayacct_rx_end()` | 受 Bug1+Bug2 影响 | spinlock 未初始化 + GRO 丢失时间戳 |
-| `net_delayacct_tx_end()` | 受 Bug1 影响 | spinlock 未初始化 |
-| `net_delayacct_get_stats()` | 受 Bug1 影响 | spinlock 未初始化 |
-| `get_sockdelays.c` | 正确 | 用户态 netlink 通信逻辑正确 |
-
-### 提交记录
-| 提交 | 说明 |
-|------|------|
-| (待提交) | fix: add net_delayacct_init() call in sk_prot_alloc (Bug1) |
+**11. Trae Agent SSH 远程连接后卡在"正在分析问题"**
+- 问题：Trae IDE 通过 SSH Remote 连接 VM（桥接模式 IP 10.36.128.232），使用 Agent 功能时一直卡在"正在分析问题"
+- 排查：VM 内 `ai-agent` 进程已运行但无响应，最初怀疑内存不足（VM 仅 3.8 GB，Trae 相关服务占用约 930 MB）
+- 根因：**DNS 不通**。桥接模式 DHCP 下发网关 `10.36.128.196` 作为 DNS 服务器，但该网关不提供 DNS 服务，导致 `systemd-resolved`（127.0.0.53）所有 DNS 请求超时。Agent 需要解析 AI 服务域名，DNS 超时导致卡死
+- 解决：临时观察到 DNS 恢复（网关可能间歇性响应），永久方案是将 `/etc/resolv.conf` 改为静态公共 DNS：
+  ```bash
+  sudo rm /etc/resolv.conf
+  echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+  echo "nameserver 114.114.114.114" | sudo tee -a /etc/resolv.conf
+  sudo chattr +i /etc/resolv.conf
+  ```
