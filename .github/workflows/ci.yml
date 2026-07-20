@@ -188,6 +188,12 @@ jobs:
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
+        with:
+          clean: false
 
       - name: Run QEMU test pipeline
         run: sudo -E bash ci/qemu/ci-test.sh
+
+      - name: Fix permissions (sudo creates root-owned files)
+        if: always()
+        run: sudo chown -R lai:lai /home/lai/actions-runner/_work/NET_DELAYACCT/
