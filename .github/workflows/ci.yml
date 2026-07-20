@@ -174,3 +174,18 @@ jobs:
         run: |
           test -x userspace/get_sockdelays/get_sockdelays
           ./userspace/get_sockdelays/get_sockdelays -h || true
+
+  qemu-test:
+    name: QEMU runtime test (self-hosted)
+    runs-on: self-hosted
+    if: github.event_name == 'push'
+    timeout-minutes: 60
+    env:
+      LINUX_SRC: /home/runner/linux-6.6
+      ROOTFS_IMG: /home/runner/qemu-rootfs.img
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Run QEMU test pipeline
+        run: sudo bash ci/qemu/ci-test.sh
