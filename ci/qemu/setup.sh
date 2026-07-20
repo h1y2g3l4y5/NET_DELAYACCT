@@ -28,8 +28,19 @@ die()  { log "FATAL: $*"; exit 1; }
 # ============================================================================
 # Configuration — override via environment
 # ============================================================================
-WORKDIR="${WORKDIR:-$HOME}"   # Will be adjusted for root below
+# Auto-detect repo
+# ============================================================================
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+for d in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$SCRIPT_DIR/../.."; do
+	if [ -f "$d/../userspace/get_sockdelays/get_sockdelays.c" ]; then
+		NETDELAY_REPO="$(cd "$d/.." && pwd)"
+		break
+	fi
+done
 NETDELAY_REPO="${NETDELAY_REPO:-$WORKDIR/NET_DELAYACCT}"
+
+WORKDIR="${WORKDIR:-$HOME}"   # Will be adjusted for root below
+# (NETDELAY_REPO already set above if detected)
 LINUX_SRC="${LINUX_SRC:-$WORKDIR/linux-6.6}"
 ROOTFS_IMG="${ROOTFS_IMG:-$WORKDIR/qemu-rootfs.img}"
 ROOTFS_SIZE="${ROOTFS_SIZE:-2G}"
@@ -39,9 +50,8 @@ USER_NAME="${SUDO_USER:-$USER}"
 # Adjust workdir for root's perspective
 if [ "$USER_NAME" != "root" ] && [ -n "$USER_NAME" ]; then
 	WORKDIR="/home/$USER_NAME"
-	NETDELAY_REPO="$WORKDIR/NET_DELAYACCT"
-	LINUX_SRC="$WORKDIR/linux-6.6"
-	ROOTFS_IMG="$WORKDIR/qemu-rootfs.img"
+	LINUX_SRC="${LINUX_SRC:-$WORKDIR/linux-6.6}"
+	ROOTFS_IMG="${ROOTFS_IMG:-$WORKDIR/qemu-rootfs.img}"
 fi
 
 # ============================================================================
@@ -105,13 +115,9 @@ log "Kernel source ready at $LINUX_SRC"
 log "=== Step 3: Cloning NET_DELAYACCT repo ==="
 
 if [ -d "$NETDELAY_REPO/.git" ]; then
-	log "Repo already exists at $NETDELAY_REPO, fetching latest..."
+	log "Repo ready at $NETDELAY_REPO"
 	cd "$NETDELAY_REPO"
 	git fetch origin 2>/dev/null || log "Fetch failed (non-fatal), using existing code"
-elif [ -d "$(dirname "$0")/../../.git" ]; then
-	# Fallback: symlink the repo we are running from
-	log "Linking repo from $(dirname "$0")/../.. to $NETDELAY_REPO"
-	ln -sfn "$(cd "$(dirname "$0")/../.." && pwd)" "$NETDELAY_REPO"
 else
 	log "Cloning NET_DELAYACCT..."
 	git clone https://github.com/h1y2g3l4y5/NET_DELAYACCT.git "$NETDELAY_REPO"
