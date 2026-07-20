@@ -28,9 +28,19 @@ set -euo pipefail
 # ============================================================================
 # Configuration
 # ============================================================================
+# Auto-detect NETDELAY_REPO by walking up from SCRIPT_DIR
+NETDELAY_REPO=""
+for d in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$SCRIPT_DIR/../.."; do
+	if [ -f "$d/../userspace/get_sockdelays/get_sockdelays.c" ]; then
+		NETDELAY_REPO="$(cd "$d/.." && pwd)"
+		break
+	fi
+done
 NETDELAY_REPO="${NETDELAY_REPO:-$HOME/NET_DELAYACCT}"
-LINUX_SRC="${LINUX_SRC:-$HOME/linux-6.6}"
-ROOTFS_IMG="${ROOTFS_IMG:-$HOME/qemu-rootfs.img}"
+
+# Derived paths: everything lives alongside the repo (same as setup.sh)
+LINUX_SRC="${LINUX_SRC:-$NETDELAY_REPO/../linux-6.6}"
+ROOTFS_IMG="${ROOTFS_IMG:-$NETDELAY_REPO/../qemu-rootfs.img}"
 QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
 BRANCH="${BRANCH:-main}"
 LAST_TESTED_FILE="$NETDELAY_REPO/.qemu_last_tested"
