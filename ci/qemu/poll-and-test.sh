@@ -133,8 +133,12 @@ build_kernel() {
 	log "Verifying config:"
 	grep -E 'CONFIG_(NET_DELAYACCT|VIRTIO_BLK|VIRTIO_NET|EXT4_FS)=' .config || true
 
-	log "Building kernel (this may take a while)..."
-	make -j"$(nproc)" CC="${CC:-gcc}" bzImage 2>&1 | tail -5
+	log "Building kernel (this may take a while, progress shown below)..."
+	echo ""
+	make -j"$(nproc)" CC="${CC:-gcc}" bzImage 2>&1
+	local make_rc=$?
+	echo ""
+	[ "$make_rc" -eq 0 ] || die "Kernel build failed (exit code $make_rc)"
 	[ -f arch/x86/boot/bzImage ] || die "bzImage not built"
 
 	log "Kernel build complete: arch/x86/boot/bzImage"
@@ -195,7 +199,7 @@ prepare_rootfs() {
 	sudo chmod +x "$mnt/opt/net_delayacct_tests/func/"*.sh 2>/dev/null || true
 
 	sudo umount "$mnt"
-	rmdir "$mnt"
+	sudo rmdir "$mnt"
 	log "Rootfs prepared"
 }
 
