@@ -70,9 +70,16 @@ tests/reports/*.log
 tests/reports/*.xml
 tests/reports/*.json
 tests/reports/*.txt
+# QEMU test reports are committed back to repo — allow them
+!tests/reports/qemu/
+!tests/reports/qemu/*.txt
+!tests/reports/qemu/*.log
 *.log
 test-results/
 *.tap
+
+# QEMU local state (not committed)
+.qemu_last_tested
 
 # Patch artifacts / 补丁中间产物
 *.patch.rej
