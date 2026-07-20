@@ -94,6 +94,7 @@ apply_patches() {
 	if [ "$full_reset" -eq 1 ]; then
 		git checkout -- . 2>/dev/null || true
 		git clean -fd 2>/dev/null || true
+		rm -f .config   # force reconfig when kernel/repo changed
 
 		# Append Kconfig/Makefile fragments
 		if ! grep -q "CONFIG_NET_DELAYACCT" net/Kconfig 2>/dev/null; then
@@ -181,6 +182,23 @@ build_tool() {
 	log "Tool build complete: userspace/get_sockdelays/get_sockdelays"
 }
 
+# Build the kernel's built-in getdelays tool (CONFIG_TASK_DELAY_ACCT userspace).
+build_getdelays() {
+	log "Building getdelays tool (kernel task delay accounting)..."
+	cd "$LINUX_SRC"
+
+	if [ ! -f tools/accounting/getdelays.c ]; then
+		log "  getdelays.c not found in kernel tree, skipping"
+		return 0
+	fi
+
+	gcc -o /tmp/getdelays tools/accounting/getdelays.c -I/usr/include 2>&1 || {
+		log "  WARNING: getdelays build failed (non-fatal)"
+		return 0
+	}
+	log "Tool build complete: /tmp/getdelays"
+}
+
 # Prepare rootfs: copy latest binary, test scripts, init script into the image.
 prepare_rootfs() {
 	log "Preparing rootfs image..."
@@ -196,6 +214,12 @@ prepare_rootfs() {
 	# Copy get_sockdelays binary
 	sudo install -m 0755 "$NETDELAY_REPO/userspace/get_sockdelays/get_sockdelays" \
 		"$mnt/usr/local/bin/get_sockdelays"
+
+	# Copy kernel built-in getdelays binary (if built)
+	if [ -f /tmp/getdelays ]; then
+		sudo install -m 0755 /tmp/getdelays "$mnt/usr/local/bin/getdelays"
+		log "Installed getdelays to rootfs"
+	fi
 
 	# Copy test scripts
 	sudo rm -rf "$mnt/opt/net_delayacct_tests"
@@ -363,6 +387,9 @@ main() {
 	fi
 	if [ "$build_ok" -eq 1 ]; then
 		build_tool || build_ok=0
+	fi
+	if [ "$build_ok" -eq 1 ]; then
+		build_getdelays || build_ok=0
 	fi
 
 	if [ "$build_ok" -eq 1 ]; then
