@@ -33,14 +33,19 @@ modprobe net-delayacct 2>/dev/null || true
 
 # --- Verify genl family is registered ---
 echo "Checking net_delayacct genl family..."
+# Try exact match first, then flexible search, then show raw content
 if grep -q "net_delayacct" /proc/net/genetlink 2>/dev/null; then
 	echo "genl family registered OK"
+elif grep -qi "net.delayacct\|delayacct" /proc/net/genetlink 2>/dev/null; then
+	echo "genl family found (fuzzy match):"
+	grep -i "net.delayacct\|delayacct" /proc/net/genetlink
 else
 	echo "WARNING: net_delayacct genl family not found in /proc/net/genetlink"
+	echo "/proc/net/genetlink first 10 lines:"
+	head -10 /proc/net/genetlink 2>/dev/null || echo "  (file empty or unreadable)"
+	echo ""
 	echo "Kernel messages for net_delayacct:"
 	dmesg | grep -i "net_delayacct\|net-delayacct\|net_delay" || echo "  (no messages found)"
-	echo "Checking if module is loaded:"
-	lsmod | grep delayacct 2>/dev/null || echo "  (not found in lsmod)"
 fi
 
 # --- Find and run test scripts ---
