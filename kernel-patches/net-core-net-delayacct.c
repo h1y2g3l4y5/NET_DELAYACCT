@@ -417,12 +417,14 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 {
 	u64 target_inode;
 	struct task_struct *task;
+	int sock_count = 0;
+	int match_count = 0;
 
 	if (!info->attrs[NET_DELAYACCT_A_INODE])
 		return -EINVAL;
 	target_inode = nla_get_u64(info->attrs[NET_DELAYACCT_A_INODE]);
 
-	pr_emerg("net_delayacct: cmd_get_by_inode: querying inode=%llu\n",
+	pr_emerg("net_delayacct: cmd_get_by_inode: ENTER target_inode=%llu\n",
 		 (unsigned long long)target_inode);
 
 	rcu_read_lock();
@@ -450,11 +452,23 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 			if (!file)
 				continue;
 			sk = sock_from_file_safe(file);
+			if (!sk)
+				continue;
 			if (!is_inet_tcp_udp(sk))
 				continue;
-			ino = sock_inode_for(sk);
+			sock_count++;
+			/* Use file_inode directly — more reliable than
+			 * sock_inode_for() which depends on sk->sk_socket->file
+			 * (may be NULL in some kernel versions).
+			 */
+			ino = file_inode(file)->i_ino;
+			pr_emerg("net_delayacct: cmd_get_by_inode: pid=%d fd=%u ino=%llu sk_family=%u sk_proto=%u\n",
+				 task_pid_nr(task), fd,
+				 (unsigned long long)ino,
+				 sk->sk_family, sk->sk_protocol);
 			if (ino != target_inode)
 				continue;
+			match_count++;
 
 			get_file(file);
 			sock_hold(sk);
@@ -467,6 +481,7 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 			fput(file);
 			put_files_struct(files);
 			rcu_read_unlock();
+			pr_emerg("net_delayacct: cmd_get_by_inode: MATCH ret=%d\n", ret);
 			return ret;
 		}
 		spin_unlock(&files->file_lock);
@@ -474,6 +489,8 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 	}
 	rcu_read_unlock();
 
+	pr_emerg("net_delayacct: cmd_get_by_inode: EXIT sock_count=%d match_count=%d (returning -ENOENT)\n",
+		 sock_count, match_count);
 	return -ENOENT;
 }
 

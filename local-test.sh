@@ -37,10 +37,10 @@ NC='\033[0m'
 
 init_log() {
 	mkdir -p "$LOG_DIR"
-	exec > >(tee -a "$LOG_FILE") 2>&1
-	echo "=== Local Test $(date) ==="
-	echo "Log: $LOG_FILE"
-	echo ""
+	# NOTE: do NOT use `exec > >(tee ...)` here — the detached tee
+	# subprocess cannot be killed by an outer `timeout`, which made
+	# the whole script hang and swallowed QEMU output. Instead the
+	# main body is wrapped in a single `| tee -a` pipeline below.
 }
 
 log_section() {
@@ -112,7 +112,7 @@ step_build_kernel() {
 	# Touch source files to force rebuild (rm .o not allowed in sandbox)
 	touch net/core/net-delayacct.c include/net/net-delayacct.h 2>/dev/null || true
 
-	# Ensure config exists
+	# Ensure config exists and has CONFIG_NET_DELAYACCT=y
 	if [ ! -f .config ]; then
 		echo "Generating .config..."
 		make defconfig 2>&1 | tail -1
@@ -120,14 +120,13 @@ step_build_kernel() {
 			"$PROJECT_DIR/ci/kernel.config.fragment" \
 			"$PROJECT_DIR/ci/qemu/kernel-qemu.config" 2>&1 | tail -3
 		make olddefconfig 2>&1 | tail -1
-	fi
-
-	# Verify CONFIG_NET_DELAYACCT
-	if ! grep -q "CONFIG_NET_DELAYACCT=y" .config; then
-		echo "${YELLOW}WARNING: CONFIG_NET_DELAYACCT not set, reconfiguring...${NC}"
+	elif ! grep -q "CONFIG_NET_DELAYACCT=y" .config; then
+		echo "Adding CONFIG_NET_DELAYACCT=y to existing .config..."
 		"$LINUX_SRC/scripts/kconfig/merge_config.sh" -m .config \
 			"$PROJECT_DIR/ci/kernel.config.fragment" 2>&1 | tail -1
 		make olddefconfig 2>&1 | tail -1
+	else
+		echo "Config OK (CONFIG_NET_DELAYACCT=y already set)"
 	fi
 
 	echo "Building bzImage (with ccache)..."
@@ -197,8 +196,9 @@ step_create_initramfs() {
 	chmod +x "$INITRD_DIR/bin/busybox"
 	for cmd in sh ls cat echo grep wc head tail awk sed sleep kill pgrep \
 		   mount umount mknod chmod chown mkdir rmdir cp mv rm ln \
-		   nc iperf3 reboot poweroff dirname basename which true false test [ [[ \
-		   sort readlink ip ifconfig; do
+		   timeout dmesg readlink command killall sort uniq dirname \
+		   basename date test tr cut which true false \
+		   nc iperf3 ip ifconfig; do
 		ln -sf /bin/busybox "$INITRD_DIR/bin/$cmd" 2>/dev/null || true
 	done
 	ln -sf /bin/busybox "$INITRD_DIR/sbin/init"
@@ -276,6 +276,39 @@ log ""
 log "--- get_sockdelays self PID ---"
 MYPID=$$
 timeout 10 /usr/local/bin/get_sockdelays -p "$MYPID" 2>&1 || log "(timeout or error)"
+
+# Test 3: inode query — create a socket, extract its inode, query by inode
+log ""
+log "--- get_sockdelays -i (inode query) ---"
+INODE=""
+NC_PORT=19999
+if command -v nc >/dev/null 2>&1; then
+	nc -l -p "$NC_PORT" &
+	NC_PID=$!
+	/bin/sleep 1
+	if kill -0 "$NC_PID" 2>/dev/null; then
+		for fd_path in /proc/"$NC_PID"/fd/*; do
+			target=$(readlink "$fd_path" 2>/dev/null || true)
+			case "$target" in
+				socket:\[*\])
+					INODE=$(echo "$target" | sed 's/.*socket:\[\([0-9]*\)\].*/\1/')
+					break
+					;;
+			esac
+		done
+		if [ -n "$INODE" ]; then
+			log "extracted inode=$INODE from nc listener pid=$NC_PID"
+			timeout 10 /usr/local/bin/get_sockdelays -i "$INODE" 2>&1 || log "(timeout or error)"
+		else
+			log "(could not extract inode from nc listener)"
+		fi
+		kill "$NC_PID" 2>/dev/null || true
+	else
+		log "(nc listener failed to start)"
+	fi
+else
+	log "(nc not available, skipping inode query test)"
+fi
 
 # Run func tests if available (ignore failures)
 log ""
@@ -379,33 +412,44 @@ step_show_results() {
 # ============================================================================
 init_log
 
-case "${1:-}" in
-	--kernel-only)
-		step_sync_source
-		step_apply_patches
-		step_build_kernel
-		step_build_tool
-		echo "${GREEN}Kernel + tool built. Run './local-test.sh --qemu-only' to test.${NC}"
-		;;
-	--qemu-only)
-		step_create_initramfs
-		step_run_qemu
-		step_show_results
-		;;
-	--help|-h)
-		echo "Usage: ./local-test.sh [--kernel-only|--qemu-only]"
-		echo ""
-		echo "  (no args)     Full test: sync → build → QEMU → results"
-		echo "  --kernel-only Build kernel + tool only, skip QEMU"
-		echo "  --qemu-only   Run QEMU test only (assumes already built)"
-		;;
-	*)
-		step_sync_source
-		step_apply_patches
-		step_build_kernel
-		step_build_tool
-		step_create_initramfs
-		step_run_qemu
-		step_show_results
-		;;
-esac
+# Wrap the whole body in a single `tee` pipeline so that:
+#   - output goes to BOTH the terminal and the log file
+#   - `timeout` / Ctrl-C kills the script and tee exits cleanly with the pipe
+#     (the previous `exec > >(tee ...)` in init_log left a detached tee that
+#      hung the terminal and swallowed QEMU output)
+{
+	echo "=== Local Test $(date) ==="
+	echo "Log: $LOG_FILE"
+	echo ""
+
+	case "${1:-}" in
+		--kernel-only)
+			step_sync_source
+			step_apply_patches
+			step_build_kernel
+			step_build_tool
+			echo "${GREEN}Kernel + tool built. Run './local-test.sh --qemu-only' to test.${NC}"
+			;;
+		--qemu-only)
+			step_create_initramfs
+			step_run_qemu
+			step_show_results
+			;;
+		--help|-h)
+			echo "Usage: ./local-test.sh [--kernel-only|--qemu-only]"
+			echo ""
+			echo "  (no args)     Full test: sync → build → QEMU → results"
+			echo "  --kernel-only Build kernel + tool only, skip QEMU"
+			echo "  --qemu-only   Run QEMU test only (assumes already built)"
+			;;
+		*)
+			step_sync_source
+			step_apply_patches
+			step_build_kernel
+			step_build_tool
+			step_create_initramfs
+			step_run_qemu
+			step_show_results
+			;;
+	esac
+} 2>&1 | tee -a "$LOG_FILE"

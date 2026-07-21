@@ -603,3 +603,198 @@ ls tests/reports/local/            # test-YYYYMMDD_HHMMSS.log
 | `local-test.sh` | **新建** 完整本地测试脚本 | 替代 CI，本地快速迭代 |
 | `kernel-patches/net-core-net-delayacct.c` L97 | 添加 `.resv_start_op = __NET_DELAYACCT_CMD_MAX` | 修复 genl family 注册 -22 错误 |
 | `ci/qemu/local-initrd.img` | 由 local-test.sh 自动生成 | QEMU 启动用的 initramfs |
+
+---
+
+## 第九轮：QEMU "无输出"黑盒问题定位与 inode 查询链路打通
+
+### 问题描述
+
+用户反馈 `Terminal#73-94 依然没有任何输出`，`local-test.sh --qemu-only` 跑完后日志里只有
+`No test results found — guest may have crashed`，内核 `pr_emerg` 调试日志一条都没出现，
+`get_sockdelays` 始终返回 `(no matching sockets)`。整条调用链看起来像黑盒，无法判断
+是内核没收到请求，还是用户态没发出请求，还是 inode 匹配逻辑写错了。
+
+### 排查过程与证据链
+
+#### 第 1 步：确认 QEMU / bzImage 本身能启动
+
+直接命令行跑 QEMU（绕过 local-test.sh 的 tee 包装），发现内核**能正常启动并进入 init**：
+
+```
+[    8.361334] Run /init as init process
+=== local-test guest init ===
+Kernel: 6.6.39-dirty
+[    6.882102] net_delayacct: framework registered v2 (family=28)
+```
+
+→ 结论：不是 QEMU 崩溃，也不是内核起不来。"无输出"是假象。
+
+#### 第 2 步：定位"无输出"假象的根因 —— init_log 的 tee 陷阱
+
+`local-test.sh` 的 `init_log()` 用了：
+```bash
+exec > >(tee -a "$LOG_FILE") 2>&1
+```
+这个 process substitution 会 fork 出一个独立的 `tee` 子进程。当外层用
+`timeout 120 ./local-test.sh --qemu-only` 包裹时，**timeout 杀的是脚本主进程，
+杀不掉 tee 子进程**，导致脚本"看起来卡死"，且 QEMU 的 stdout 被 tee 缓冲，
+日志文件里只能看到头部几行。
+
+→ 这是"无输出"的直接原因，属于**测试脚本本身的 bug**，与内核/工具代码无关。
+
+#### 第 3 步：发现内核树源码与 kernel-patches 不一致
+
+直接对比两处源码：
+
+| 位置 | inode 获取方式 | pr_emerg 数量 |
+|------|---------------|--------------|
+| `kernel-patches/net-core-net-delayacct.c`（最新） | `file_inode(file)->i_ino` | 8 |
+| `linux-6.6/net/core/net-delayacct.c`（内核树） | `sock_inode_for(sk)` ← 旧 | 5 |
+
+→ 上一次 `--qemu-only` 只重建了 initramfs，**没有重新同步源码、没有重新编译内核**，
+QEMU 跑的还是带 `sock_inode_for(sk)` 旧逻辑的内核（该函数依赖 `sk->sk_socket->file`，
+在 busybox nc 监听场景下可能为 NULL，导致 inode 取不到）。
+
+#### 第 4 步：发现用户态工具也是旧版
+
+```
+-rwxrwxr-x 1 lai lai 56008  7月 20 15:05  get_sockdelays   ← 旧，无 [diag]
+```
+旧工具里没有 `[diag] send_and_recv / recvfrom / mnl_cb_run` 调试输出，所以即使跑了
+也无法判断工具到底有没有把 netlink 请求发出去。**这是之前一直无法定位根因的根本原因 ——
+内核和工具至少有一个是旧版本，证据自相矛盾。**
+
+#### 第 5 步：同时重建内核 + 工具，再跑关键测试
+
+```bash
+# 1. 同步最新源码到内核树
+sudo install -m 0644 kernel-patches/net-core-net-delayacct.c \
+    /home/lai/Code/linux-6.6/net/core/net-delayacct.c
+# 2. 重建内核（确保 .o 被重编、vmlinux 被重链）
+make -j$(nproc) CC="ccache gcc" bzImage   # → bzImage #31, vmlinux md5=f201ece737ac38d7
+# 3. 重建工具
+make -C userspace/get_sockdelays clean && make -C userspace/get_sockdelays
+# 4. 重建 initramfs（装入新工具）
+# 5. 跑 QEMU
+```
+
+验证新构建确实进了内核/工具：
+- `strings vmlinux | grep "ENTER target_inode"` → 命中 ✅
+- `gzip -dc local-initrd.img | strings | grep -c "[diag]"` → 5 ✅
+
+#### 第 6 步：关键测试结果 —— 链路全通
+
+用最新构建跑 QEMU，**两边调试日志同时出现**：
+
+内核侧（pr_emerg）：
+```
+[    9.157122] net_delayacct: cmd_get_by_inode: ENTER target_inode=1103
+[    9.159077] net_delayacct: cmd_get_by_inode: pid=72 fd=3 ino=1103 sk_family=10 sk_proto=6
+[    9.161165] net_delayacct: cmd_get_by_inode: MATCH ret=0
+```
+
+用户态（[diag]）：
+```
+get_sockdelays: [diag] send_and_recv: seq=... portid=85 type=28
+get_sockdelays: [diag] recvfrom returned 36 bytes
+get_sockdelays: [diag] mnl_cb_run returned 0
+```
+
+### 根因总结
+
+**本轮所有困惑的根因不是代码逻辑错误，也不是环境问题，而是"测试用的内核/工具不是最新构建"**：
+
+1. `--qemu-only` 模式只重建 initramfs，不会重新同步源码、不会重编内核 → 跑的是旧内核
+2. 旧内核用 `sock_inode_for(sk)`，在 busybox nc 场景下取不到 inode
+3. 旧工具没有 `[diag]` 输出，看不到请求是否发出，形成黑盒
+4. `init_log` 的 tee 机制让 `timeout` 杀不干净子进程，制造"无输出"假象
+
+### 验证结论
+
+| 验证项 | 结果 |
+|--------|------|
+| genl family 注册 | ✅ `family=28` |
+| doit 回调被调用 | ✅ `cmd_get_by_inode: ENTER` 出现 |
+| `file_inode(file)->i_ino` 修复有效 | ✅ `ino=1103` 取到，且与 target 相等 |
+| inode 匹配逻辑 | ✅ `MATCH ret=0` |
+| 用户态发出请求 | ✅ `[diag] send_and_recv type=28` |
+
+### 遗留问题（新发现，可定位）
+
+内核 `MATCH ret=0` 表示回复发送成功，但用户态只收到 **36 bytes**
+（恰好等于 `NLMSG_ERROR` 长度 `nlmsghdr(16) + nlmsgerr(20)`），
+且 `parse_msg_cb` 的 ERROR/DONE/default 三个分支都没打印 ——
+说明 `mnl_cb_run` 认为消息格式不合法，没调用 callback 就返回 0。
+
+这是 `genlmsg_put_reply` / `genlmsg_reply` 消息构造或用户态解析的问题，
+不再是"黑盒无输出"，是一个**全新的、具体的、可定位的 bug**，
+留待下一轮修复。
+
+### 修复方案（本轮）
+
+1. **确保每次测试前同步源码 + 重建内核**：`local-test.sh` 默认流程已覆盖，
+   但 `--qemu-only` 模式需手动确认内核已是最新（后续在脚本里加一致性检查）
+2. **去掉 `init_log` 的 tee 陷阱**（✅ 已完成）：见下文"local-test.sh tee 卡死修复"
+3. `file_inode(file)->i_ino` 替换 `sock_inode_for(sk)` 的修复**确认正确，保留**
+
+### local-test.sh tee 卡死修复（已完成）
+
+**问题**：`init_log()` 原实现为：
+```bash
+init_log() {
+    mkdir -p "$LOG_DIR"
+    exec > >(tee -a "$LOG_FILE") 2>&1   # ← 罪魁祸首
+    echo "=== Local Test $(date) ==="
+}
+```
+`exec > >(tee ...)` 使用 process substitution，会 fork 出一个**独立的 tee 子进程**
+（不是脚本的子进程，无法通过 `jobs`/`$!` 拿到 PID）。当外层用
+`timeout N ./local-test.sh --qemu-only` 包裹时：
+
+1. `timeout` 到期后向脚本主进程发 SIGTERM
+2. 脚本主进程退出，但其 stdout/stderr 仍连接到 tee 的管道
+3. **tee 子进程未被杀**，继续阻塞在 read stdin 上
+4. 整个命令行表现为"卡死"，QEMU 的 stdout 被 tee 缓冲，日志文件里只有头部几行
+
+这就是 `Terminal#73-94 依然没有任何输出` 的直接原因。
+
+**修复**：去掉 `init_log` 里的 `exec > >(tee ...)`，改为在 main 用一个
+`{ ...; } 2>&1 | tee -a "$LOG_FILE"` 管道包裹整个 body：
+
+```bash
+init_log() {
+    mkdir -p "$LOG_DIR"
+    # NOTE: do NOT use `exec > >(tee ...)` here — the detached tee
+    # subprocess cannot be killed by an outer `timeout` ...
+}
+
+# Main
+init_log
+{
+    echo "=== Local Test $(date) ==="
+    case "${1:-}" in
+        ...各 step...
+    esac
+} 2>&1 | tee -a "$LOG_FILE"
+```
+
+这样 tee 是脚本主进程的**管道下游**，脚本退出/被 `timeout` 杀掉时管道写端关闭，
+tee 收到 EOF 自动退出，不再有遗留子进程。
+
+**验证**：
+```
+QEMU_TIMEOUT=45 ./local-test.sh --qemu-only
+EXIT=0          # ← 正常退出，不再卡死
+LINES=559       # ← 完整输出
+# inode 匹配成功：cmd_get_by_inode: MATCH ret=0
+```
+
+### 修改文件清单（本轮）
+
+| 文件 | 变更 | 目的 |
+|------|------|------|
+| `kernel-patches/net-core-net-delayacct.c` L464 | `sock_inode_for(sk)` → `file_inode(file)->i_ino` | inode 获取不再依赖可能为 NULL 的 `sk->sk_socket->file` |
+| `kernel-patches/net-core-net-delayacct.c` L427/465/484/492 | 增加 4 处 `pr_emerg` | 追踪 `cmd_get_by_inode` 的 enter/match/exit 路径 |
+| `userspace/get_sockdelays/get_sockdelays.c` L283/297/301 | 增加 `[diag]` 日志 | 追踪 send/recv/cb_run 链路 |
+| `local-test.sh` L38-44 | 去掉 `init_log` 的 `exec > >(tee ...)`；main 改用 `{ ...; } 2>&1 \| tee -a` 管道包裹 | 解决 timeout 杀不掉独立 tee 子进程导致的"无输出"卡死 |
