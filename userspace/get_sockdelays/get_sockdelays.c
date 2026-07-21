@@ -178,7 +178,6 @@ static void format_addr(char *out, size_t outsz, __u8 family,
 static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 {
 	struct dump_ctx *ctx = data;
-	struct genlmsghdr *genl;
 	struct nlattr *attr;
 	const char *comm = NULL;
 	char laddr_str[INET6_ADDRSTRLEN + 16];
@@ -188,7 +187,6 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 	__u32 pid = 0;
 	uint64_t inode = 0, rx_total = 0, rx_count = 0, tx_total = 0, tx_count = 0;
 	const void *laddr = NULL, *raddr = NULL;
-	int laddr_len = 0, raddr_len = 0;
 
 	if (nlh->nlmsg_type == NLMSG_ERROR) {
 		struct nlmsgerr *err = mnl_nlmsg_get_payload(nlh);
@@ -197,17 +195,16 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 		return MNL_CB_ERROR;
 	}
 	if (nlh->nlmsg_type == NLMSG_DONE) {
-		fprintf(stderr, "%s: [diag] received NLMSG_DONE (seq=%u portid=%u)\n",
-			prog_name, nlh->nlmsg_seq, nlh->nlmsg_portid);
+		fprintf(stderr, "%s: [diag] received NLMSG_DONE (seq=%u pid=%u)\n",
+			prog_name, nlh->nlmsg_seq, nlh->nlmsg_pid);
 		return MNL_CB_OK;
 	}
 
 	/* Diagnostic: print non-error, non-DONE messages */
-	fprintf(stderr, "%s: [diag] received msg type=%u (seq=%u portid=%u len=%u)\n",
+	fprintf(stderr, "%s: [diag] received msg type=%u (seq=%u pid=%u len=%u)\n",
 		prog_name, nlh->nlmsg_type, nlh->nlmsg_seq,
-		nlh->nlmsg_portid, nlh->nlmsg_len);
+		nlh->nlmsg_pid, nlh->nlmsg_len);
 
-	genl = mnl_nlmsg_get_payload(nlh);
 	mnl_attr_for_each(attr, nlh, GENL_HDRLEN) {
 		switch (mnl_attr_get_type(attr)) {
 		case NET_DELAYACCT_A_TYPE:
@@ -309,31 +306,6 @@ static int send_and_recv(struct mnl_socket *nl, struct nlmsghdr *nlh,
 			break;
 	}
 	return ret == MNL_CB_ERROR ? -EIO : 0;
-}
-
-static struct nlmsghdr *build_request(char *buf, size_t bufsz,
-				      int family_id, __u8 cmd,
-				      const void *payload, size_t plen)
-{
-	struct nlmsghdr *nlh;
-	struct genlmsghdr *genl;
-
-	(void)bufsz;
-	nlh = mnl_nlmsg_put_header(buf);
-	nlh->nlmsg_type = family_id;
-	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-	nlh->nlmsg_seq = time(NULL);
-
-	genl = mnl_nlmsg_put_extra_header(nlh, sizeof(*genl));
-	genl->cmd = cmd;
-	genl->version = 1;
-	genl->reserved = 0;
-
-	if (payload && plen)
-		memcpy(mnl_nlmsg_put_payload_at(nlh,
-				mnl_nlmsg_get_payload_len(nlh), plen),
-		       payload, plen);
-	return nlh;
 }
 
 static int do_query(struct mnl_socket *nl, int family_id,
