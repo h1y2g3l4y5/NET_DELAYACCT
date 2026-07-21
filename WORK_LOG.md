@@ -365,3 +365,36 @@ nlh->nlmsg_flags = NLM_F_REQUEST;
 |------|------|
 | `userspace/get_sockdelays/get_sockdelays.c` `send_and_recv` | 加 seq/portid/type 诊断输出 |
 | `userspace/get_sockdelays/get_sockdelays.c` `parse_msg_cb` | 加消息类型/匹配诊断输出 |
+
+---
+
+### 第四轮修复：编译错误 + genl strict validation（2026-07-21）
+
+**CI 结果**（提交 e41042a）：
+- 用户态工具**编译失败**：
+  - `nlmsg_portid` → 改为 `nlmsg_pid`（已修复）
+  - `struct genlmsghdr *genl` 声明但未使用（已删除）
+  - `laddr_len`、`raddr_len` 使用但未声明（本提交修复）
+  - `build_request` 函数定义但未调用（已删除）
+  - `mnl_nlmsg_put_payload_at` 隐式声明（随 `build_request` 删除而消除）
+- 内核模块已加载（`v2` 消息出现），但 **doit 回调仍然未被调用**（无 `pr_emerg`）
+
+**根因分析：genl strict validation 导致 doit 被静默跳过**
+
+Linux 6.6 的 genetlink 框架对 `genl_ops` 引入了 strict validation 机制。如果 `genl_ops` 未设置 `validate = GENL_DONT_VALIDATE_STRICT`，内核会对请求属性进行严格校验（`NL_VALIDATE_STRICT`）。虽然我们的 `net_delayacct_policy` 包含了 `NET_DELAYACCT_A_PID` 和 `NET_DELAYACCT_A_INODE`，但 strict validation 可能因以下原因拒绝请求：
+
+1. policy 数组中未初始化的条目默认 `.type = 0`（NLA_UNSPEC），strict 模式下可能触发拒绝
+2. 部分内核版本（6.6）中，old-style `{ .type = NLA_U32 }` 在 strict 模式下行为不同于 `NLA_POLICY_EXACT_LEN()` 等新式宏
+
+**修复**：
+
+| 文件 | 变更 | 目的 |
+|------|------|------|
+| `kernel-patches/net-core-net-delayacct.c` genl_ops | 每个 op 添加 `.validate = GENL_DONT_VALIDATE_STRICT` | 跳过 strict validation 让请求能到达 doit |
+| `kernel-patches/net-core-net-delayacct.c` genl_ops | GET_BY_PID/GET_BY_INODE op 添加 `.policy = net_delayacct_policy`、`.maxattr = NET_DELAYACCT_A_MAX` | 确保 per-op policy 存在，双重保险 |
+| `userspace/get_sockdelays/get_sockdelays.c` parse_msg_cb | 删除 `laddr_len`/`raddr_len` 赋值（变量已删除但使用残留） | 修复编译错误 |
+
+**下一轮预期**：
+- 编译应通过（用户态和内核模块）
+- 如果 `GENL_DONT_VALIDATE_STRICT` 是根因 → doit 被调用，dmesg 中应出现 `pr_emerg` 消息
+- 如果 doit 仍未被调用 → 需要更深入排查 genl_rcv_msg 分发路径

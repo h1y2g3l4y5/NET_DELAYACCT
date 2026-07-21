@@ -70,16 +70,23 @@ static const struct genl_ops net_delayacct_ops[] = {
 		.cmd	= NET_DELAYACCT_CMD_GET_BY_PID,
 		.doit	= net_delayacct_cmd_get_by_pid,
 		.flags	= GENL_ADMIN_PERM,
+		.validate = GENL_DONT_VALIDATE_STRICT,
+		.policy	= net_delayacct_policy,
+		.maxattr = NET_DELAYACCT_A_MAX,
 	},
 	{
 		.cmd	= NET_DELAYACCT_CMD_GET_BY_INODE,
 		.doit	= net_delayacct_cmd_get_by_inode,
 		.flags	= GENL_ADMIN_PERM,
+		.validate = GENL_DONT_VALIDATE_STRICT,
+		.policy	= net_delayacct_policy,
+		.maxattr = NET_DELAYACCT_A_MAX,
 	},
 	{
 		.cmd	= NET_DELAYACCT_CMD_RESET,
 		.doit	= net_delayacct_cmd_reset,
 		.flags	= GENL_ADMIN_PERM,
+		.validate = GENL_DONT_VALIDATE_STRICT,
 	},
 };
 

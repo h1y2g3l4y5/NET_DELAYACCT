@@ -213,13 +213,11 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 			family = mnl_attr_get_u8(attr); break;
 		case NET_DELAYACCT_A_LADDR:
 			laddr = mnl_attr_get_payload(attr);
-			laddr_len = mnl_attr_get_payload_len(attr);
 			break;
 		case NET_DELAYACCT_A_LPORT:
 			lport = mnl_attr_get_u16(attr); break;
 		case NET_DELAYACCT_A_RADDR:
 			raddr = mnl_attr_get_payload(attr);
-			raddr_len = mnl_attr_get_payload_len(attr);
 			break;
 		case NET_DELAYACCT_A_RPORT:
 			rport = mnl_attr_get_u16(attr); break;
