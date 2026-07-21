@@ -1,0 +1,90 @@
+=== QEMU Test Run: Tue Jul 21 05:32:29 UTC 2026 ===
+Kernel: 6.6.39-dirty
+
+get_sockdelays binary: OK
+--- Running test_netdelayacct.sh ---
+SKIP: net_delayacct genl family not accessible: get_sockdelays: family 'net_delayacct' not registered (kernel returns -2)
+get_sockdelays: cannot find Generic Netlink family 'net_delayacct'
+        (is the net-delayacct module loaded?)
+  (test timed out or failed)
+
+--- Running test_inode_query.sh ---
+=== test_inode_query: get_sockdelays -i ===
+Found socket inode: 1441 (pid=100)
+[FAIL] output does not contain inode 1441
+  Output was: get_sockdelays: family 'net_delayacct' not registered (kernel returns -2)
+get_sockdelays: cannot find Generic Netlink family 'net_delayacct'
+        (is the net-delayacct module loaded?)
+[FAIL] output has 3 data lines, expected 1
+
+=== Summary: PASS=0 FAIL=2 ===
+  (test timed out or failed)
+
+--- Running test_multi_socket.sh ---
+=== test_multi_socket: single process, multiple sockets ===
+Client PID: 124
+[PASS] output has 3 data line(s), expected >= 3
+[FAIL] found 3 different PIDs in output, expected 1
+
+=== Summary: PASS=1 FAIL=1 ===
+  (test timed out or failed)
+
+--- Running test_pid_query.sh ---
+=== test_pid_query: get_sockdelays -p ===
+Querying PID: 162
+[PASS] output has 3 line(s)
+[FAIL] output does not contain TCP type
+  Output was: get_sockdelays: family 'net_delayacct' not registered (kernel returns -2)
+get_sockdelays: cannot find Generic Netlink family 'net_delayacct'
+        (is the net-delayacct module loaded?)
+
+=== Summary: PASS=1 FAIL=1 ===
+  (test timed out or failed)
+
+--- Running test_reset.sh ---
+=== test_reset: get_sockdelays -R ===
+reset-test-traffic
+Pre-reset output:
+get_sockdelays: family 'net_delayacct' not registered (kernel returns -2)
+get_sockdelays: cannot find Generic Netlink family 'net_delayacct'
+        (is the net-delayacct module loaded?)
+Executing reset...
+get_sockdelays: family 'net_delayacct' not registered (kernel returns -2)
+get_sockdelays: cannot find Generic Netlink family 'net_delayacct'
+        (is the net-delayacct module loaded?)
+Post-reset output:
+get_sockdelays: family 'net_delayacct' not registered (kernel returns -2)
+get_sockdelays: cannot find Generic Netlink family 'net_delayacct'
+        (is the net-delayacct module loaded?)
+[PASS] all counters are zero/N/A after reset
+[PASS] pre-reset output was non-empty (traffic was recorded)
+
+=== Summary: PASS=2 FAIL=0 ===
+
+--- Running test_tcp_udp.sh ---
+=== test_tcp_udp: TCP and UDP path validation ===
+
+--- TCP test ---
+[FAIL] TCP path: output does not contain TCP type
+  Output: get_sockdelays: family 'net_delayacct' not registered (kernel returns -2)
+get_sockdelays: cannot find Generic Netlink family 'net_delayacct'
+        (is the net-delayacct module loaded?)
+
+--- UDP test ---
+[FAIL] UDP path: output does not contain UDP type
+  Output: get_sockdelays: family 'net_delayacct' not registered (kernel returns -2)
+get_sockdelays: cannot find Generic Netlink family 'net_delayacct'
+        (is the net-delayacct module loaded?)
+
+=== Summary: PASS=0 FAIL=2 ===
+  (test timed out or failed)
+
+
+=== Test run finished: Tue Jul 21 05:33:14 UTC 2026 ===
+
+=== Kernel net_delayacct messages (post-test) ===
+[    6.696637]  ? __pfx_net_delayacct_cmd_get_by_pid+0x10/0x10
+[    6.696940]  ? __pfx_net_delayacct_mod_init+0x10/0x10
+[    6.700008]  ? __pfx_net_delayacct_mod_init+0x10/0x10
+[    6.700333]  net_delayacct_mod_init+0x12/0x50
+[    6.705285] net_delayacct: failed to register genl family: -22
