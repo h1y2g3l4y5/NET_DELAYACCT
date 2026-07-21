@@ -92,3 +92,203 @@
   echo "nameserver 114.114.114.114" | sudo tee -a /etc/resolv.conf
   sudo chattr +i /etc/resolv.conf
   ```
+
+---
+
+## 2026-07-21
+
+### 任务概述
+解决 CI 流程中 QEMU 测试阶段挂死、无法到达 Step 7（提取测试结果）的问题，修复 get_sockdelays netlink 通信协议不匹配问题。
+
+---
+
+### 问题 1：CI 卡在 QEMU 启动阶段，永远走不到 Step 7
+
+#### 现象
+CI 输出停在 QEMU 内核启动日志处，后续没有任何输出，`========== TEST RESULTS ==========` 从未出现。这意味着 `ci-test.sh` 的 Step 6（`timeout 300 qemu-system-x86_64 ...`）没有正常退出，或退出后脚本异常终止。
+
+#### 根因与执行链分析
+
+**ci-test.sh 依赖链**：
+```
+ci-test.sh Step 6: timeout 300 qemu-system-x86_64 ...
+    └── QEMU 启动，init=/sbin/qemu-init
+        └── guest-init.sh 执行
+            ├── 挂载文件系统
+            ├── get_sockdelays -p 1   ← 阻塞式 netlink 调用，可能挂死
+            ├── 运行 test_netdelayacct.sh
+            ├── 运行 func/test_*.sh
+            └── poweroff -f           ← 只有走到这里 QEMU 才会退出
+```
+
+**挂死点**：`get_sockdelays -p 1` 调用了 `mnl_socket_recvfrom(3)`，这是**无限期阻塞**的系统调用。如果内核 net_delayacct 模块不回复（或回复格式不对），进程永久挂起。
+
+**具体代码路径**（`get_sockdelays.c`）：
+```
+main() → do_query() → send_and_recv()
+    └── while(1) {
+            mnl_socket_recvfrom()  ← 阻塞等待，永无返回
+            mnl_cb_run()
+            if (ret <= MNL_CB_STOP) break;  ← 永远到不了
+        }
+```
+
+**为什么 `ci-test.sh` 的 `|| true` 没起作用**：虽然 QEMU 命令后有 `|| true`，但 QEMU 被 timeout 杀掉后 shell 管道可能产生 SIGPIPE，且 CI runner（GitHub Actions 自托管）的 step 级别也可能有独立超时。即使 `ci-test.sh` 理论上能继续，VM 没生成 `test-output.txt`，Step 7 挂载 rootfs 提取结果也拿不到数据。
+
+#### 为什么内核可能不回复
+
+内核模块 `net_delayacct` 的 genl ops 注册方式：
+```c
+// net-core-net-delayacct.c
+static const struct genl_ops net_delayacct_ops[] = {
+    {
+        .cmd    = NET_DELAYACCT_CMD_GET_BY_PID,
+        .doit   = net_delayacct_cmd_get_by_pid,   // 只有 doit
+        .flags  = GENL_ADMIN_PERM,                 // 需要 CAP_NET_ADMIN
+        // 没有 .dumpit
+    },
+    ...
+};
+```
+
+而用户态工具发送请求时带了 `NLM_F_DUMP`：
+```c
+// get_sockdelays.c do_query()
+nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;  // ← 带了 DUMP 标志
+```
+
+在 Linux 6.6 的 `net/netlink/genetlink.c` 中，`genl_family_rcv_msg()` 的逻辑是：
+```c
+if (nlh->nlmsg_flags & NLM_F_DUMP) {
+    if (ops->dumpit)
+        err = genl_family_rcv_msg_dumpit(...);
+    else
+        err = -EOPNOTSUPP;    // ← 没有 dumpit，返回错误
+} else {
+    if (ops->doit)
+        err = genl_family_rcv_msg_doit(...);  // ← 正常调用 doit
+}
+```
+
+因此在 Linux 6.6 中，`NLM_F_DUMP` + 仅 `doit` = `-EOPNOTSUPP`。内核应返回 netlink error 消息。如果由于某种原因错误消息未送达（或网络命名空间问题等边界情况），用户态就会无限阻塞。
+
+---
+
+### 问题 2：get_sockdelays 对真实 socket 返回空结果 `(no matching sockets)`
+
+#### 现象
+测试脚本（`test_inode_query.sh`、`test_multi_socket.sh`）创建了真实的 TCP socket（nc/python），但 `get_sockdelays -i <inode>` 返回 `(no matching sockets)`。
+
+#### 可能根因
+
+**可能是 `doit` 被意外调用**：在特定条件下（如内核某些补丁或配置），`NLM_F_DUMP` 请求可能被转为 `doit` 调用。`net_delayacct_cmd_get_by_pid()` → `net_delayacct_iter_task_sockets()` 遍历 `task->files→fdt->fd[]` 数组，对每个 fd 调用 `sock_from_file_safe()`。如果 socket 文件的 `SOCKET_I(inode)->sk` 为 NULL（例如 socket 处于 CLOSE 状态或尚未完全初始化），socket 被跳过，最终无结果。
+
+**已添加的调试日志**（前一轮修改）：
+- `pr_info("iter_task_sockets pid=%u max_fds=%u\n", ...)` — 查看 PID 和文件描述符表大小
+- `pr_info("iter fd=%u inode=%llu family=%u proto=%u SKIPPED/FOUND\n", ...)` — 每个 fd 的处理结果
+- `pr_info_ratelimited("sock_from_file_safe: SOCKET_I/sock->sk is NULL", ...)` — socket 解析失败
+
+这些日志需要通过去掉 `quiet` 参数才能在 QEMU 控制台中看到。
+
+---
+
+### 修复方案
+
+#### 修复 1：guest-init.sh 多层超时保护
+
+**文件**：[`ci/qemu/guest-init.sh`](ci/qemu/guest-init.sh)
+
+**变更详情**：
+
+(a) 添加 Watchdog 后台进程（第 20-22 行）：
+```bash
+# 启动后即 fork，120 秒到期强制关机
+( sleep 120; echo "WATCHDOG: forcing poweroff after 120s timeout"; poweroff -f ) &
+WATCHDOG_PID=$!
+```
+这是最后一道防线。无论 `get_sockdelays`、测试脚本还是其他任何步骤卡住，VM 最晚 120 秒后强制关机。QEMU 退出后 `ci-test.sh` 的 `|| true` 接管，继续执行 Step 7。
+
+(b) `get_sockdelays` 调用加 `timeout`（第 40, 45 行）：
+```bash
+# 之前：直接调用，无超时保护
+# /usr/local/bin/get_sockdelays -p 1 >/dev/null 2>&1
+
+# 之后：10 秒超时
+timeout 10 /usr/local/bin/get_sockdelays -p 1 >/dev/null 2>&1
+```
+第一层防护。如果内核在 10 秒内不回复，`timeout` 发送 SIGTERM 杀掉进程。
+
+(c) 诊断调用也加 `timeout`（第 45 行）：
+```bash
+timeout 5 /usr/local/bin/get_sockdelays -p 1 2>&1 | head -3 \
+    || echo "  (get_sockdelays timed out or failed)"
+```
+
+(d) 测试脚本调用加 `timeout 30`（第 72, 81 行）：
+```bash
+# 之前：bash test.sh 2>&1 || true  ← 无超时，可能挂死
+# 之后：
+timeout 30 bash "$TEST_ROOT/test_netdelayacct.sh" 2>&1 || echo "  (test timed out or failed)"
+```
+每个测试最多 30 秒。测试内部的 `get_sockdelays` 调用也会被 `timeout` 进程树一起杀掉。
+
+(e) 正常退出时清理 watchdog（第 102 行）：
+```bash
+kill "$WATCHDOG_PID" 2>/dev/null || true
+```
+避免正常完成的 VM 被 watchdog 误杀。
+
+(f) 添加进度标记 `[guest-init]`（第 52 行）：
+```bash
+echo "[guest-init] Starting test suite..."
+```
+这样在 QEMU 控制台输出中能看到确切进度位置。
+
+#### 修复 2：get_sockdelays.c 协议对齐
+
+**文件**：[`userspace/get_sockdelays/get_sockdelays.c`](userspace/get_sockdelays/get_sockdelays.c) 第 334 行
+
+**变更**：
+```c
+// 之前：
+nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+
+// 之后：
+nlh->nlmsg_flags = NLM_F_REQUEST;
+```
+
+**理由**：
+- 内核模块只注册了 `doit` 回调，没有 `dumpit`
+- `NLM_F_DUMP` 在 Linux 6.6 的 genetlink 中触发 `dumpit` 路径，没有 `dumpit` → `EOPNOTSUPP`
+- 去掉 `NLM_F_DUMP` 后，内核走 `doit` 路径，正常调用 `net_delayacct_cmd_get_by_pid/inode`
+- `doit` 回调内部已经自行处理了多 socket 回复（每个 socket 发一条 `genlmsg_reply` + 最后发 `NLMSG_DONE`），不需要框架的 dump 机制
+- 同时修复了 `send_and_recv` 循环：`mnl_cb_run` 处理完当前 buffer 中所有消息后，`NLM_F_MULTI` 标记的消息返回 `MNL_CB_OK`（=0），无 `NLM_F_MULTI` 的返回 `MNL_CB_STOP`（=0），循环自然终止
+
+#### 修复 3：ci-test.sh 去掉 quiet
+
+**文件**：[`ci/qemu/ci-test.sh`](ci/qemu/ci-test.sh) 第 174 行
+
+**变更**：
+```bash
+# 之前：
+-append "console=ttyS0,115200n8 root=/dev/vda rw quiet init=/sbin/qemu-init"
+
+# 之后：
+-append "console=ttyS0,115200n8 root=/dev/vda rw init=/sbin/qemu-init"
+```
+
+**理由**：`quiet` 参数会抑制 `pr_info()` 级别的内核日志输出到控制台。去掉后，`net-core-net-delayacct.c` 中添加的调试日志（`pr_info("iter_task_sockets pid=%u max_fds=%u", ...)` 等）会直接出现在 QEMU 控制台输出中，在 CI log 中即可看到，无需等待 Step 7 挂载 rootfs 提取 dmesg。
+
+---
+
+### 修改文件清单
+
+| 文件 | 修改行 | 变更内容 |
+|------|--------|----------|
+| `ci/qemu/guest-init.sh` | L20-22 | 添加 120s watchdog 后台进程 |
+| `ci/qemu/guest-init.sh` | L40, L45 | `get_sockdelays` 调用加 `timeout 10`/`timeout 5` |
+| `ci/qemu/guest-init.sh` | L52 | 添加 `[guest-init]` 进度标记 |
+| `ci/qemu/guest-init.sh` | L72, L81 | 测试脚本调用加 `timeout 30` |
+| `ci/qemu/guest-init.sh` | L102 | 正常退出时清理 watchdog |
+| `userspace/get_sockdelays/get_sockdelays.c` | L334 | `NLM_F_REQUEST \| NLM_F_DUMP` → `NLM_F_REQUEST` |
+| `ci/qemu/ci-test.sh` | L174 | 内核命令行去掉 `quiet` |

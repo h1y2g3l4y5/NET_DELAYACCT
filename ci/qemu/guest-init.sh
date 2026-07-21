@@ -17,6 +17,10 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo "=== QEMU guest boot: $(date -u) ==="
 
+# Watchdog: force poweroff after 120s to prevent CI hang if any step blocks
+( sleep 120; echo "WATCHDOG: forcing poweroff after 120s timeout"; poweroff -f ) &
+WATCHDOG_PID=$!
+
 # --- Mount essential filesystems (idempotent — skip if already mounted) ---
 mountpoint -q /proc  || mount -t proc  proc  /proc  -o nosuid,noexec,nodev
 mountpoint -q /sys   || mount -t sysfs sysfs /sys   -o nosuid,noexec,nodev
@@ -33,16 +37,19 @@ modprobe net-delayacct 2>/dev/null || true
 
 # --- Verify genl family is registered by actually calling get_sockdelays ---
 echo "Checking net_delayacct genl family..."
-if /usr/local/bin/get_sockdelays -p 1 >/dev/null 2>&1; then
+if timeout 10 /usr/local/bin/get_sockdelays -p 1 >/dev/null 2>&1; then
 	echo "genl family accessible (get_sockdelays works)"
 else
-	# get_sockdelays failed — try to diagnose
-	/usr/local/bin/get_sockdelays -p 1 2>&1 | head -3
+	# get_sockdelays failed or timed out — try to diagnose (with timeout)
+	echo "genl check failed, diagnosing..."
+	timeout 5 /usr/local/bin/get_sockdelays -p 1 2>&1 | head -3 || echo "  (get_sockdelays timed out or failed)"
 fi
 
 # Always show kernel net_delayacct messages for debugging
 echo "Kernel net_delayacct messages:"
 dmesg | grep -i "net_delayacct" || echo "  (no net_delayacct kernel messages)"
+
+echo "[guest-init] Starting test suite..."
 
 # --- Find and run test scripts ---
 TEST_ROOT="/opt/net_delayacct_tests"
@@ -62,7 +69,7 @@ RESULT_FILE="/root/test-output.txt"
 			# Run the selftest suite
 			if [ -f "$TEST_ROOT/test_netdelayacct.sh" ]; then
 				echo "--- Running test_netdelayacct.sh ---"
-				bash "$TEST_ROOT/test_netdelayacct.sh" 2>&1 || true
+				timeout 30 bash "$TEST_ROOT/test_netdelayacct.sh" 2>&1 || echo "  (test timed out or failed)"
 				echo ""
 			fi
 
@@ -71,7 +78,7 @@ RESULT_FILE="/root/test-output.txt"
 				for t in "$TEST_ROOT/func/test_"*.sh; do
 					if [ -f "$t" ]; then
 						echo "--- Running $(basename "$t") ---"
-						bash "$t" 2>&1 || true
+						timeout 30 bash "$t" 2>&1 || echo "  (test timed out or failed)"
 						echo ""
 					fi
 				done
@@ -91,6 +98,8 @@ RESULT_FILE="/root/test-output.txt"
 } > "$RESULT_FILE" 2>&1
 
 # --- Sync and power off ---
+# Kill the watchdog since we finished normally
+kill "$WATCHDOG_PID" 2>/dev/null || true
 sync
-echo "Powering off..."
+echo "Guest init completed successfully, powering off..."
 poweroff -f || halt -f || shutdown -h now

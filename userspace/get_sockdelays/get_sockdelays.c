@@ -331,7 +331,7 @@ static int do_query(struct mnl_socket *nl, int family_id,
 
 	nlh = mnl_nlmsg_put_header(buf);
 	nlh->nlmsg_type = family_id;
-	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	nlh->nlmsg_flags = NLM_F_REQUEST;
 	nlh->nlmsg_seq = time(NULL);
 
 	struct genlmsghdr *genl = mnl_nlmsg_put_extra_header(nlh, sizeof(*genl));

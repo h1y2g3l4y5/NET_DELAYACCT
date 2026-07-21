@@ -171,7 +171,7 @@ timeout 300 qemu-system-x86_64 \
 	-smp 2 \
 	-kernel "$LINUX_SRC/arch/x86/boot/bzImage" \
 	-drive file="$ROOTFS_IMG",format=raw,if=virtio \
-	-append "console=ttyS0,115200n8 root=/dev/vda rw quiet init=/sbin/qemu-init" \
+	-append "console=ttyS0,115200n8 root=/dev/vda rw init=/sbin/qemu-init" \
 	-nographic \
 	-no-reboot \
 	2>&1 | tee "$QEMU_LOG" || true
