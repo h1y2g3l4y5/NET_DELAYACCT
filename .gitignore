@@ -84,3 +84,4 @@ test-results/
 # Patch artifacts / 补丁中间产物
 *.patch.rej
 *.patch.orig
+.d

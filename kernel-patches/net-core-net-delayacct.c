@@ -94,6 +94,7 @@ static struct genl_family net_delayacct_genl_family __ro_after_init = {
 	.module		= THIS_MODULE,
 	.ops		= net_delayacct_ops,
 	.n_ops          = ARRAY_SIZE(net_delayacct_ops),
+	.resv_start_op	= __NET_DELAYACCT_CMD_MAX,
 	.policy		= net_delayacct_policy,
 };
 
