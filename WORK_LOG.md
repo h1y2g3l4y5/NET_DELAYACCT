@@ -336,3 +336,32 @@ nlh->nlmsg_flags = NLM_F_REQUEST;
 - 如果 dmesg 中出现 `cmd_get_by_pid: querying pid=...`（pr_emerg）→ `doit` 被调用，问题在内部逻辑
 - 如果 dmesg 中只有 `v2` 但没有 `cmd_get_by_pid` → `doit` 确实未被调用，需排查 genl 框架层
 - 如果 dmesg 中连 `v2` 都没有 → 内核编译/部署链路有问题，`make bzImage` 未包含修改
+
+---
+
+### 第三轮诊断：doit 确实未被调用（2026-07-21）
+
+**CI 结果**（提交 49bee79）：
+
+- dmesg：`net_delayacct: framework registered v2 (family=28)` → **新内核已生效**
+- dmesg：**没有任何 `pr_emerg` 消息**（`cmd_get_by_pid`、`cmd_get_by_inode`、`iter_task_sockets` 全部未出现）
+- 但用户态工具仍正常返回 `(no matching sockets)`，无 error、无 timeout
+
+**结论**：`doit` 回调 **100% 未被内核调用**。genl family 注册了，netlink 通信通了，但请求不知在 genl 框架的哪一层被静默处理/丢弃了——没有走 doit 路径，也没有返回 error。
+
+**下一轮诊断**（本提交）：
+
+在用户态 `get_sockdelays` 的 `send_and_recv` 和 `parse_msg_cb` 中添加详细诊断日志：
+- 每次 `send_and_recv` 打印发送的 `seq/portid/type`
+- 每次 `recvfrom` 打印收到的字节数
+- 每条消息打印 `nlmsg_type`、`seq`、`portid`
+- `NLMSG_DONE` 消息打印匹配信息
+- `mnl_cb_run` 返回值
+
+**目的**：精确看清内核到底回了什么消息，seq/portid 是否匹配，从而定位 genl 框架哪一层出了问题。
+
+**修改文件**：
+| 文件 | 变更 |
+|------|------|
+| `userspace/get_sockdelays/get_sockdelays.c` `send_and_recv` | 加 seq/portid/type 诊断输出 |
+| `userspace/get_sockdelays/get_sockdelays.c` `parse_msg_cb` | 加消息类型/匹配诊断输出 |

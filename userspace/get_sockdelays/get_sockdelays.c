@@ -196,8 +196,16 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 			prog_name, err->error);
 		return MNL_CB_ERROR;
 	}
-	if (nlh->nlmsg_type == NLMSG_DONE)
+	if (nlh->nlmsg_type == NLMSG_DONE) {
+		fprintf(stderr, "%s: [diag] received NLMSG_DONE (seq=%u portid=%u)\n",
+			prog_name, nlh->nlmsg_seq, nlh->nlmsg_portid);
 		return MNL_CB_OK;
+	}
+
+	/* Diagnostic: print non-error, non-DONE messages */
+	fprintf(stderr, "%s: [diag] received msg type=%u (seq=%u portid=%u len=%u)\n",
+		prog_name, nlh->nlmsg_type, nlh->nlmsg_seq,
+		nlh->nlmsg_portid, nlh->nlmsg_len);
 
 	genl = mnl_nlmsg_get_payload(nlh);
 	mnl_attr_for_each(attr, nlh, GENL_HDRLEN) {
@@ -277,6 +285,9 @@ static int send_and_recv(struct mnl_socket *nl, struct nlmsghdr *nlh,
 	seq = nlh->nlmsg_seq;
 	portid = mnl_socket_get_portid(nl);
 
+	fprintf(stderr, "%s: [diag] send_and_recv: seq=%u portid=%u type=%u\n",
+		prog_name, seq, portid, nlh->nlmsg_type);
+
 	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
 		perror("mnl_socket_sendto");
 		return -errno;
@@ -288,8 +299,12 @@ static int send_and_recv(struct mnl_socket *nl, struct nlmsghdr *nlh,
 			perror("mnl_socket_recvfrom");
 			return -errno;
 		}
+		fprintf(stderr, "%s: [diag] recvfrom returned %d bytes\n",
+			prog_name, ret);
 		ret = mnl_cb_run(buf, ret, seq, portid,
 				 parse_msg_cb, ctx);
+		fprintf(stderr, "%s: [diag] mnl_cb_run returned %d\n",
+			prog_name, ret);
 		if (ret <= MNL_CB_STOP)
 			break;
 	}
