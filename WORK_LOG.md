@@ -292,3 +292,47 @@ nlh->nlmsg_flags = NLM_F_REQUEST;
 | `ci/qemu/guest-init.sh` | L102 | 正常退出时清理 watchdog |
 | `userspace/get_sockdelays/get_sockdelays.c` | L334 | `NLM_F_REQUEST \| NLM_F_DUMP` → `NLM_F_REQUEST` |
 | `ci/qemu/ci-test.sh` | L174 | 内核命令行去掉 `quiet` |
+
+---
+
+### 新发现：doit 回调根本未被调用（2026-07-21 第二轮分析）
+
+**CI 结果**（提交 a135a5d，超时保护后 CI 首次成功完成 Step 7）：
+
+- `dmesg | grep net_delayacct` 只输出一条消息：`net_delayacct: framework registered (family=28)`
+- 之前在 `net_delayacct_cmd_get_by_pid` 第 387 行添加的 `pr_info("cmd_get_by_pid: querying pid=%u", ...)` **完全没有出现**
+- `net_delayacct_iter_task_sockets` 内的多条 `pr_info`（第 321-341 行）也**全部未出现**
+- 但用户态工具 `get_sockdelays` 没有报错，正常返回 `(no matching sockets)`
+
+**关键证据**：
+
+1. genl family 已注册（dmesg 有 "framework registered"）
+2. `resolve_family_id` 正常工作（否则工具会报错/fail）
+3. 用户态 netlink 通信正常（无 timeout、无 error）
+4. **所有 `doit` 回调内的日志均未输出** → `doit` 一定未被调用
+5. 所有查询返回 `(no matching sockets)`，说明 `send_and_recv` 返回 0 且 `ctx.rec_count == 0`
+
+**矛盾点分析**：
+
+如果 `doit` 未被调用但内核也没有返回 error（否则用户态会显示 "netlink error -X"），那内核必然发了某种非 error 的响应。可能场景：
+
+- **场景 A**：内核框架在 `doit` 之前某处静默处理了请求并发了 `NLMSG_DONE`
+- **场景 B**：`doit` 实际被调用了但 `pr_info` 因某些原因未进入 dmesg（例如内核二进制非最新构建）
+- **场景 C**：用户态收到了与请求无关的 netlink 消息（不同 portid/seq），被 `mnl_cb_run` 跳过，然后因 `MNL_CB_OK` 退出循环
+
+**Test 2 假阳性**：`test_02_nc_listener_pid` 只检查 `[ -n "$out" ]`（输出非空即 PASS），而 `(no matching sockets)` 是非空的。因此 Test 2 的 PASS 不具有诊断价值。
+
+**本次修改**（提交 cf1bf3d 之后）：
+
+| 文件/行 | 变更 | 目的 |
+|---------|------|------|
+| `kernel-patches/net-core-net-delayacct.c` L593 | 注册消息加 `v2` 标记 | 确认 CI 中真正运行的是新编译的内核 |
+| `kernel-patches/net-core-net-delayacct.c` L387 | `pr_info` → `pr_emerg` | `KERN_EMERG` 级别无法被任何 loglevel 过滤 |
+| `kernel-patches/net-core-net-delayacct.c` L421-422 | `cmd_get_by_inode` 加 `pr_emerg` | 确认 inode 查询回调是否被调用 |
+| `kernel-patches/net-core-net-delayacct.c` L321-341 | `pr_info` → `pr_emerg` | iter 内部所有调试日志提升至 EMERG 级别 |
+
+**预期下一轮 CI 结果**：
+- 如果 dmesg 中出现 `v2` → 新内核已生效
+- 如果 dmesg 中出现 `cmd_get_by_pid: querying pid=...`（pr_emerg）→ `doit` 被调用，问题在内部逻辑
+- 如果 dmesg 中只有 `v2` 但没有 `cmd_get_by_pid` → `doit` 确实未被调用，需排查 genl 框架层
+- 如果 dmesg 中连 `v2` 都没有 → 内核编译/部署链路有问题，`make bzImage` 未包含修改

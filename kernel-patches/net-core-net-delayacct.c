@@ -318,7 +318,7 @@ static int net_delayacct_iter_task_sockets(struct task_struct *task,
 
 	spin_lock(&files->file_lock);
 	fdt = files_fdtable(files);
-	pr_info("net_delayacct: iter_task_sockets pid=%u max_fds=%u\n",
+	pr_emerg("net_delayacct: iter_task_sockets pid=%u max_fds=%u\n",
 		pid, fdt->max_fds);
 	for (fd = 0; fd < fdt->max_fds; fd++) {
 		struct file *file = fdt->fd[fd];
@@ -330,13 +330,13 @@ static int net_delayacct_iter_task_sockets(struct task_struct *task,
 		if (!sk)
 			continue;
 		if (!is_inet_tcp_udp(sk)) {
-			pr_info("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u SKIPPED\n",
+			pr_emerg("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u SKIPPED\n",
 				fd, (unsigned long long)sock_inode_for(sk),
 				sk->sk_family, sk->sk_protocol);
 			continue;
 		}
 
-		pr_info("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u FOUND\n",
+		pr_emerg("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u FOUND\n",
 			fd, (unsigned long long)sock_inode_for(sk),
 			sk->sk_family, sk->sk_protocol);
 
@@ -384,7 +384,7 @@ static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
 
 	pid = nla_get_u32(info->attrs[NET_DELAYACCT_A_PID]);
 
-	pr_info("net_delayacct: cmd_get_by_pid: querying pid=%u\n", pid);
+	pr_emerg("net_delayacct: cmd_get_by_pid: querying pid=%u\n", pid);
 
 	rcu_read_lock();
 	pidp = find_get_pid(pid);
@@ -417,6 +417,9 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 	if (!info->attrs[NET_DELAYACCT_A_INODE])
 		return -EINVAL;
 	target_inode = nla_get_u64(info->attrs[NET_DELAYACCT_A_INODE]);
+
+	pr_emerg("net_delayacct: cmd_get_by_inode: querying inode=%llu\n",
+		 (unsigned long long)target_inode);
 
 	rcu_read_lock();
 	for_each_process(task) {
@@ -590,7 +593,7 @@ static int __init net_delayacct_mod_init(void)
 		       ret);
 		return ret;
 	}
-	pr_info("net_delayacct: framework registered (family=%u)\n",
+	pr_info("net_delayacct: framework registered v2 (family=%u)\n",
 		net_delayacct_genl_family.id);
 	return 0;
 }
