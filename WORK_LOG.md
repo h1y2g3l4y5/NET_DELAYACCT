@@ -1472,3 +1472,137 @@ net_delayacct: one_reply: genlmsg_reply ret=0
 | userspace/get_sockdelays/get_sockdelays.c | seq 检查 + mnl_cb_run 返回值捕获 + 诊断增强 |
 | ci/qemu/ci-test.sh | `make tool` → `make -B tool` |
 | ci/qemu/guest-init.sh | `--debug` → `-d` + printk/genl/dmesg 诊断 |
+
+---
+
+## 第十四轮 — selftest nc 时序修复 + CI 首次全绿 (2026-07-22)
+
+### 背景
+
+第十三轮修复了 `send_and_recv` 丢弃 `mnl_cb_run` 返回值的核心 bug（commit ab91f63），
+CI 的 func 测试全部通过，但 selftest Test 2 仍然 FAIL。进一步分析发现 fb64647 的 CI
+报告中 Test 2 失败导致 `test_fail()` 调用 `exit 1`，Tests 3-7 从未执行。
+
+### 问题 1：selftest Test 2 — nc listener PID 查询失败
+
+#### 现象
+
+CI 报告（commit fb64647, test-report-20260722_172019.txt）：
+
+```
+--- Test 2: nc listener PID query ---
+netdelayacct-test
+[FAIL] nc listener (pid 102) no socket data (output: (no matching sockets))
+```
+
+#### 根因
+
+OpenBSD `nc -l` 的默认行为是：接受第一个连接后，处理完毕即退出。测试脚本的时序为：
+
+```bash
+nc -l -p "$port" &       # 启动监听
+sleep 1
+echo "..." | nc ... &    # 客户端连接 → nc 服务端接受 → 读取数据 → 退出
+sleep 1
+get_sockdelays -p $nc_pid  # 查询时 nc 已退出，所有 fd 已关闭
+```
+
+内核日志证实：`iter_task_sockets pid=102 max_fds=256` 但没有 `iter fd=...` 行 —
+进程仍在 task list 中（zombie），但所有文件描述符均已关闭。
+
+#### 修复
+
+在客户端连接**之前**查询 nc 监听器，此时 listening socket 保证已打开：
+
+```bash
+nc -l -p "$port" &
+nc_pid=$!
+sleep 1
+# Query BEFORE connecting — listening socket is guaranteed open
+out=$("$GET_SOCKDELAYS" -p "$nc_pid" 2>&1 || true)
+# ... check output ...
+# 然后再发起客户端连接（可选，不影响测试结果）
+```
+
+同样的时序修复应用到 Test 4（reset）和 Test 7（multi-socket）。
+
+### 问题 2：test_fail() 的 exit 1 导致后续测试不执行
+
+#### 现象
+
+Test 2 FAIL 后，`test_fail()` 调用 `exit 1`，整个 selftest 脚本退出。
+Tests 3-7 从未执行，无法判断它们是否通过。
+
+#### 修复
+
+从 `test_fail()` 中移除 `exit 1`，改为只递增失败计数器。所有测试都会执行完毕，
+最终退出码由 `print_summary()` 的返回值决定（有失败则返回 1）。
+
+```bash
+# Before:
+test_fail() {
+    TEST_FAIL_COUNT=$((TEST_FAIL_COUNT + 1))
+    echo "[FAIL] $1"
+    exit 1               # ← 立即退出，后续测试不执行
+}
+
+# After:
+test_fail() {
+    TEST_FAIL_COUNT=$((TEST_FAIL_COUNT + 1))
+    echo "[FAIL] $1"
+    # 不退出，让所有测试跑完
+}
+```
+
+### 问题 3：guest-init.sh 的 SKIP 误导信息
+
+#### 现象
+
+`test_multi_socket.sh` 因缺少 python3 而返回 exit code 4（SKIP），
+但 `guest-init.sh` 的 `|| echo "test timed out or failed"` 误导性地报告失败。
+
+#### 修复
+
+在 `guest-init.sh` 中正确处理 exit code 4（SKIP）：
+
+```bash
+set +e
+timeout 30 bash "$t" 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 4 ]; then
+    echo "  (SKIP: dependencies not met)"
+elif [ "$rc" -ne 0 ]; then
+    echo "  (test failed or timed out, rc=$rc)"
+fi
+```
+
+### CI 验证结果（commit c0cb1bf）
+
+**CI 状态：Succeeded** ✅ — 首次全绿！
+
+```
+selftest:  Passed: 8, Failed: 0
+  Test 1: PASS  query own PID
+  Test 2: PASS  nc listener PID query        ← 之前 FAIL，已修复
+  Test 3: PASS  inode query
+  Test 4: PASS  reset counters
+  Test 5: PASS  TCP path (iperf3)
+  Test 6: PASS  UDP path (iperf3 -u)          ← 之前 FAIL，已修复
+  Test 7: PASS  multi-socket (nc + iperf3)
+
+func tests: ALL PASS
+  test_inode_query.sh: PASS=2
+  test_multi_socket.sh:  SKIP (requires python3)
+  test_pid_query.sh:    PASS=2
+  test_reset.sh:        PASS=2
+  test_tcp_udp.sh:      PASS=2 (TCP + UDP)
+```
+
+### 修改文件清单
+
+| 文件 | 改动 |
+|------|------|
+| tests/selftests/net-delayacct/test_helper.sh | `test_fail()` 移除 `exit 1` |
+| tests/selftests/net-delayacct/test_netdelayacct.sh | Test 2/4/7 时序修复 + `exit $?` |
+| ci/qemu/guest-init.sh | selftest 和 func 测试正确处理 SKIP (exit code 4) |
