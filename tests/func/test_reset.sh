@@ -23,7 +23,7 @@ else
 fi
 
 # 检查依赖命令
-for cmd in iperf3 nc; do
+for cmd in iperf3; do
 	if ! command -v "$cmd" >/dev/null 2>&1; then
 		echo "SKIP: required command '$cmd' not found"
 		exit 4
@@ -31,34 +31,38 @@ for cmd in iperf3 nc; do
 done
 
 IPERF_PORT=5204
-NC_PORT=12400
 PASS=0
 FAIL=0
 
 cleanup() {
-	pkill -f "iperf3 -s -D -p $IPERF_PORT" 2>/dev/null || true
-	if [ -n "${NC_PID:-}" ]; then
-		kill "$NC_PID" 2>/dev/null || true
+	if [ -n "${IPERF_PID:-}" ]; then
+		kill "$IPERF_PID" 2>/dev/null || true
 	fi
 }
 trap cleanup EXIT
 
 echo "=== test_reset: get_sockdelays -R ==="
 
-# 步骤 1：产生网络流量以累积时延计数
-iperf3 -s -D -p "$IPERF_PORT" 2>/dev/null || true
+# 步骤 1：启动 iperf3 服务端（后台模式，输出全部重定向避免干扰测试输出）
+iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+IPERF_PID=$!
 sleep 1
+
+# 产生网络流量以累积时延计数
 iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 3 >/dev/null 2>&1 || true
 sleep 1
 
-nc -l "$NC_PORT" &
-NC_PID=$!
-sleep 1
-echo "reset-test-traffic" | nc 127.0.0.1 "$NC_PORT" >/dev/null 2>&1 || true
-sleep 1
+# 确认服务端存活
+if ! kill -0 "$IPERF_PID" 2>/dev/null; then
+	echo "[FAIL] iperf3 server not running"
+	FAIL=$((FAIL + 1))
+	echo ""
+	echo "=== Summary: PASS=$PASS FAIL=$FAIL ==="
+	exit 1
+fi
 
 # 步骤 2：记录重置前的计数
-PRE_RESET_OUTPUT=$("$GET_SOCKDELAYS" -p "$NC_PID" 2>&1 || true)
+PRE_RESET_OUTPUT=$("$GET_SOCKDELAYS" -p "$IPERF_PID" 2>&1 || true)
 echo "Pre-reset output:"
 echo "$PRE_RESET_OUTPUT" | head -5
 
@@ -68,22 +72,17 @@ echo "Executing reset..."
 sleep 1
 
 # 步骤 4：查询重置后的计数
-POST_RESET_OUTPUT=$("$GET_SOCKDELAYS" -p "$NC_PID" 2>&1 || true)
+POST_RESET_OUTPUT=$("$GET_SOCKDELAYS" -p "$IPERF_PID" 2>&1 || true)
 echo "Post-reset output:"
 echo "$POST_RESET_OUTPUT" | head -5
 
 # 步骤 5：验证重置后所有计数为零或 N/A
-# 输出格式参考: TYPE LADDR LPORT RADDR RPORT COMM PID AVG_RX AVG_TX
-# 检查最后两列（AVG_RX, AVG_TX）是否为零或 N/A
+# 输出格式: proto=xxx pid=NNN inode=NNN comm=xxx local=x remote=x rx=<NS>ns/<N>pkts tx=<NS>ns/<N>pkts
+# 提取 rx= 和 tx= 字段，检查是否为 0ns/0pkts
 NONZERO_COUNT=$(echo "$POST_RESET_OUTPUT" | \
-	grep -v -E '^(TYPE|$)' | \
-	awk '{
-		for (i = NF - 1; i <= NF; i++) {
-			val = $i
-			gsub(/[usn]/, "", val)
-			if (val != "N/A" && val + 0 > 0) print $0
-		}
-	}' | wc -l)
+	grep -E '^proto=' | \
+	sed -n 's/.*rx=\([0-9]*\)ns\/\([0-9]*\)pkts.*tx=\([0-9]*\)ns\/\([0-9]*\)pkts.*/\1 \2 \3 \4/p' | \
+	awk '$1 > 0 || $2 > 0 || $3 > 0 || $4 > 0 {print}' | wc -l)
 
 if [ "$NONZERO_COUNT" -eq 0 ]; then
 	echo "[PASS] all counters are zero/N/A after reset"

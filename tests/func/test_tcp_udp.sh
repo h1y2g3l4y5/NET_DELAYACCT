@@ -65,7 +65,7 @@ if [ -z "$TCP_OUTPUT" ]; then
 	fi
 fi
 
-if [ -n "$TCP_OUTPUT" ] && echo "$TCP_OUTPUT" | grep -q "TCP"; then
+if [ -n "$TCP_OUTPUT" ] && echo "$TCP_OUTPUT" | grep -qi "proto=tcp"; then
 	echo "[PASS] TCP path: output contains TCP type"
 	PASS=$((PASS + 1))
 else
@@ -103,7 +103,7 @@ if [ -z "$UDP_OUTPUT" ]; then
 	fi
 fi
 
-if [ -n "$UDP_OUTPUT" ] && echo "$UDP_OUTPUT" | grep -q "UDP"; then
+if [ -n "$UDP_OUTPUT" ] && echo "$UDP_OUTPUT" | grep -qi "proto=udp"; then
 	echo "[PASS] UDP path: output contains UDP type"
 	PASS=$((PASS + 1))
 else

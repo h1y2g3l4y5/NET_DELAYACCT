@@ -40,6 +40,7 @@
 #define NL_BUF_SIZE		(32 * 1024)
 
 static const char *prog_name = "get_sockdelays";
+static int debug = 0;
 
 static void usage(FILE *out)
 {
@@ -62,6 +63,7 @@ static void usage(FILE *out)
 		"Miscellaneous:\n"
 		"  -h, --help            Show this help and exit.\n"
 		"  -V, --version         Print version and exit.\n"
+		"  -d, --debug           Print diagnostic netlink messages to stderr.\n"
 		"\n"
 		"The kernel must have CONFIG_NET_DELAYACCT=y and the\n"
 		"net-delayacct module loaded.  Root may be required to\n"
@@ -200,15 +202,17 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 		return MNL_CB_ERROR;
 	}
 	if (nlh->nlmsg_type == NLMSG_DONE) {
-		fprintf(stderr, "%s: [diag] received NLMSG_DONE (seq=%u pid=%u)\n",
-			prog_name, nlh->nlmsg_seq, nlh->nlmsg_pid);
+		if (debug)
+			fprintf(stderr, "%s: [diag] received NLMSG_DONE (seq=%u pid=%u)\n",
+				prog_name, nlh->nlmsg_seq, nlh->nlmsg_pid);
 		return MNL_CB_OK;
 	}
 
 	/* Diagnostic: print non-error, non-DONE messages */
-	fprintf(stderr, "%s: [diag] received msg type=%u (seq=%u pid=%u len=%u)\n",
-		prog_name, nlh->nlmsg_type, nlh->nlmsg_seq,
-		nlh->nlmsg_pid, nlh->nlmsg_len);
+	if (debug)
+		fprintf(stderr, "%s: [diag] received msg type=%u (seq=%u pid=%u len=%u)\n",
+			prog_name, nlh->nlmsg_type, nlh->nlmsg_seq,
+			nlh->nlmsg_pid, nlh->nlmsg_len);
 
 	mnl_attr_for_each(attr, nlh, GENL_HDRLEN) {
 		switch (mnl_attr_get_type(attr)) {
@@ -285,8 +289,9 @@ static int send_and_recv(struct mnl_socket *nl, struct nlmsghdr *nlh,
 	seq = nlh->nlmsg_seq;
 	portid = mnl_socket_get_portid(nl);
 
-	fprintf(stderr, "%s: [diag] send_and_recv: seq=%u portid=%u type=%u\n",
-		prog_name, seq, portid, nlh->nlmsg_type);
+	if (debug)
+		fprintf(stderr, "%s: [diag] send_and_recv: seq=%u portid=%u type=%u\n",
+			prog_name, seq, portid, nlh->nlmsg_type);
 
 	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
 		perror("mnl_socket_sendto");
@@ -301,19 +306,33 @@ static int send_and_recv(struct mnl_socket *nl, struct nlmsghdr *nlh,
 		}
 		{
 			struct nlmsghdr *rnlh = (struct nlmsghdr *)buf;
-			fprintf(stderr, "%s: [diag] recvfrom %d bytes type=%u len=%u flags=%u\n",
-				prog_name, ret, rnlh->nlmsg_type,
-				rnlh->nlmsg_len, rnlh->nlmsg_flags);
+			if (debug)
+				fprintf(stderr, "%s: [diag] recvfrom %d bytes type=%u len=%u flags=%u\n",
+					prog_name, ret, rnlh->nlmsg_type,
+					rnlh->nlmsg_len, rnlh->nlmsg_flags);
 			if (rnlh->nlmsg_type == NLMSG_ERROR) {
 				struct nlmsgerr *nle = (struct nlmsgerr *)NLMSG_DATA(rnlh);
-				fprintf(stderr, "%s: [diag] NLMSG_ERROR error=%d (req type=%u)\n",
-					prog_name, nle->error, nle->msg.nlmsg_type);
+				if (debug)
+					fprintf(stderr, "%s: [diag] NLMSG_ERROR error=%d (req type=%u)\n",
+						prog_name, nle->error, nle->msg.nlmsg_type);
+			}
+			/* For non-multipart (doit) replies, the kernel sends a
+			 * single message without NLM_F_MULTI and without a
+			 * trailing NLMSG_DONE.  Break after processing it so
+			 * we don't block on the next recvfrom forever. */
+			if (!(rnlh->nlmsg_flags & NLM_F_MULTI) &&
+			    rnlh->nlmsg_type != NLMSG_DONE &&
+			    rnlh->nlmsg_type != NLMSG_ERROR) {
+				mnl_cb_run(buf, ret, seq, portid,
+					   parse_msg_cb, ctx);
+				break;
 			}
 		}
 		ret = mnl_cb_run(buf, ret, seq, portid,
 				 parse_msg_cb, ctx);
-		fprintf(stderr, "%s: [diag] mnl_cb_run returned %d\n",
-			prog_name, ret);
+		if (debug)
+			fprintf(stderr, "%s: [diag] mnl_cb_run returned %d\n",
+				prog_name, ret);
 		if (ret <= MNL_CB_STOP)
 			break;
 	}
@@ -391,7 +410,7 @@ int main(int argc, char **argv)
 	struct mnl_socket *nl;
 	int rc = 0;
 
-	static const char *short_opts = "hp:i:RjV";
+	static const char *short_opts = "hp:i:RjVd";
 	static const struct option long_opts[] = {
 		{ "help",    no_argument,       NULL, 'h' },
 		{ "pid",     required_argument, NULL, 'p' },
@@ -399,6 +418,7 @@ int main(int argc, char **argv)
 		{ "reset",   no_argument,       NULL, 'R' },
 		{ "json",    no_argument,       NULL, 'j' },
 		{ "version", no_argument,       NULL, 'V' },
+		{ "debug",   no_argument,       NULL, 'd' },
 		{ NULL, 0, NULL, 0 },
 	};
 
@@ -423,6 +443,9 @@ int main(int argc, char **argv)
 			break;
 		case 'j':
 			json = 1;
+			break;
+		case 'd':
+			debug = 1;
 			break;
 		default:
 			usage(stderr);

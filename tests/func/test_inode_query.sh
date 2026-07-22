@@ -80,8 +80,8 @@ else
 		echo "[FAIL] get_sockdelays -i $INODE returned empty output"
 		FAIL=$((FAIL + 1))
 	else
-		# 验证输出中包含该 inode
-		if echo "$OUTPUT" | grep -q "$INODE"; then
+		# 验证输出中包含该 inode（精确匹配 inode=<INODE>）
+		if echo "$OUTPUT" | grep -q "inode=$INODE"; then
 			echo "[PASS] output contains inode $INODE"
 			PASS=$((PASS + 1))
 		else
@@ -90,8 +90,8 @@ else
 			FAIL=$((FAIL + 1))
 		fi
 
-		# 验证输出行数：按 inode 查询应返回单行（不含表头）
-		DATA_LINES=$(echo "$OUTPUT" | grep -v -E '^(TYPE|$)' | wc -l)
+		# 验证输出行数：按 inode 查询应返回单行数据（proto= 开头）
+		DATA_LINES=$(echo "$OUTPUT" | grep -c -E '^proto=' || true)
 		if [ "$DATA_LINES" -eq 1 ]; then
 			echo "[PASS] output has exactly 1 data line"
 			PASS=$((PASS + 1))

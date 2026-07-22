@@ -77,7 +77,7 @@ else
 	fi
 
 	# 验证 2：输出包含 TCP 类型
-	if echo "$OUTPUT" | grep -q "TCP"; then
+	if echo "$OUTPUT" | grep -qi "proto=tcp"; then
 		echo "[PASS] output contains TCP type"
 		PASS=$((PASS + 1))
 	else

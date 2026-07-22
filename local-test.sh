@@ -28,7 +28,13 @@ LOG_FILE="$LOG_DIR/test-${TIMESTAMP}.log"
 
 KERNEL_PATCH_DIR="$PROJECT_DIR/kernel-patches"
 QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
-QEMU_TIMEOUT="${QEMU_TIMEOUT:-180}"
+QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-90}"
+QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-240}"
+# Backward compatibility: if user still exports QEMU_TIMEOUT, use it for both.
+if [ -n "${QEMU_TIMEOUT:-}" ]; then
+	QEMU_TIMEOUT_KVM="$QEMU_TIMEOUT"
+	QEMU_TIMEOUT_TCG="$QEMU_TIMEOUT"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -46,6 +52,25 @@ init_log() {
 log_section() {
 	echo ""
 	echo "--- [$1] $(date +%H:%M:%S) ---"
+}
+
+copy_binary_with_libs() {
+	local src="$1"
+	local dest_root="$2"
+	local dest="$dest_root$src"
+	local lib
+
+	[ -x "$src" ] || return 1
+	mkdir -p "$(dirname "$dest")"
+	cp -L "$src" "$dest"
+	chmod +x "$dest" 2>/dev/null || true
+
+	for lib in $(ldd "$src" 2>/dev/null | grep -o '/[^ ]*' | sort -u); do
+		[ -f "$lib" ] || continue
+		mkdir -p "$(dirname "$dest_root$lib")"
+		cp -L "$lib" "$dest_root$lib" 2>/dev/null || true
+	done
+	return 0
 }
 
 # ============================================================================
@@ -191,17 +216,35 @@ step_create_initramfs() {
 		BUSYBOX=$(command -v busybox)
 	fi
 
-	# Copy busybox and create symlinks
+	# Copy busybox and create symlinks for base commands only
 	cp "$BUSYBOX" "$INITRD_DIR/bin/busybox"
 	chmod +x "$INITRD_DIR/bin/busybox"
 	for cmd in sh ls cat echo grep wc head tail awk sed sleep kill pgrep \
 		   mount umount mknod chmod chown mkdir rmdir cp mv rm ln \
 		   timeout dmesg readlink command killall sort uniq dirname \
 		   basename date test tr cut which true false \
-		   nc iperf3 ip ifconfig; do
+		   ip ifconfig; do
 		ln -sf /bin/busybox "$INITRD_DIR/bin/$cmd" 2>/dev/null || true
 	done
 	ln -sf /bin/busybox "$INITRD_DIR/sbin/init"
+
+	# Prefer real host binaries for iperf3 / nc when available.
+	# This makes the guest environment much closer to CI than busybox applets.
+	if command -v iperf3 >/dev/null 2>&1; then
+		copy_binary_with_libs "$(command -v iperf3)" "$INITRD_DIR"
+		echo "Packed real iperf3 from $(command -v iperf3)"
+	else
+		ln -sf /bin/busybox "$INITRD_DIR/bin/iperf3" 2>/dev/null || true
+		echo "WARNING: host iperf3 not found, falling back to busybox symlink"
+	fi
+
+	if command -v nc >/dev/null 2>&1; then
+		copy_binary_with_libs "$(command -v nc)" "$INITRD_DIR"
+		echo "Packed real nc from $(command -v nc)"
+	else
+		ln -sf /bin/busybox "$INITRD_DIR/bin/nc" 2>/dev/null || true
+		echo "WARNING: host nc not found, falling back to busybox symlink"
+	fi
 
 	# Copy get_sockdelays binary and its shared libraries
 	local TOOL_BIN="$PROJECT_DIR/userspace/get_sockdelays/get_sockdelays"
@@ -283,7 +326,7 @@ log "--- get_sockdelays -i (inode query) ---"
 INODE=""
 NC_PORT=19999
 if command -v nc >/dev/null 2>&1; then
-	nc -l -p "$NC_PORT" &
+	nc -l "$NC_PORT" &
 	NC_PID=$!
 	/bin/sleep 1
 	if kill -0 "$NC_PID" 2>/dev/null; then
@@ -318,7 +361,13 @@ for t in /opt/test/test_*.sh; do
 	tname=$(basename "$t")
 	log ""
 	log "--- $tname ---"
-	timeout 30 /bin/bash "$t" 2>&1 || log "[FAIL] $tname (timeout or failed)"
+	timeout 30 /bin/bash "$t" 2>&1
+	rc=$?
+	if [ "$rc" -eq 4 ]; then
+		log "[SKIP] $tname (dependencies not met)"
+	elif [ "$rc" -ne 0 ]; then
+		log "[FAIL] $tname (timeout or failed, rc=$rc)"
+	fi
 done
 
 # Post-test dmesg
@@ -352,25 +401,52 @@ step_run_qemu() {
 
 	local KERNEL_IMAGE="$LINUX_SRC/arch/x86/boot/bzImage"
 	local INITRD="$PROJECT_DIR/ci/qemu/local-initrd.img"
+	local qemu_common_args=()
+	local qemu_mode="kvm"
+	local qemu_rc=0
 
 	[ -f "$KERNEL_IMAGE" ] || { echo "${RED}No bzImage found${NC}"; exit 1; }
 	[ -f "$INITRD" ] || { echo "${RED}No initrd found${NC}"; exit 1; }
 
-	echo "Timeout: ${QEMU_TIMEOUT}s"
+	echo "Timeout (kvm): ${QEMU_TIMEOUT_KVM}s"
+	echo "Timeout (tcg): ${QEMU_TIMEOUT_TCG}s"
 	echo ""
 
-	timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
-		-m "$QEMU_MEMORY" \
-		-smp 2 \
-		-kernel "$KERNEL_IMAGE" \
-		-initrd "$INITRD" \
-		-append "console=ttyS0,115200n8 rdinit=/init" \
-		-nographic \
-		-no-reboot \
-		2>&1 || true
+	qemu_common_args=(
+		-m "$QEMU_MEMORY"
+		-smp 2
+		-kernel "$KERNEL_IMAGE"
+		-initrd "$INITRD"
+		-append "console=ttyS0,115200n8 rdinit=/init"
+		-nographic
+		-no-reboot
+	)
+
+	echo "QEMU mode: ${qemu_mode} (timeout=${QEMU_TIMEOUT_KVM}s)"
+	set +e
+	timeout "$QEMU_TIMEOUT_KVM" qemu-system-x86_64 \
+		-machine q35,accel=kvm,smm=off \
+		-cpu host,-sgx \
+		"${qemu_common_args[@]}"
+	qemu_rc=$?
+	set -e
+
+	if [ "$qemu_rc" -ne 0 ] && grep -Eq '(/dev/kvm|failed to initialize kvm|Permission denied|/dev/sgx_vepc|hit restricted)' "$LOG_FILE" 2>/dev/null; then
+		qemu_mode="tcg"
+		echo ""
+		echo "KVM/SGX unavailable in current environment, falling back to TCG..."
+		echo "QEMU mode: ${qemu_mode} (timeout=${QEMU_TIMEOUT_TCG}s)"
+		set +e
+		timeout "$QEMU_TIMEOUT_TCG" qemu-system-x86_64 \
+			-machine q35,accel=tcg,smm=off \
+			-cpu qemu64,-sgx \
+			"${qemu_common_args[@]}"
+		qemu_rc=$?
+		set -e
+	fi
 
 	echo ""
-	echo "QEMU exited"
+	echo "QEMU exited (mode=${qemu_mode}, rc=${qemu_rc})"
 }
 
 # ============================================================================

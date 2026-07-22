@@ -547,7 +547,25 @@ static int net_delayacct_cmd_reset(struct sk_buff *skb,
 	}
 	rcu_read_unlock();
 
-	return 0;
+	/* Send a simple reply so the userspace tool doesn't block on
+	 * recvfrom forever.  genl doit handlers must explicitly send a
+	 * reply; returning 0 alone does not generate one. */
+	{
+		struct sk_buff *msg;
+		void *hdr;
+
+		msg = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+		if (!msg)
+			return -ENOMEM;
+		hdr = genlmsg_put_reply(msg, info, &net_delayacct_genl_family,
+					0, info->genlhdr->cmd);
+		if (!hdr) {
+			nlmsg_free(msg);
+			return -EMSGSIZE;
+		}
+		genlmsg_end(msg, hdr);
+		return genlmsg_reply(msg, info);
+	}
 }
 
 /*

@@ -46,17 +46,22 @@ trap cleanup EXIT
 echo "=== test_multi_socket: single process, multiple sockets ==="
 
 # 使用 Python 打开 3 个 TCP socket 的脚本
-# 如果 python3 不可用，回退到 nc 方案
-if command -v python3 >/dev/null 2>&1; then
-	# 启动 3 个 nc 监听器作为对端
-	for port in 13001 13002 13003; do
-		nc -l "$port" &
-		LISTENER_PIDS="$LISTENER_PIDS $!"
-	done
-	sleep 1
+# nc 回退方案无法实现单进程多 socket（/dev/tcp 创建的 socket 在子 shell 中，
+# PID 不同），因此没有 python3 时直接 SKIP
+if ! command -v python3 >/dev/null 2>&1; then
+	echo "SKIP: requires python3 for single-process multi-socket test"
+	exit 4
+fi
 
-	# Python 脚本：打开 3 个 socket 连接到上述端口，保持连接
-	python3 -c "
+# 启动 3 个 nc 监听器作为对端
+for port in 13001 13002 13003; do
+	nc -l "$port" &
+	LISTENER_PIDS="$LISTENER_PIDS $!"
+done
+sleep 1
+
+# Python 脚本：打开 3 个 socket 连接到上述端口，保持连接
+python3 -c "
 import socket, time, os, signal
 
 sockets = []
@@ -72,24 +77,7 @@ time.sleep(5)
 for s in sockets:
     s.close()
 " &
-	CLIENT_PID=$!
-else
-	# 回退方案：使用后台 nc 连接模拟多 socket
-	for port in 13001 13002 13003; do
-		nc -l "$port" &
-		LISTENER_PIDS="$LISTENER_PIDS $!"
-	done
-	sleep 1
-
-	# 用 bash 打开 3 个 nc 连接（通过 coproc 或后台进程）
-	# 注意：bash 方案中 3 个 nc 是独立进程，PID 不同
-	# 因此这里主要用 Python 方案，nc 方案仅作为降级
-	for port in 13001 13002 13003; do
-		( exec 3<>/dev/tcp/127.0.0.1/$port; sleep 5; exec 3>&- ) &
-	done
-	# 使用当前 shell 的 PID 作为目标（bash 的 /dev/tcp 会创建 socket）
-	CLIENT_PID=$$
-fi
+CLIENT_PID=$!
 
 sleep 2
 
@@ -98,8 +86,8 @@ echo "Client PID: $CLIENT_PID"
 # 查询该 PID 的 socket 信息
 OUTPUT=$("$GET_SOCKDELAYS" -p "$CLIENT_PID" 2>&1 || true)
 
-# 验证 1：输出至少 3 行（不含表头）
-DATA_LINES=$(echo "$OUTPUT" | grep -v -E '^(TYPE|$)' | wc -l)
+# 验证 1：输出至少 3 行（数据行以 proto= 开头）
+DATA_LINES=$(echo "$OUTPUT" | grep -c -E '^proto=' || true)
 if [ "$DATA_LINES" -ge 3 ]; then
 	echo "[PASS] output has $DATA_LINES data line(s), expected >= 3"
 	PASS=$((PASS + 1))
@@ -111,10 +99,11 @@ else
 fi
 
 # 验证 2：所有数据行的 PID 字段相同
-# 输出格式中 PID 通常是倒数第 3 列（AVG_RX, AVG_TX 在最后）
+# 输出格式为: proto=xxx pid=NNN inode=NNN comm=xxx local=x remote=x rx=x tx=x
+# PID 字段是第 2 列（pid=NNN）
 UNIQUE_PIDS=$(echo "$OUTPUT" | \
-	grep -v -E '^(TYPE|$)' | \
-	awk '{print $(NF-2)}' | sort -u | wc -l)
+	grep -E '^proto=' | \
+	sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u | wc -l)
 if [ "$UNIQUE_PIDS" -eq 1 ]; then
 	echo "[PASS] all lines have the same PID"
 	PASS=$((PASS + 1))
