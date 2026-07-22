@@ -57,15 +57,15 @@ sleep 2
 # 查询客户端 PID
 TCP_OUTPUT=$("$GET_SOCKDELAYS" -p "$TCP_CLIENT_PID" 2>&1 || true)
 
-# 客户端可能已退出，尝试查询服务端
-if [ -z "$TCP_OUTPUT" ]; then
+# 客户端可能已退出或无数据，尝试查询服务端
+if ! echo "$TCP_OUTPUT" | grep -q -E '^proto='; then
 	TCP_SERVER_PID=$(pgrep -f "iperf3 -s -D -p $TCP_PORT" | head -1 || true)
 	if [ -n "$TCP_SERVER_PID" ]; then
 		TCP_OUTPUT=$("$GET_SOCKDELAYS" -p "$TCP_SERVER_PID" 2>&1 || true)
 	fi
 fi
 
-if [ -n "$TCP_OUTPUT" ] && echo "$TCP_OUTPUT" | grep -qi "proto=tcp"; then
+if echo "$TCP_OUTPUT" | grep -qi "proto=tcp"; then
 	echo "[PASS] TCP path: output contains TCP type"
 	PASS=$((PASS + 1))
 else
@@ -95,15 +95,15 @@ sleep 2
 # 查询客户端 PID
 UDP_OUTPUT=$("$GET_SOCKDELAYS" -p "$UDP_CLIENT_PID" 2>&1 || true)
 
-# 客户端可能已退出，尝试查询服务端
-if [ -z "$UDP_OUTPUT" ]; then
+# 客户端可能已退出或无数据，尝试查询服务端
+if ! echo "$UDP_OUTPUT" | grep -q -E '^proto='; then
 	UDP_SERVER_PID=$(pgrep -f "iperf3 -s -D -p $UDP_PORT" | head -1 || true)
 	if [ -n "$UDP_SERVER_PID" ]; then
 		UDP_OUTPUT=$("$GET_SOCKDELAYS" -p "$UDP_SERVER_PID" 2>&1 || true)
 	fi
 fi
 
-if [ -n "$UDP_OUTPUT" ] && echo "$UDP_OUTPUT" | grep -qi "proto=udp"; then
+if echo "$UDP_OUTPUT" | grep -qi "proto=udp"; then
 	echo "[PASS] UDP path: output contains UDP type"
 	PASS=$((PASS + 1))
 else

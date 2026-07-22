@@ -77,10 +77,10 @@ test_02_nc_listener_pid() {
 
 	# 查询监听进程的 socket
 	out=$("$GET_SOCKDELAYS" -p "$nc_pid" 2>&1 || true)
-	if [ -n "$out" ]; then
+	if echo "$out" | grep -q '^proto='; then
 		test_pass "nc listener (pid $nc_pid) found in output"
 	else
-		test_fail "nc listener (pid $nc_pid) produced empty output"
+		test_fail "nc listener (pid $nc_pid) no socket data (output: $out)"
 	fi
 
 	kill "$nc_pid" 2>/dev/null || true
@@ -127,16 +127,16 @@ test_03_inode_query() {
 	if [ -z "$out" ]; then
 		test_fail "inode query ($inode) returned empty"
 	else
-		# 验证输出中包含该 inode
-		if echo "$out" | grep -q "$inode"; then
-			line_count=$(echo "$out" | wc -l)
+		# 验证输出中包含该 inode（精确匹配 inode=<inode>）
+		if echo "$out" | grep -q "inode=$inode"; then
+			line_count=$(echo "$out" | grep -c -E '^proto=' || true)
 			if [ "$line_count" -eq 1 ]; then
 				test_pass "inode query ($inode) returned single line"
 			else
-				test_fail "inode query returned $line_count lines, expected 1"
+				test_fail "inode query returned $line_count data lines, expected 1"
 			fi
 		else
-			test_fail "inode query output does not contain inode $inode"
+			test_fail "inode query output does not contain inode $inode (output: $out)"
 		fi
 	fi
 
@@ -162,21 +162,20 @@ test_04_reset() {
 	sleep 1
 
 	# 执行重置
-	"$GET_SOCKDELAYS" -r 2>&1 || true
+	"$GET_SOCKDELAYS" -R 2>&1 || true
 	sleep 1
 
 	# 重置后查询，预期所有计数为零或 N/A
 	out=$("$GET_SOCKDELAYS" -p "$nc_pid" 2>&1 || true)
 
 	# 验证输出中不包含非零的时延计数
-	# 输出中的时延字段若为 0 或 N/A 则通过
+	# 输出格式: proto=xxx ... rx=<NS>ns/<N>pkts  tx=<NS>ns/<N>pkts
+	# 提取 rx= 和 tx= 字段的数值，检查是否全为零
 	local nonzero
-	nonzero=$(echo "$out" | grep -v -E '(N/A|^$|^TYPE)' | \
-		awk '{
-			for (i = NF - 1; i <= NF; i++) {
-				if ($i + 0 > 0) print $i
-			}
-		}' || true)
+	nonzero=$(echo "$out" | \
+		grep -E '^proto=' | \
+		sed -n 's/.*rx=\([0-9]*\)ns\/\([0-9]*\)pkts.*tx=\([0-9]*\)ns\/\([0-9]*\)pkts.*/\1 \2 \3 \4/p' | \
+		awk '$1 > 0 || $2 > 0 || $3 > 0 || $4 > 0 {print}' || true)
 
 	if [ -z "$nonzero" ]; then
 		test_pass "all counters are zero after reset"
@@ -215,10 +214,10 @@ test_05_tcp_path() {
 		fi
 	fi
 
-	if [ -n "$out" ] && echo "$out" | grep -q "TCP"; then
+	if [ -n "$out" ] && echo "$out" | grep -qi "proto=tcp"; then
 		test_pass "TCP socket found in iperf3 query output"
 	else
-		test_fail "TCP socket not found in output"
+		test_fail "TCP socket not found in output (out: $out)"
 	fi
 
 	# 清理 iperf3 服务端
@@ -251,10 +250,10 @@ test_06_udp_path() {
 		fi
 	fi
 
-	if [ -n "$out" ] && echo "$out" | grep -q "UDP"; then
+	if [ -n "$out" ] && echo "$out" | grep -qi "proto=udp"; then
 		test_pass "UDP socket found in iperf3 -u query output"
 	else
-		test_fail "UDP socket not found in output"
+		test_fail "UDP socket not found in output (out: $out)"
 	fi
 
 	pkill -f "iperf3 -s" 2>/dev/null || true
@@ -287,23 +286,23 @@ test_07_multi_socket() {
 	iperf_client_pid=$!
 	sleep 4
 
-	# 查询 nc 进程，应至少有一行（nc 的监听 socket）
+	# 查询 nc 进程，应至少有一行数据（nc 的监听 socket）
 	out=$("$GET_SOCKDELAYS" -p "$nc_pid" 2>&1 || true)
-	line_count=$(echo "$out" | grep -c . || true)
+	line_count=$(echo "$out" | grep -c -E '^proto=' || true)
 
 	if [ "$line_count" -ge 1 ]; then
 		test_pass "nc multi-socket query returned $line_count line(s)"
 	else
-		test_fail "nc multi-socket query returned empty"
+		test_fail "nc multi-socket query returned no data (out: $out)"
 	fi
 
-	# 查询 iperf3 客户端，应至少有一行
+	# 查询 iperf3 客户端，应至少有一行数据
 	out=$("$GET_SOCKDELAYS" -p "$iperf_client_pid" 2>&1 || true)
-	line_count=$(echo "$out" | grep -c . || true)
+	line_count=$(echo "$out" | grep -c -E '^proto=' || true)
 	if [ "$line_count" -ge 1 ]; then
 		test_pass "iperf3 multi-socket query returned $line_count line(s)"
 	else
-		test_fail "iperf3 multi-socket query returned empty"
+		test_fail "iperf3 multi-socket query returned no data (out: $out)"
 	fi
 
 	# 清理

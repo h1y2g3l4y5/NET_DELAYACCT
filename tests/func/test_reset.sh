@@ -92,13 +92,14 @@ else
 	FAIL=$((FAIL + 1))
 fi
 
-# 额外验证：重置前应有非零计数（确保流量确实被统计）
-# 注意：如果内核刚启动或未产生足够流量，此处可能为空
-if [ -n "$PRE_RESET_OUTPUT" ]; then
+# 额外验证：重置前应有实际数据行（确保流量确实被统计）
+# 注意："(no matching sockets)" 也是非空字符串，需要检查 ^proto= 数据行
+PRE_RESET_DATA_LINES=$(echo "$PRE_RESET_OUTPUT" | grep -c -E '^proto=' || true)
+if [ "$PRE_RESET_DATA_LINES" -ge 1 ]; then
 	echo "[PASS] pre-reset output was non-empty (traffic was recorded)"
 	PASS=$((PASS + 1))
 else
-	echo "[INFO] pre-reset output was empty (may be normal if no prior traffic)"
+	echo "[INFO] pre-reset output had no data lines (may be normal if no prior traffic)"
 fi
 
 echo ""

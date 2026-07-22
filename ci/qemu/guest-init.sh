@@ -45,6 +45,23 @@ else
 	timeout 5 /usr/local/bin/get_sockdelays -p 1 2>&1 | head -3 || echo "  (get_sockdelays timed out or failed)"
 fi
 
+# Diagnostic: start nc listener, query with --debug, capture kernel logs
+echo "Diagnostic: nc listener query test..."
+nc -l 19999 &
+NC_DIAG_PID=$!
+sleep 1
+if kill -0 "$NC_DIAG_PID" 2>/dev/null; then
+	echo "  nc pid=$NC_DIAG_PID"
+	echo "  get_sockdelays output:"
+	timeout 5 /usr/local/bin/get_sockdelays --debug -p "$NC_DIAG_PID" 2>&1 | head -10
+	echo "  kernel messages after query:"
+	dmesg | grep -i "net_delayacct" | tail -5
+	kill "$NC_DIAG_PID" 2>/dev/null || true
+	wait "$NC_DIAG_PID" 2>/dev/null || true
+else
+	echo "  (nc failed to start)"
+fi
+
 # Always show kernel net_delayacct messages for debugging
 echo "Kernel net_delayacct messages:"
 dmesg | grep -i "net_delayacct" || echo "  (no net_delayacct kernel messages)"

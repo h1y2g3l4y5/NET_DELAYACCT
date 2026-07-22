@@ -66,13 +66,14 @@ else
 	# 查询 socket 时延信息
 	OUTPUT=$("$GET_SOCKDELAYS" -p "$TARGET_PID" 2>&1 || true)
 
-	# 验证 1：输出非空
-	LINE_COUNT=$(echo "$OUTPUT" | grep -c . || true)
+	# 验证 1：输出包含至少一行数据（proto= 开头）
+	LINE_COUNT=$(echo "$OUTPUT" | grep -c -E '^proto=' || true)
 	if [ "$LINE_COUNT" -ge 1 ]; then
 		echo "[PASS] output has $LINE_COUNT line(s)"
 		PASS=$((PASS + 1))
 	else
-		echo "[FAIL] output is empty"
+		echo "[FAIL] output has no data lines"
+		echo "  Output was: $OUTPUT"
 		FAIL=$((FAIL + 1))
 	fi
 
