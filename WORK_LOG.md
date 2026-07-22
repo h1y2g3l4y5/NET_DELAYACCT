@@ -798,3 +798,127 @@ LINES=559       # ← 完整输出
 | `kernel-patches/net-core-net-delayacct.c` L427/465/484/492 | 增加 4 处 `pr_emerg` | 追踪 `cmd_get_by_inode` 的 enter/match/exit 路径 |
 | `userspace/get_sockdelays/get_sockdelays.c` L283/297/301 | 增加 `[diag]` 日志 | 追踪 send/recv/cb_run 链路 |
 | `local-test.sh` L38-44 | 去掉 `init_log` 的 `exec > >(tee ...)`；main 改用 `{ ...; } 2>&1 \| tee -a` 管道包裹 | 解决 timeout 杀不掉独立 tee 子进程导致的"无输出"卡死 |
+
+### 附：CI / guest 超时保护机制设计由来
+
+> 问：QEMU 5 分钟超时 + guest-init 120 秒 watchdog 当初为什么要设置？
+
+**背景**：CI 早期现象是输出停在 QEMU 内核启动日志处，`========== TEST RESULTS ==========`
+从不出现，整个 CI job 挂死不退出。
+
+**挂死根因**：`guest-init.sh` 里调用 `get_sockdelays -p 1` 时，其内部的
+`mnl_socket_recvfrom()` 是**无限期阻塞**系统调用。当时 genl 通信尚未打通（doit 回调
+未被触发 / 回复格式不对），内核不回复 → 进程永久挂起 → guest-init 卡住 →
+QEMU 永远不 poweroff → CI job 挂死。即使 `ci-test.sh` 的 QEMU 命令后有 `|| true`，
+被 `timeout 300` 强杀后管道产生 SIGPIPE，且 guest 没生成 `test-output.txt`，
+Step 7 提取结果也拿不到数据。
+
+**多层超时保护设计**（详细记录见上文"修复 1：guest-init.sh 多层超时保护"）：
+
+| 层级 | 超时 | 作用 |
+|------|------|------|
+| `get_sockdelays` 调用 | 10s | 内核不回复时杀掉单个调用，不让它永久阻塞 |
+| 测试脚本调用 | 30s | 防止整个 test 脚本卡住 |
+| guest-init watchdog | 120s | **兜底**：无论哪一步卡死，120s 后强制 `poweroff -f`，让 QEMU 优雅退出 |
+| ci-test.sh QEMU | 300s（5分钟）| 最外层兜底，watchdog 失效时强杀 QEMU |
+
+**关键设计**：watchdog（120s）比 QEMU timeout（300s）短，正常情况下 watchdog 先触发
+poweroff，QEMU 走优雅退出路径、能生成日志；只有 watchdog 本身也失效时才轮到 5 分钟
+强杀。正常完成后第 102 行 `kill $WATCHDOG_PID` 清理，避免误杀。
+
+现在 genl 通信已打通（`MATCH ret=0`），这些超时更多是保险作用，但保留着没有坏处。
+
+---
+
+## 第十轮：36-byte NLMSG_ERROR 回复根因定位与修复（已解决）
+
+### 问题描述
+
+第九轮发现：内核 `cmd_get_by_inode` 返回 `MATCH ret=0`（回复发送成功），但用户态
+`get_sockdelays` 只收到 **36 bytes** 且 `parse_msg_cb` 三个分支都不打印，`mnl_cb_run`
+返回 0，输出 `(no matching sockets)`。
+
+### 逐步定位
+
+#### 第 1 步：确认收到的消息类型
+
+在 `send_and_recv` 的 recvfrom 后打印 `nlmsghdr.nlmsg_type`：
+```
+get_sockdelays: [diag] recvfrom 36 bytes type=2 len=36 flags=256
+```
+`type=2 = NLMSG_ERROR` —— 收到的不是数据消息（应为 type=28 family id），而是错误/ACK。
+
+#### 第 2 步：确认 error 值
+
+进一步打印 `NLMSG_ERROR` 的 error 字段：
+```
+get_sockdelays: [diag] NLMSG_ERROR error=0 (req type=16)
+```
+- `error=0` → 这是 **ACK（成功确认）**，不是真错误
+- `req type=16` → 触发 ACK 的原请求 type=16，而 `16 = GENL_ID_CTRL`（genl 控制器固定 id）
+
+#### 第 3 步：发现矛盾
+
+`do_query()` 发请求时 `nlh->nlmsg_type = family_id`（line 327）。如果 `family_id`
+是内核分配给 net_delayacct 的 id（如 28），`req type` 应该是 28，不是 16。
+说明用户态收到的 ACK **不是 do_query 自己的回复**，而是别人留下的。
+
+#### 第 4 步：找到残留 ACK 的来源
+
+审查 `resolve_family_id()`（line 82-142）：
+```c
+nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;   // line 91 ← 带 NLM_F_ACK
+// ...发送 CTRL_CMD_GETFAMILY 请求...
+ret = mnl_socket_recvfrom(nl, buf, sizeof(buf)); // line 106 ← 只读一次
+// 解析 CTRL_ATTR_FAMILY_ID，返回
+```
+
+请求带 `NLM_F_ACK`，内核回复**两个**消息：
+1. 数据消息（含 `CTRL_ATTR_FAMILY_ID`）—— resolve_family_id 读到了，正确解析
+2. **ACK（NLMSG_ERROR error=0, req type=16）—— 残留在 socket 队列，未被读取！**
+
+#### 第 5 步：确认污染链
+
+之后 `do_query()` 发请求，第一次 `recvfrom` 读到的是 `resolve_family_id` 残留的 ACK：
+```
+do_query recvfrom → 读到 ACK(error=0, req type=16) → mnl_cb_run → MNL_CB_STOP → break
+→ rec_count=0 → "(no matching sockets)"
+```
+即使内核真的匹配并发送了数据消息（`MATCH ret=0`），用户态也收不到——它先读到残留 ACK 就退出了。
+
+### 根因
+
+**纯粹的用户态 bug**：`resolve_family_id()` 的 `CTRL_CMD_GETFAMILY` 请求不该带
+`NLM_F_ACK`。带 ACK 导致内核多发一个 ACK 消息，但函数只读一次，ACK 残留污染了
+后续 `do_query()` 的接收队列。内核模块一直是正确的。
+
+### 修复
+
+去掉 `NLM_F_ACK`（`get_sockdelays.c` line 91）：
+```c
+// 之前：nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+// 之后：
+nlh->nlmsg_flags = NLM_F_REQUEST;
+```
+
+`CTRL_CMD_GETFAMILY` 是 GET 请求，内核回复数据消息即可，不需要 ACK。
+
+### 验证结果
+
+修复后 `get_sockdelays` 成功接收数据消息：
+```
+cmd_get_by_inode: pid=71 fd=3 ino=1136 sk_family=10 sk_proto=6
+cmd_get_by_inode: MATCH ret=0
+[diag] recvfrom 168 bytes type=28 len=168 flags=0   ← 数据消息！不再是 36 bytes ACK
+proto=tcp pid=71 inode=1136 comm=nc ...             ← 真正解析出数据！
+```
+
+**通信链路完全打通**。剩余测试失败均为 busybox 环境限制（iperf3 不在 initramfs、
+nc 行为差异），非内核/工具代码问题。
+
+### 教训
+
+- genetlink GET 请求**不要**带 `NLM_F_ACK`：带 ACK 会让内核多发一个 ACK 消息，
+  如果接收方没有读完整个队列，ACK 会污染后续请求的接收
+- 同一个 netlink socket 复用时，必须确保每次请求的回复消息**完全消费干净**，
+  否则残留消息会串入下一次请求

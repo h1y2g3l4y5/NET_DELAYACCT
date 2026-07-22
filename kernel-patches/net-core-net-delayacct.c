@@ -200,7 +200,16 @@ static int net_delayacct_one_reply(struct genl_info *info, int flags,
 	}
 	genlmsg_end(msg, hdr);
 
-	return genlmsg_reply(msg, info);
+	{
+		struct nlmsghdr *nlh = nlmsg_hdr(msg);
+
+		pr_emerg("net_delayacct: one_reply: SEND skb->len=%u nlmsg_type=%u nlmsg_len=%u nlmsg_flags=%u\n",
+			 msg->len, nlh->nlmsg_type, nlh->nlmsg_len,
+			 nlh->nlmsg_flags);
+	}
+	ret = genlmsg_reply(msg, info);
+	pr_emerg("net_delayacct: one_reply: genlmsg_reply ret=%d\n", ret);
+	return ret;
 }
 
 /**

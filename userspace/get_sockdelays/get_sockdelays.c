@@ -88,7 +88,12 @@ static int resolve_family_id(struct mnl_socket *nl)
 
 	nlh = mnl_nlmsg_put_header(buf);
 	nlh->nlmsg_type = GENL_ID_CTRL;
-	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	/* NOTE: do NOT set NLM_F_ACK here.  With NLM_F_ACK the kernel replies
+	 * with TWO messages (data + NLMSG_ERROR ack); resolve_family_id() only
+	 * reads one, leaving the ack in the socket queue.  The next do_query()
+	 * recvfrom() would then pick up that stale ack instead of its own reply,
+	 * causing every query to see "(no matching sockets)". */
+	nlh->nlmsg_flags = NLM_F_REQUEST;
 	nlh->nlmsg_seq = seq = time(NULL);
 
 	struct genlmsghdr *genl = mnl_nlmsg_put_extra_header(nlh, sizeof(*genl));
@@ -294,8 +299,17 @@ static int send_and_recv(struct mnl_socket *nl, struct nlmsghdr *nlh,
 			perror("mnl_socket_recvfrom");
 			return -errno;
 		}
-		fprintf(stderr, "%s: [diag] recvfrom returned %d bytes\n",
-			prog_name, ret);
+		{
+			struct nlmsghdr *rnlh = (struct nlmsghdr *)buf;
+			fprintf(stderr, "%s: [diag] recvfrom %d bytes type=%u len=%u flags=%u\n",
+				prog_name, ret, rnlh->nlmsg_type,
+				rnlh->nlmsg_len, rnlh->nlmsg_flags);
+			if (rnlh->nlmsg_type == NLMSG_ERROR) {
+				struct nlmsgerr *nle = (struct nlmsgerr *)NLMSG_DATA(rnlh);
+				fprintf(stderr, "%s: [diag] NLMSG_ERROR error=%d (req type=%u)\n",
+					prog_name, nle->error, nle->msg.nlmsg_type);
+			}
+		}
 		ret = mnl_cb_run(buf, ret, seq, portid,
 				 parse_msg_cb, ctx);
 		fprintf(stderr, "%s: [diag] mnl_cb_run returned %d\n",
