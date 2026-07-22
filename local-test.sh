@@ -223,7 +223,7 @@ step_create_initramfs() {
 		   mount umount mknod chmod chown mkdir rmdir cp mv rm ln \
 		   timeout dmesg readlink command killall sort uniq dirname \
 		   basename date test tr cut which true false \
-		   ip ifconfig; do
+		   ip ifconfig nslookup wget; do
 		ln -sf /bin/busybox "$INITRD_DIR/bin/$cmd" 2>/dev/null || true
 	done
 	ln -sf /bin/busybox "$INITRD_DIR/sbin/init"
@@ -308,6 +308,20 @@ export GET_SOCKDELAYS=/usr/local/bin/get_sockdelays
 /bin/mount -t tmpfs none /tmp 2>/dev/null || true
 /bin/ip link set lo up 2>/dev/null || /bin/ifconfig lo 127.0.0.1 up 2>/dev/null || true
 
+# Configure external network (QEMU user-mode networking)
+# This enables real-world traffic demos (e.g., TCP to baidu.com, UDP to bilibili.com)
+if /bin/ip link show eth0 >/dev/null 2>&1; then
+	/bin/ip link set eth0 up
+	/bin/ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || true
+	/bin/ip route add default via 10.0.2.2 2>/dev/null || true
+	echo "nameserver 10.0.2.3" > /etc/resolv.conf
+	log "External network: eth0 configured (10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3)"
+	EXTERNAL_NET=1
+else
+	log "External network: eth0 not found, real-world demos will be skipped"
+	EXTERNAL_NET=0
+fi
+
 log ""
 log "=== local-test guest init ==="
 log "Date: $(date)"
@@ -390,18 +404,18 @@ log "========================================"
 # Demo 1: Help and version
 log ""
 log "--- Demo 1: Tool help ---"
+log "$ get_sockdelays -h"
 /usr/local/bin/get_sockdelays -h 2>&1
 
 log ""
 log "--- Demo 2: Tool version ---"
+log "$ get_sockdelays -V"
 /usr/local/bin/get_sockdelays -V 2>&1
 
 # Demo 3: TCP socket query
 log ""
-log "--- Demo 3: TCP socket query (-p <pid>) ---"
+log "--- Demo 3: TCP socket query (local iperf3) ---"
 TCP_PORT=21524
-# Start server in background (not -D) to capture PID directly — avoids
-# dependency on pgrep which may not be available in the guest (busybox).
 iperf3 -s -p "$TCP_PORT" >/dev/null 2>&1 &
 TCP_PID=$!
 sleep 1
@@ -409,10 +423,11 @@ if kill -0 "$TCP_PID" 2>/dev/null; then
 	iperf3 -c 127.0.0.1 -p "$TCP_PORT" -t 5 >/dev/null 2>&1 &
 	CLIENT_PID=$!
 	sleep 2
-	log "Querying iperf3 server (pid=$TCP_PID):"
+	log "# iperf3 server pid=$TCP_PID, client pid=$CLIENT_PID"
+	log "$ get_sockdelays -p $TCP_PID"
 	/usr/local/bin/get_sockdelays -p "$TCP_PID" 2>&1
 	log ""
-	log "Querying iperf3 client (pid=$CLIENT_PID):"
+	log "$ get_sockdelays -p $CLIENT_PID"
 	/usr/local/bin/get_sockdelays -p "$CLIENT_PID" 2>&1
 	kill "$CLIENT_PID" 2>/dev/null || true
 	wait "$CLIENT_PID" 2>/dev/null || true
@@ -424,7 +439,7 @@ wait "$TCP_PID" 2>/dev/null || true
 
 # Demo 4: UDP socket query
 log ""
-log "--- Demo 4: UDP socket query (-p <pid>) ---"
+log "--- Demo 4: UDP socket query (local iperf3 -u) ---"
 UDP_PORT=21525
 iperf3 -s -p "$UDP_PORT" >/dev/null 2>&1 &
 UDP_PID=$!
@@ -433,10 +448,11 @@ if kill -0 "$UDP_PID" 2>/dev/null; then
 	iperf3 -c 127.0.0.1 -p "$UDP_PORT" -u -t 10 -b 100M >/dev/null 2>&1 &
 	UDP_CLIENT=$!
 	sleep 2
-	log "Querying iperf3 UDP server (pid=$UDP_PID):"
+	log "# iperf3 UDP server pid=$UDP_PID, client pid=$UDP_CLIENT"
+	log "$ get_sockdelays -p $UDP_PID"
 	/usr/local/bin/get_sockdelays -p "$UDP_PID" 2>&1
 	log ""
-	log "Querying iperf3 UDP client (pid=$UDP_CLIENT):"
+	log "$ get_sockdelays -p $UDP_CLIENT"
 	/usr/local/bin/get_sockdelays -p "$UDP_CLIENT" 2>&1
 	kill "$UDP_CLIENT" 2>/dev/null || true
 	wait "$UDP_CLIENT" 2>/dev/null || true
@@ -450,7 +466,6 @@ wait "$UDP_PID" 2>/dev/null || true
 log ""
 log "--- Demo 5: Inode query (-i <inode>) ---"
 NC_PORT=21526
-# Use 'nc -l -p' (OpenBSD nc syntax) so the port is parsed correctly.
 nc -l -p "$NC_PORT" &
 NC_PID=$!
 sleep 1
@@ -466,8 +481,8 @@ if kill -0 "$NC_PID" 2>/dev/null; then
 		esac
 	done
 	if [ -n "$INODE" ]; then
-		log "Extracted inode=$INODE from nc listener (pid=$NC_PID)"
-		log "Querying by inode:"
+		log "# Extracted inode=$INODE from nc listener pid=$NC_PID"
+		log "$ get_sockdelays -i $INODE"
 		/usr/local/bin/get_sockdelays -i "$INODE" 2>&1
 	else
 		log "(could not extract inode)"
@@ -489,7 +504,8 @@ if kill -0 "$JSON_PID" 2>/dev/null; then
 	iperf3 -c 127.0.0.1 -p "$JSON_PORT" -t 5 >/dev/null 2>&1 &
 	JSON_CLIENT=$!
 	sleep 2
-	log "JSON output for iperf3 server (pid=$JSON_PID):"
+	log "# iperf3 server pid=$JSON_PID"
+	log "$ get_sockdelays -j -p $JSON_PID"
 	/usr/local/bin/get_sockdelays -j -p "$JSON_PID" 2>&1
 	kill "$JSON_CLIENT" 2>/dev/null || true
 	wait "$JSON_CLIENT" 2>/dev/null || true
@@ -502,7 +518,7 @@ wait "$JSON_PID" 2>/dev/null || true
 # Demo 7: Reset counters
 log ""
 log "--- Demo 7: Reset counters (-R) ---"
-log "Resetting all per-socket statistics:"
+log "$ get_sockdelays -R"
 /usr/local/bin/get_sockdelays -R 2>&1
 
 # Demo 8: Debug diagnostics
@@ -513,12 +529,91 @@ nc -l -p "$DBG_PORT" &
 DBG_PID=$!
 sleep 1
 if kill -0 "$DBG_PID" 2>/dev/null; then
-	log "Debug output for nc listener (pid=$DBG_PID):"
+	log "# nc listener pid=$DBG_PID"
+	log "$ get_sockdelays -d -p $DBG_PID"
 	/usr/local/bin/get_sockdelays -d -p "$DBG_PID" 2>&1
 	kill "$DBG_PID" 2>/dev/null || true
 	wait "$DBG_PID" 2>/dev/null || true
 else
 	log "(nc listener failed to start)"
+fi
+
+# Demo 9: Real-world TCP — connect to baidu.com
+log ""
+log "--- Demo 9: Real-world TCP (nc www.baidu.com 80) ---"
+if [ "$EXTERNAL_NET" = "1" ]; then
+	# Use 'sleep' pipe to keep nc's stdin open so the TCP connection
+	# stays alive long enough for get_sockdelays to query it.
+	(sleep 8) | nc www.baidu.com 80 >/dev/null 2>&1 &
+	BAIDU_PID=$!
+	sleep 2
+	if kill -0 "$BAIDU_PID" 2>/dev/null; then
+		log "# nc connected to www.baidu.com:80, pid=$BAIDU_PID"
+		log "$ get_sockdelays -p $BAIDU_PID"
+		/usr/local/bin/get_sockdelays -p "$BAIDU_PID" 2>&1
+	else
+		log "(nc exited before query — trying wget fallback)"
+		wget -q -O /dev/null http://www.baidu.com 2>/dev/null &
+		WGET_PID=$!
+		sleep 1
+		if kill -0 "$WGET_PID" 2>/dev/null; then
+			log "$ get_sockdelays -p $WGET_PID"
+			/usr/local/bin/get_sockdelays -p "$WGET_PID" 2>&1
+			kill "$WGET_PID" 2>/dev/null || true
+			wait "$WGET_PID" 2>/dev/null || true
+		else
+			log "(wget also exited too quickly)"
+		fi
+	fi
+	kill "$BAIDU_PID" 2>/dev/null || true
+	wait "$BAIDU_PID" 2>/dev/null || true
+else
+	log "(external network unavailable, skipping)"
+fi
+
+# Demo 10: Real-world UDP — connect to bilibili.com (QUIC port)
+log ""
+log "--- Demo 10: Real-world UDP (bilibili.com video streaming) ---"
+if [ "$EXTERNAL_NET" = "1" ]; then
+	# Resolve bilibili.com first so we can use the IP directly with nc -u.
+	# Filter for IPv4 only — QEMU user-mode networking only forwards IPv4.
+	BILI_IP=$(nslookup www.bilibili.com 2>/dev/null | awk '{print $NF}' | grep '^[0-9]' | grep '\.' | grep -v ':' | grep -v '^10\.0\.2\.' | head -1 | sed 's/#.*//')
+	if [ -n "$BILI_IP" ]; then
+		log "# Resolved www.bilibili.com -> $BILI_IP"
+		# Open a UDP socket to bilibili's QUIC port (443/udp).
+		# Bilibili serves video over QUIC (HTTP/3), which uses UDP.
+		(sleep 8) | nc -u -w 10 "$BILI_IP" 443 >/dev/null 2>&1 &
+		BILI_PID=$!
+		sleep 3
+		if kill -0 "$BILI_PID" 2>/dev/null; then
+			log "# nc -u connected to $BILI_IP:443 (bilibili QUIC), pid=$BILI_PID"
+			log "$ get_sockdelays -p $BILI_PID"
+			/usr/local/bin/get_sockdelays -p "$BILI_PID" 2>&1
+		else
+			log "# nc -u to bilibili exited (server may refuse raw UDP)"
+			log "# Falling back to local iperf3 -u (simulating video streaming)"
+			UDP_FB_PORT=21530
+			iperf3 -s -p "$UDP_FB_PORT" >/dev/null 2>&1 &
+			UDP_FB_PID=$!
+			sleep 1
+			iperf3 -c 127.0.0.1 -p "$UDP_FB_PORT" -u -t 5 -b 50M >/dev/null 2>&1 &
+			UDP_FB_CLI=$!
+			sleep 2
+			log "# iperf3 -u (simulated video stream), server pid=$UDP_FB_PID"
+			log "$ get_sockdelays -p $UDP_FB_PID"
+			/usr/local/bin/get_sockdelays -p "$UDP_FB_PID" 2>&1
+			kill "$UDP_FB_CLI" 2>/dev/null || true
+			wait "$UDP_FB_CLI" 2>/dev/null || true
+			kill "$UDP_FB_PID" 2>/dev/null || true
+			wait "$UDP_FB_PID" 2>/dev/null || true
+		fi
+		kill "$BILI_PID" 2>/dev/null || true
+		wait "$BILI_PID" 2>/dev/null || true
+	else
+		log "(DNS resolution for www.bilibili.com returned no IPv4 address)"
+	fi
+else
+	log "(external network unavailable, skipping)"
 fi
 
 log ""
@@ -576,6 +671,8 @@ step_run_qemu() {
 		-append "console=ttyS0,115200n8 rdinit=/init"
 		-nographic
 		-no-reboot
+		-netdev user,id=net0
+		-device e1000,netdev=net0
 	)
 
 	echo "QEMU mode: ${qemu_mode} (timeout=${QEMU_TIMEOUT_KVM}s)"

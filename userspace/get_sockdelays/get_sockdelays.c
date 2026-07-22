@@ -286,7 +286,7 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 		printf("  {");
 		printf("\"proto\":\"%s\",\"pid\":%u,\"inode\":%" PRIu64 ",",
 		       proto_str(proto), pid, inode);
-		printf("\"comm\":\"%s\",", comm ? comm : "");
+		printf("\"owner_task\":\"%s\",", comm ? comm : "");
 		printf("\"local\":\"%s\",\"remote\":\"%s\",",
 		       laddr_str, raddr_str);
 		printf("\"rx\":{\"total_ns\":%" PRIu64 ",\"count\":%" PRIu64 ",\"avg_ns\":%" PRIu64 "},",
@@ -295,7 +295,7 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 		       tx_total, tx_count, tx_count ? tx_total / tx_count : 0);
 		printf("}");
 	} else {
-		printf("proto=%-3s pid=%-7u inode=%-10" PRIu64 " comm=%-16s ",
+		printf("proto=%-3s pid=%-7u inode=%-10" PRIu64 " owner_task=%-12s ",
 		       proto_str(proto), pid, inode, comm ? comm : "");
 		printf("local=%-26s remote=%-26s\n", laddr_str, raddr_str);
 		printf("  RX  count=%-8" PRIu64 " total=%12.3fms  average=%10.3fms\n",

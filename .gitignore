@@ -75,6 +75,7 @@ tests/reports/*.txt
 !tests/reports/qemu/*.txt
 !tests/reports/qemu/*.log
 *.log
+!docs/*.log
 test-results/
 *.tap
 

@@ -1,0 +1,133 @@
+  get_sockdelays Visualization Demo
+========================================
+
+--- Demo 1: Tool help ---
+$ get_sockdelays -h
+Usage: get_sockdelays [options]
+
+Query the in-kernel per-socket network delay accounting
+framework (CONFIG_NET_DELAYACCT) over Generic Netlink.
+
+Exactly one of the following actions is required:
+  -p, --pid <pid>       List stats for every TCP/UDP socket
+                        owned by <pid>.
+  -i, --inode <n>       Show stats for the socket with
+                        inode <n>.
+  -R, --reset           Zero all per-socket statistics.
+
+Output options:
+  -j, --json            Emit machine-readable JSON.
+
+Miscellaneous:
+  -h, --help            Show this help and exit.
+  -V, --version         Print version and exit.
+  -d, --debug           Print diagnostic netlink messages to stderr.
+
+The kernel must have CONFIG_NET_DELAYACCT=y and the
+net-delayacct module loaded.  Root may be required to
+query other users' sockets.
+
+--- Demo 2: Tool version ---
+$ get_sockdelays -V
+get_sockdelays 1.0
+
+--- Demo 3: TCP socket query (local iperf3) ---
+# iperf3 server pid=311, client pid=313
+$ get_sockdelays -p 311
+proto=tcp pid=311     inode=1297       owner_task=iperf3       local=[::]:5204                  remote=[::]:0                    
+  RX  count=0        total=       0.000ms  average=     0.000ms
+  TX  count=0        total=       0.000ms  average=     0.000ms
+proto=tcp pid=311     inode=1300       owner_task=iperf3       local=[::ffff:127.0.0.1]:5204    remote=[::ffff:127.0.0.1]:54280  
+  RX  count=3        total=       4.210ms  average=     1.403ms
+  TX  count=1        total=   68393.529ms  average= 68393.529ms
+proto=tcp pid=311     inode=1301       owner_task=iperf3       local=[::ffff:127.0.0.1]:5204    remote=[::ffff:127.0.0.1]:54294  
+  RX  count=4091     total=    7982.050ms  average=     1.951ms
+  TX  count=0        total=       0.000ms  average=     0.000ms
+
+$ get_sockdelays -p 313
+proto=tcp pid=313     inode=578        owner_task=iperf3       local=127.0.0.1:2260             remote=127.0.0.1:21524           
+  RX  count=3        total=       2.219ms  average=     0.740ms
+  TX  count=2        total=   68389.685ms  average= 34194.843ms
+proto=tcp pid=313     inode=579        owner_task=iperf3       local=127.0.0.1:5844             remote=127.0.0.1:21524           
+  RX  count=0        total=       0.000ms  average=     0.000ms
+  TX  count=570      total=  333811.061ms  average=   585.633ms
+
+--- Demo 4: UDP socket query (local iperf3 -u) ---
+# iperf3 UDP server pid=317, client pid=319
+$ get_sockdelays -p 317
+proto=tcp pid=317     inode=581        owner_task=iperf3       local=[::]:5460                  remote=[::]:0                    
+  RX  count=0        total=       0.000ms  average=     0.000ms
+  TX  count=0        total=       0.000ms  average=     0.000ms
+proto=tcp pid=317     inode=584        owner_task=iperf3       local=[::ffff:127.0.0.1]:5460    remote=[::ffff:127.0.0.1]:35630  
+  RX  count=3        total=       6.809ms  average=     2.270ms
+  TX  count=1        total=   71925.369ms  average= 71925.369ms
+proto=udp pid=317     inode=585        owner_task=iperf3       local=[::ffff:127.0.0.1]:5460    remote=[::ffff:127.0.0.1]:48008  
+  RX  count=0        total=       0.000ms  average=     0.000ms
+  TX  count=1        total=       0.048ms  average=     0.048ms
+
+$ get_sockdelays -p 319
+proto=tcp pid=319     inode=1305       owner_task=iperf3       local=127.0.0.1:11915            remote=127.0.0.1:21525           
+  RX  count=3        total=       8.051ms  average=     2.684ms
+  TX  count=3        total=   73146.496ms  average= 24382.165ms
+proto=udp pid=319     inode=1306       owner_task=iperf3       local=127.0.0.1:35003            remote=127.0.0.1:21525           
+  RX  count=1        total=       1.355ms  average=     1.355ms
+  TX  count=823      total=      48.485ms  average=     0.059ms
+
+--- Demo 5: Inode query (-i <inode>) ---
+# Extracted inode=591 from nc listener pid=323
+$ get_sockdelays -i 591
+proto=tcp pid=323     inode=591        owner_task=nc           local=[::]:5716                  remote=[::]:0                    
+  RX  count=0        total=       0.000ms  average=     0.000ms
+  TX  count=0        total=       0.000ms  average=     0.000ms
+
+--- Demo 6: JSON output (-j) ---
+# iperf3 server pid=337
+$ get_sockdelays -j -p 337
+  {"proto":"tcp","pid":337,"inode":604,"owner_task":"iperf3","local":"[::]:5972","remote":"[::]:0","rx":{"total_ns":0,"count":0,"avg_ns":0},"tx":{"total_ns":0,"count":0,"avg_ns":0}},
+  {"proto":"tcp","pid":337,"inode":607,"owner_task":"iperf3","local":"[::ffff:127.0.0.1]:5972","remote":"[::ffff:127.0.0.1]:41618","rx":{"total_ns":5392680,"count":3,"avg_ns":1797560},"tx":{"total_ns":76762116404,"count":1,"avg_ns":76762116404}},
+  {"proto":"tcp","pid":337,"inode":608,"owner_task":"iperf3","local":"[::ffff:127.0.0.1]:5972","remote":"[::ffff:127.0.0.1]:41620","rx":{"total_ns":4102946340,"count":3892,"avg_ns":1054199},"tx":{"total_ns":0,"count":0,"avg_ns":0}}
+]
+
+--- Demo 7: Reset counters (-R) ---
+$ get_sockdelays -R
+all per-socket statistics reset
+
+--- Demo 8: Debug diagnostics (-d) ---
+# nc listener pid=343
+$ get_sockdelays -d -p 343
+get_sockdelays: [diag] do_query: family_id=28 cmd=1 attr_type=7 key=343
+get_sockdelays: [diag] send_and_recv: seq=1784730026 portid=345 type=28
+get_sockdelays: [diag] recvfrom 168 bytes type=28 len=168 flags=2 seq=1784730026 pid=345 (expect seq=1784730026 portid=345)
+get_sockdelays: [diag] received msg type=28 (seq=1784730026 pid=345 len=168)
+proto=tcp pid=343     inode=1320       owner_task=nc           local=[::]:6228                  remote=[::]:0                    
+  RX  count=0        total=       0.000ms  average=     0.000ms
+  TX  count=0        total=       0.000ms  average=     0.000ms
+get_sockdelays: [diag] mnl_cb_run returned 1
+get_sockdelays: [diag] recvfrom 16 bytes type=3 len=16 flags=2 seq=1784730026 pid=345 (expect seq=1784730026 portid=345)
+get_sockdelays: [diag] mnl_cb_run returned 0
+
+--- Demo 9: Real-world TCP (nc www.baidu.com 80) ---
+# nc connected to www.baidu.com:80, pid=347
+$ get_sockdelays -p 347
+proto=udp pid=347     inode=1327       owner_task=nc           local=10.0.2.15:50866            remote=10.0.2.3:53               
+  RX  count=1        total=       3.648ms  average=     3.648ms
+  TX  count=2        total=       7.803ms  average=     3.901ms
+
+--- Demo 10: Real-world UDP (bilibili.com video streaming) ---
+# Resolved www.bilibili.com -> 116.163.15.199
+# nc -u to bilibili exited (server may refuse raw UDP)
+# Falling back to local iperf3 -u (simulating video streaming)
+# iperf3 -u (simulated video stream), server pid=362
+$ get_sockdelays -p 362
+proto=tcp pid=362     inode=633        owner_task=iperf3       local=[::]:6740                  remote=[::]:0                    
+  RX  count=0        total=       0.000ms  average=     0.000ms
+  TX  count=0        total=       0.000ms  average=     0.000ms
+proto=tcp pid=362     inode=636        owner_task=iperf3       local=[::ffff:127.0.0.1]:6740    remote=[::ffff:127.0.0.1]:55974  
+  RX  count=3        total=       6.137ms  average=     2.046ms
+  TX  count=1        total=   92831.602ms  average= 92831.602ms
+proto=udp pid=362     inode=637        owner_task=iperf3       local=[::ffff:127.0.0.1]:6740    remote=[::ffff:127.0.0.1]:58653  
+  RX  count=0        total=       0.000ms  average=     0.000ms
+  TX  count=1        total=       0.096ms  average=     0.096ms
+
+========================================
+  Demo complete
