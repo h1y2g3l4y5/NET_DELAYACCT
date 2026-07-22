@@ -99,7 +99,15 @@ RESULT_FILE="/root/test-output.txt"
 			# Run the selftest suite
 			if [ -f "$TEST_ROOT/test_netdelayacct.sh" ]; then
 				echo "--- Running test_netdelayacct.sh ---"
-				timeout 30 bash "$TEST_ROOT/test_netdelayacct.sh" 2>&1 || echo "  (test timed out or failed)"
+				set +e
+				timeout 30 bash "$TEST_ROOT/test_netdelayacct.sh" 2>&1
+				rc=$?
+				set -e
+				if [ "$rc" -eq 4 ]; then
+					echo "  (SKIP: dependencies not met)"
+				elif [ "$rc" -ne 0 ]; then
+					echo "  (test failed or timed out, rc=$rc)"
+				fi
 				echo ""
 			fi
 
@@ -108,7 +116,15 @@ RESULT_FILE="/root/test-output.txt"
 				for t in "$TEST_ROOT/func/test_"*.sh; do
 					if [ -f "$t" ]; then
 						echo "--- Running $(basename "$t") ---"
-						timeout 30 bash "$t" 2>&1 || echo "  (test timed out or failed)"
+						set +e
+						timeout 30 bash "$t" 2>&1
+						rc=$?
+						set -e
+						if [ "$rc" -eq 4 ]; then
+							echo "  (SKIP: dependencies not met)"
+						elif [ "$rc" -ne 0 ]; then
+							echo "  (test failed or timed out, rc=$rc)"
+						fi
 						echo ""
 					fi
 				done

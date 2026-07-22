@@ -71,17 +71,20 @@ test_02_nc_listener_pid() {
 	nc_pid=$!
 	sleep 1
 
-	# 发起连接以产生流量
-	echo "netdelayacct-test" | nc 127.0.0.1 "$port" &
-	sleep 1
-
-	# 查询监听进程的 socket
+	# Query the listener BEFORE connecting a client.
+	# OpenBSD nc exits after the first connection closes, so querying
+	# after the client connects would find no open sockets (the process
+	# may even be a zombie with all fds closed).
 	out=$("$GET_SOCKDELAYS" -p "$nc_pid" 2>&1 || true)
 	if echo "$out" | grep -q '^proto='; then
 		test_pass "nc listener (pid $nc_pid) found in output"
 	else
 		test_fail "nc listener (pid $nc_pid) no socket data (output: $out)"
 	fi
+
+	# Generate traffic (optional, for completeness)
+	echo "netdelayacct-test" | nc 127.0.0.1 "$port" &
+	sleep 1
 
 	kill "$nc_pid" 2>/dev/null || true
 	wait "$nc_pid" 2>/dev/null || true
@@ -154,11 +157,11 @@ test_04_reset() {
 	local nc_pid
 	local out
 
-	# 先产生一些流量
+	# Start nc listener — query it without connecting a client so the
+	# listening socket stays open.  OpenBSD nc exits after the first
+	# connection closes, which would leave no sockets to query.
 	nc -l -p "$port" &
 	nc_pid=$!
-	sleep 1
-	echo "reset-test" | nc 127.0.0.1 "$port" &
 	sleep 1
 
 	# 执行重置
@@ -292,14 +295,10 @@ test_07_multi_socket() {
 	iperf_server_pid=$!
 	sleep 1
 
-	# Simultaneously connect nc and iperf3 client.
-	# Use -t 5 so the iperf3 socket is still open when we query.
-	echo "multi-socket-test" | nc 127.0.0.1 "$nc_port" &
-	iperf3 -c 127.0.0.1 -p "$iperf_port" -t 5 >/dev/null 2>&1 &
-	iperf_client_pid=$!
-	sleep 2
-
-	# Query nc process — should have at least one data line (the listen socket).
+	# Query nc BEFORE connecting a client — OpenBSD nc exits after the
+	# first connection closes, so querying after would find no sockets.
+	# The iperf3 server is also running at this point, so both processes
+	# have open sockets simultaneously.
 	out=$("$GET_SOCKDELAYS" -p "$nc_pid" 2>&1 || true)
 	line_count=$(echo "$out" | grep -c -E '^proto=' || true)
 
@@ -309,6 +308,11 @@ test_07_multi_socket() {
 		test_fail "nc multi-socket query returned no data (out: $out)"
 	fi
 
+	# Start iperf3 client (iperf3 server is still running, -t 5 keeps it open).
+	iperf3 -c 127.0.0.1 -p "$iperf_port" -t 5 >/dev/null 2>&1 &
+	iperf_client_pid=$!
+	sleep 2
+
 	# Query iperf3 server — should have at least one data line.
 	out=$("$GET_SOCKDELAYS" -p "$iperf_server_pid" 2>&1 || true)
 	line_count=$(echo "$out" | grep -c -E '^proto=' || true)
@@ -317,6 +321,9 @@ test_07_multi_socket() {
 	else
 		test_fail "iperf3 multi-socket query returned no data (out: $out)"
 	fi
+
+	# Generate nc traffic (optional, for completeness)
+	echo "multi-socket-test" | nc 127.0.0.1 "$nc_port" &
 
 	# Clean up all background processes.
 	kill "$nc_pid" 2>/dev/null || true
@@ -331,3 +338,4 @@ test_07_multi_socket
 # ---------------------------------------------------------------------------
 echo ""
 print_summary
+exit $?

@@ -15,11 +15,14 @@ test_pass() {
 	echo "[PASS] $1"
 }
 
-# 输出 FAIL 信息并递增失败计数，随后以非零状态退出
+# 输出 FAIL 信息并递增失败计数
+# Note: we intentionally do NOT call exit 1 here.  Exiting on the first
+# failure prevents subsequent tests from running, hiding potential issues.
+# The script's final exit code is determined by print_summary() which returns
+# non-zero when TEST_FAIL_COUNT > 0.
 test_fail() {
 	TEST_FAIL_COUNT=$((TEST_FAIL_COUNT + 1))
 	echo "[FAIL] $1"
-	exit 1
 }
 
 # 创建网络命名空间用于隔离测试
