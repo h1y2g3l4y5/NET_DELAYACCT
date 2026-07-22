@@ -626,6 +626,56 @@ func tests: ALL PASS
 
 ---
 
+## 18. 第十七阶段：可视化演示增强 + 严格压力测试 + 中文注释
+
+### 18.1 问题描述
+
+第十四阶段 CI 全绿后，功能链路已完全打通。但之前的 Demo 测试覆盖较弱：
+- 最多只测 3 个 socket/进程
+- RX/TX count 只有几十~几百级别
+- 缺少"一个进程持有多个 socket 且每个都有高流量"的压力测试场景
+- `docs/get_sockdelays_demo.log` 只有原始输出，无中文注释
+
+### 18.2 修复内容
+
+**1. `local-test.sh` Demo 11-13 压力测试重写**
+
+利用 `iperf3 -P N` 并行流特性，让一个进程同时持有多个有流量的 socket：
+
+| Demo | 旧版 | 新版 | 改进 |
+|------|------|------|------|
+| 11 高并发 | 10 个 nc 进程各 1 socket | iperf3 -P 6，1 进程 8 socket | socket/进程提升 8× |
+| 12 大流量 | -t 2 -b 200M 限速 | -P 3 -t 5 不限速 | count 从几十提升到数百 |
+| 13 混合协议 | TCP 单连接 + UDP 单连接 | TCP -P 5 (7 socket) + UDP | 多连接 + 协议隔离验证 |
+
+每次查询后自动统计 socket 数量和最大 count 值进行验证。
+
+**2. `-smp 1` 适配 TCG 模式**
+
+QEMU `-smp 2` 改为 `-smp 1`，避免 sandbox 环境下 TCG 多线程被挂起。
+
+**3. `docs/get_sockdelays_demo.log` 可视化文件**
+
+从 QEMU TCG 实际运行日志提取 14 个 Demo 输出，每个 Demo 添加中文注释：
+- 场景说明、执行命令、行尾注释、数据分析、结论验证
+
+### 18.3 验证结果
+
+关键压力测试数据：
+- Demo 11：单进程 8 socket，data 连接 RX count 382~399/连接
+- Demo 13 TCP：单进程 7 socket，全部 proto=tcp 无 UDP 混入
+- Demo 3：服务端 RX count 2075
+- 所有 14 个 Demo 成功执行，无崩溃、无遗漏、无溢出
+
+### 18.4 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| local-test.sh | 重写 Demo 11-13 压力测试；-smp 1 |
+| docs/get_sockdelays_demo.log | 新建：14 Demo 可视化输出 + 中文注释 |
+
+---
+
 ## 17. 一句话总结
 
 这一轮开发的主线是：

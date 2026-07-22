@@ -1606,3 +1606,73 @@ func tests: ALL PASS
 | tests/selftests/net-delayacct/test_helper.sh | `test_fail()` 移除 `exit 1` |
 | tests/selftests/net-delayacct/test_netdelayacct.sh | Test 2/4/7 时序修复 + `exit $?` |
 | ci/qemu/guest-init.sh | selftest 和 func 测试正确处理 SKIP (exit code 4) |
+
+---
+## 第十五轮 — 可视化演示增强 + 严格压力测试 + 中文注释 (2026-07-23)
+
+### 背景
+
+第十四轮 CI 已全绿，工具功能链路全部打通。但之前工具可视化演示存在以下局限：
+
+1. **测试覆盖不足**：每次 Demo 最多只测 3 个 socket/进程，RX/TX count 仅几十~几百级别
+2. **压力测试欠缺**：没有"一个进程持有多个 socket 且每个都有高流量"的场景
+3. **可视化文件缺少注释**：`docs/get_sockdelays_demo.log` 只有原始输出，没有中文注释说明
+
+### 需求
+
+用户提出三个改进方向：
+- 设计更严格条件下的测试（高并发多连接、大流量高计数）
+- 在可视化文件中标记中文注释
+- 同时完成 `comm` → `owner_task` 字段重命名（已在之前提交完成）
+
+### 改动内容
+
+#### 1. `local-test.sh` 压力测试 Demo 重写
+
+将第三部分（Demo 11-13）从简单场景改为真正的压力测试：
+- **Demo 11**：从"10 个 nc 进程各 1 个 socket"改为"iperf3 -P 6 单进程 8 socket"
+- **Demo 12**：从"-t 2 -b 200M 限速短时"改为"iperf3 -P 3 不限速 × 5 秒"
+- **Demo 13**：从"TCP 单连接 + UDP 单连接"改为"TCP -P 5 (7 socket) + UDP 同时运行"
+
+关键技术点：
+- `iperf3 -P N` 创建 N 条并行 TCP 连接，服务端某进程同时持有 1+N 个 socket
+- 每个 socket 都有独立的数据流，RX count 可达 270~400+
+- 验证不崩溃、不遗漏 socket、64 位计数不溢出、协议行正确隔离
+- 每次查询后统计 socket 数量和最大 count 值进行验证
+
+#### 2. `-smp 1` 适配 TCG 模式
+
+`local-test.sh` 中 QEMU 参数 `-smp 2` 改为 `-smp 1`，避免 TCG 多线程被 sandbox 挂起。
+
+#### 3. `docs/get_sockdelays_demo.log` 可视化文件重建
+
+从 QEMU TCG 实际运行日志中提取 14 个 Demo 的完整输出，每个 Demo 添加：
+- `# 场景：` 中文说明测试目的和背景
+- `# 执行命令：` 显示实际执行的 get_sockdelays 命令
+- `←` 行尾注释标注每个 socket 的含义
+- `# 分析：` 对输出数据的详细解读
+- `# 结论：` 验证结果（✓/✗）
+
+文件结构：
+```
+第一部分：基础功能 (Demo 1-8)  — 帮助、版本、TCP/UDP/Inode/JSON/Reset/Debug
+第二部分：真实网络场景 (Demo 9-10) — TCP 连接百度、UDP 连接 B站
+第三部分：严格压力测试 (Demo 11-14) — 高并发、大流量、混合协议、边界条件
+```
+
+### 验证结果
+
+关键测试数据：
+| Demo | 场景 | 结果 |
+|------|------|------|
+| Demo 11 | 单进程 8 socket 高并发 | 1 listen + 1 ctrl + 6 data，RX count 382~399/连接 ✅ |
+| Demo 13 TCP | 单进程 7 socket 混合协议 | 1 listen + 1 ctrl + 5 data，全部 proto=tcp 无 UDP 混入 ✅ |
+| Demo 3 | 基础 TCP 查询 | 服务端 RX count 2075，客户端 TX count 557 ✅ |
+| Demo 14 | 边界条件 | PID 1 / 不存在 PID → `(no matching sockets)` 正确处理 ✅ |
+
+### 修改文件清单
+
+| 文件 | 改动 |
+|------|------|
+| local-test.sh | 重写 Demo 11-13 压力测试逻辑；-smp 1 适配 TCG |
+| docs/get_sockdelays_demo.log | 新建：14 个 Demo 完整可视化输出 + 中文注释 |
