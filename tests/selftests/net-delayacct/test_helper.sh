@@ -88,7 +88,11 @@ require_kernel_config() {
 # 优先使用环境变量 GET_SOCKDELAYS，否则在常见路径中搜索
 # 用法: find_get_sockdelays
 find_get_sockdelays() {
-	if [ -n "$GET_SOCKDELAYS" ] && [ -x "$GET_SOCKDELAYS" ]; then
+	# Use ${VAR:-} to be safe under 'set -u' — the variable may be unset
+	# when GET_SOCKDELAYS is not exported in the environment (e.g. local
+	# QEMU tests).  Without this, the -n test below triggers
+	# "unbound variable" and aborts before we can search for the binary.
+	if [ -n "${GET_SOCKDELAYS:-}" ] && [ -x "${GET_SOCKDELAYS:-}" ]; then
 		return 0
 	fi
 

@@ -66,8 +66,8 @@ test_02_nc_listener_pid() {
 	local nc_pid
 	local out
 
-	# 启动 nc 监听
-	nc -l "$port" &
+	# 启动 nc 监听 (use -p for OpenBSD nc compatibility)
+	nc -l -p "$port" &
 	nc_pid=$!
 	sleep 1
 
@@ -100,7 +100,7 @@ test_03_inode_query() {
 	local out
 	local line_count
 
-	nc -l "$port" &
+	nc -l -p "$port" &
 	nc_pid=$!
 	sleep 1
 
@@ -155,7 +155,7 @@ test_04_reset() {
 	local out
 
 	# 先产生一些流量
-	nc -l "$port" &
+	nc -l -p "$port" &
 	nc_pid=$!
 	sleep 1
 	echo "reset-test" | nc 127.0.0.1 "$port" &
@@ -198,20 +198,21 @@ test_05_tcp_path() {
 	local client_pid
 	local out
 
-	iperf3 -s -D -p "$port" 2>/dev/null || true
+	# Start server in background (not -D) so we capture its PID directly.
+	# This avoids dependency on pgrep which may not be available (e.g. busybox).
+	iperf3 -s -p "$port" >/dev/null 2>&1 &
+	server_pid=$!
 	sleep 1
-	server_pid=$(pgrep -f "iperf3 -s -D -p $port" | head -1)
 
-	iperf3 -c 127.0.0.1 -p "$port" -t 3 >/dev/null 2>&1 &
+	# Run client for 5s; query after 2s so the TCP socket is still open.
+	iperf3 -c 127.0.0.1 -p "$port" -t 5 >/dev/null 2>&1 &
 	client_pid=$!
-	sleep 4
+	sleep 2
 
-	out=$("$GET_SOCKDELAYS" -p "$client_pid" 2>&1 || true)
-	if [ -z "$out" ]; then
-		# 客户端可能已退出，尝试查询服务端
-		if [ -n "$server_pid" ]; then
-			out=$("$GET_SOCKDELAYS" -p "$server_pid" 2>&1 || true)
-		fi
+	# Query server first (always running), fall back to client.
+	out=$("$GET_SOCKDELAYS" -p "$server_pid" 2>&1 || true)
+	if [ -z "$out" ] || ! echo "$out" | grep -qi "proto=tcp"; then
+		out=$("$GET_SOCKDELAYS" -p "$client_pid" 2>&1 || true)
 	fi
 
 	if [ -n "$out" ] && echo "$out" | grep -qi "proto=tcp"; then
@@ -220,8 +221,11 @@ test_05_tcp_path() {
 		test_fail "TCP socket not found in output (out: $out)"
 	fi
 
-	# 清理 iperf3 服务端
-	pkill -f "iperf3 -s" 2>/dev/null || true
+	# Clean up client and server.
+	kill "$client_pid" 2>/dev/null || true
+	wait "$client_pid" 2>/dev/null || true
+	kill "$server_pid" 2>/dev/null || true
+	wait "$server_pid" 2>/dev/null || true
 }
 test_05_tcp_path
 
@@ -235,19 +239,23 @@ test_06_udp_path() {
 	local client_pid
 	local out
 
-	iperf3 -s -D -p "$port" 2>/dev/null || true
+	# Start server in background (not -D) so we capture its PID directly.
+	iperf3 -s -p "$port" >/dev/null 2>&1 &
+	server_pid=$!
 	sleep 1
-	server_pid=$(pgrep -f "iperf3 -s -D -p $port" | head -1)
 
-	iperf3 -c 127.0.0.1 -p "$port" -u -t 3 -b 100M >/dev/null 2>&1 &
+	# Use -t 10 so the UDP socket stays open while we query.
+	# Previously -t 3 with sleep 4 meant the client had already exited
+	# and the UDP socket was closed by query time.
+	iperf3 -c 127.0.0.1 -p "$port" -u -t 10 -b 100M >/dev/null 2>&1 &
 	client_pid=$!
-	sleep 4
+	# Query while the client is still running (UDP socket is open)
+	sleep 2
 
+	# Query client first (UDP socket is on the client side), fall back to server.
 	out=$("$GET_SOCKDELAYS" -p "$client_pid" 2>&1 || true)
-	if [ -z "$out" ]; then
-		if [ -n "$server_pid" ]; then
-			out=$("$GET_SOCKDELAYS" -p "$server_pid" 2>&1 || true)
-		fi
+	if [ -z "$out" ] || ! echo "$out" | grep -qi "proto=udp"; then
+		out=$("$GET_SOCKDELAYS" -p "$server_pid" 2>&1 || true)
 	fi
 
 	if [ -n "$out" ] && echo "$out" | grep -qi "proto=udp"; then
@@ -256,7 +264,11 @@ test_06_udp_path() {
 		test_fail "UDP socket not found in output (out: $out)"
 	fi
 
-	pkill -f "iperf3 -s" 2>/dev/null || true
+	# Clean up client and server.
+	kill "$client_pid" 2>/dev/null || true
+	wait "$client_pid" 2>/dev/null || true
+	kill "$server_pid" 2>/dev/null || true
+	wait "$server_pid" 2>/dev/null || true
 }
 test_06_udp_path
 
@@ -273,20 +285,21 @@ test_07_multi_socket() {
 	local out
 	local line_count
 
-	# 同时启动 nc 监听和 iperf3 服务端
-	nc -l "$nc_port" &
+	# Start nc listener and iperf3 server simultaneously (both in background).
+	nc -l -p "$nc_port" &
 	nc_pid=$!
-	iperf3 -s -D -p "$iperf_port" 2>/dev/null || true
+	iperf3 -s -p "$iperf_port" >/dev/null 2>&1 &
+	iperf_server_pid=$!
 	sleep 1
-	iperf_server_pid=$(pgrep -f "iperf3 -s -D -p $iperf_port" | head -1)
 
-	# 同时发起 nc 连接和 iperf3 客户端
+	# Simultaneously connect nc and iperf3 client.
+	# Use -t 5 so the iperf3 socket is still open when we query.
 	echo "multi-socket-test" | nc 127.0.0.1 "$nc_port" &
-	iperf3 -c 127.0.0.1 -p "$iperf_port" -t 3 >/dev/null 2>&1 &
+	iperf3 -c 127.0.0.1 -p "$iperf_port" -t 5 >/dev/null 2>&1 &
 	iperf_client_pid=$!
-	sleep 4
+	sleep 2
 
-	# 查询 nc 进程，应至少有一行数据（nc 的监听 socket）
+	# Query nc process — should have at least one data line (the listen socket).
 	out=$("$GET_SOCKDELAYS" -p "$nc_pid" 2>&1 || true)
 	line_count=$(echo "$out" | grep -c -E '^proto=' || true)
 
@@ -296,8 +309,8 @@ test_07_multi_socket() {
 		test_fail "nc multi-socket query returned no data (out: $out)"
 	fi
 
-	# 查询 iperf3 客户端，应至少有一行数据
-	out=$("$GET_SOCKDELAYS" -p "$iperf_client_pid" 2>&1 || true)
+	# Query iperf3 server — should have at least one data line.
+	out=$("$GET_SOCKDELAYS" -p "$iperf_server_pid" 2>&1 || true)
 	line_count=$(echo "$out" | grep -c -E '^proto=' || true)
 	if [ "$line_count" -ge 1 ]; then
 		test_pass "iperf3 multi-socket query returned $line_count line(s)"
@@ -305,9 +318,11 @@ test_07_multi_socket() {
 		test_fail "iperf3 multi-socket query returned no data (out: $out)"
 	fi
 
-	# 清理
+	# Clean up all background processes.
 	kill "$nc_pid" 2>/dev/null || true
-	pkill -f "iperf3 -s" 2>/dev/null || true
+	kill "$iperf_client_pid" 2>/dev/null || true
+	kill "$iperf_server_pid" 2>/dev/null || true
+	wait 2>/dev/null || true
 }
 test_07_multi_socket
 

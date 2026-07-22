@@ -275,9 +275,15 @@ step_create_initramfs() {
 		done
 	fi
 
-	# Copy test scripts
+	# Copy test scripts (func + selftests)
 	if [ -d "$PROJECT_DIR/tests/func" ]; then
 		cp "$PROJECT_DIR/tests/func/test_"*.sh "$INITRD_DIR/opt/test/" 2>/dev/null || true
+	fi
+	# Copy selftest suite (test_netdelayacct.sh + helper)
+	if [ -d "$PROJECT_DIR/tests/selftests/net-delayacct" ]; then
+		cp "$PROJECT_DIR/tests/selftests/net-delayacct/test_netdelayacct.sh" \
+		   "$PROJECT_DIR/tests/selftests/net-delayacct/test_helper.sh" \
+		   "$INITRD_DIR/opt/test/" 2>/dev/null || true
 	fi
 	chmod +x "$INITRD_DIR/opt/test/"*.sh 2>/dev/null || true
 
@@ -288,6 +294,9 @@ step_create_initramfs() {
 log() { echo "$*"; echo "$*" >> /root/test-output.txt; }
 
 export PATH=/usr/local/bin:/usr/bin:/bin:/sbin
+# Export tool path so the selftest (which runs under 'set -u') can find it
+# without crashing on the unbound GET_SOCKDELAYS variable.
+export GET_SOCKDELAYS=/usr/local/bin/get_sockdelays
 
 # Mount essentials
 /bin/mount -t proc none /proc
@@ -326,7 +335,7 @@ log "--- get_sockdelays -i (inode query) ---"
 INODE=""
 NC_PORT=19999
 if command -v nc >/dev/null 2>&1; then
-	nc -l "$NC_PORT" &
+	nc -l -p "$NC_PORT" &
 	NC_PID=$!
 	/bin/sleep 1
 	if kill -0 "$NC_PID" 2>/dev/null; then
@@ -369,6 +378,153 @@ for t in /opt/test/test_*.sh; do
 		log "[FAIL] $tname (timeout or failed, rc=$rc)"
 	fi
 done
+
+# ============================================================================
+# Visualization Demo — demonstrate get_sockdelays features for manual review
+# ============================================================================
+log ""
+log "========================================"
+log "  get_sockdelays Visualization Demo"
+log "========================================"
+
+# Demo 1: Help and version
+log ""
+log "--- Demo 1: Tool help ---"
+/usr/local/bin/get_sockdelays -h 2>&1
+
+log ""
+log "--- Demo 2: Tool version ---"
+/usr/local/bin/get_sockdelays -V 2>&1
+
+# Demo 3: TCP socket query
+log ""
+log "--- Demo 3: TCP socket query (-p <pid>) ---"
+TCP_PORT=21524
+# Start server in background (not -D) to capture PID directly — avoids
+# dependency on pgrep which may not be available in the guest (busybox).
+iperf3 -s -p "$TCP_PORT" >/dev/null 2>&1 &
+TCP_PID=$!
+sleep 1
+if kill -0 "$TCP_PID" 2>/dev/null; then
+	iperf3 -c 127.0.0.1 -p "$TCP_PORT" -t 5 >/dev/null 2>&1 &
+	CLIENT_PID=$!
+	sleep 2
+	log "Querying iperf3 server (pid=$TCP_PID):"
+	/usr/local/bin/get_sockdelays -p "$TCP_PID" 2>&1
+	log ""
+	log "Querying iperf3 client (pid=$CLIENT_PID):"
+	/usr/local/bin/get_sockdelays -p "$CLIENT_PID" 2>&1
+	kill "$CLIENT_PID" 2>/dev/null || true
+	wait "$CLIENT_PID" 2>/dev/null || true
+else
+	log "(iperf3 server failed to start)"
+fi
+kill "$TCP_PID" 2>/dev/null || true
+wait "$TCP_PID" 2>/dev/null || true
+
+# Demo 4: UDP socket query
+log ""
+log "--- Demo 4: UDP socket query (-p <pid>) ---"
+UDP_PORT=21525
+iperf3 -s -p "$UDP_PORT" >/dev/null 2>&1 &
+UDP_PID=$!
+sleep 1
+if kill -0 "$UDP_PID" 2>/dev/null; then
+	iperf3 -c 127.0.0.1 -p "$UDP_PORT" -u -t 10 -b 100M >/dev/null 2>&1 &
+	UDP_CLIENT=$!
+	sleep 2
+	log "Querying iperf3 UDP server (pid=$UDP_PID):"
+	/usr/local/bin/get_sockdelays -p "$UDP_PID" 2>&1
+	log ""
+	log "Querying iperf3 UDP client (pid=$UDP_CLIENT):"
+	/usr/local/bin/get_sockdelays -p "$UDP_CLIENT" 2>&1
+	kill "$UDP_CLIENT" 2>/dev/null || true
+	wait "$UDP_CLIENT" 2>/dev/null || true
+else
+	log "(iperf3 UDP server failed to start)"
+fi
+kill "$UDP_PID" 2>/dev/null || true
+wait "$UDP_PID" 2>/dev/null || true
+
+# Demo 5: Inode query
+log ""
+log "--- Demo 5: Inode query (-i <inode>) ---"
+NC_PORT=21526
+# Use 'nc -l -p' (OpenBSD nc syntax) so the port is parsed correctly.
+nc -l -p "$NC_PORT" &
+NC_PID=$!
+sleep 1
+if kill -0 "$NC_PID" 2>/dev/null; then
+	INODE=""
+	for fd_path in /proc/"$NC_PID"/fd/*; do
+		target=$(readlink "$fd_path" 2>/dev/null || true)
+		case "$target" in
+			socket:\[*\])
+				INODE=$(echo "$target" | sed 's/.*socket:\[\([0-9]*\)\].*/\1/')
+				break
+				;;
+		esac
+	done
+	if [ -n "$INODE" ]; then
+		log "Extracted inode=$INODE from nc listener (pid=$NC_PID)"
+		log "Querying by inode:"
+		/usr/local/bin/get_sockdelays -i "$INODE" 2>&1
+	else
+		log "(could not extract inode)"
+	fi
+	kill "$NC_PID" 2>/dev/null || true
+	wait "$NC_PID" 2>/dev/null || true
+else
+	log "(nc listener failed to start)"
+fi
+
+# Demo 6: JSON output
+log ""
+log "--- Demo 6: JSON output (-j) ---"
+JSON_PORT=21527
+iperf3 -s -p "$JSON_PORT" >/dev/null 2>&1 &
+JSON_PID=$!
+sleep 1
+if kill -0 "$JSON_PID" 2>/dev/null; then
+	iperf3 -c 127.0.0.1 -p "$JSON_PORT" -t 5 >/dev/null 2>&1 &
+	JSON_CLIENT=$!
+	sleep 2
+	log "JSON output for iperf3 server (pid=$JSON_PID):"
+	/usr/local/bin/get_sockdelays -j -p "$JSON_PID" 2>&1
+	kill "$JSON_CLIENT" 2>/dev/null || true
+	wait "$JSON_CLIENT" 2>/dev/null || true
+else
+	log "(iperf3 server failed to start)"
+fi
+kill "$JSON_PID" 2>/dev/null || true
+wait "$JSON_PID" 2>/dev/null || true
+
+# Demo 7: Reset counters
+log ""
+log "--- Demo 7: Reset counters (-R) ---"
+log "Resetting all per-socket statistics:"
+/usr/local/bin/get_sockdelays -R 2>&1
+
+# Demo 8: Debug diagnostics
+log ""
+log "--- Demo 8: Debug diagnostics (-d) ---"
+DBG_PORT=21528
+nc -l -p "$DBG_PORT" &
+DBG_PID=$!
+sleep 1
+if kill -0 "$DBG_PID" 2>/dev/null; then
+	log "Debug output for nc listener (pid=$DBG_PID):"
+	/usr/local/bin/get_sockdelays -d -p "$DBG_PID" 2>&1
+	kill "$DBG_PID" 2>/dev/null || true
+	wait "$DBG_PID" 2>/dev/null || true
+else
+	log "(nc listener failed to start)"
+fi
+
+log ""
+log "========================================"
+log "  Demo complete"
+log "========================================"
 
 # Post-test dmesg
 log ""

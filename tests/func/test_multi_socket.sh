@@ -55,7 +55,7 @@ fi
 
 # 启动 3 个 nc 监听器作为对端
 for port in 13001 13002 13003; do
-	nc -l "$port" &
+	nc -l -p "$port" &
 	LISTENER_PIDS="$LISTENER_PIDS $!"
 done
 sleep 1

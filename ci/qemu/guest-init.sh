@@ -58,7 +58,7 @@ echo "Genl family listing (/proc/net/generic):"
 cat /proc/net/generic 2>/dev/null || echo "  (not available)"
 
 echo "Diagnostic: nc listener query test..."
-nc -l 19999 &
+nc -l -p 19999 &
 NC_DIAG_PID=$!
 sleep 1
 if kill -0 "$NC_DIAG_PID" 2>/dev/null; then

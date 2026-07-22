@@ -44,7 +44,7 @@ trap cleanup EXIT
 echo "=== test_inode_query: get_sockdelays -i ==="
 
 # 启动 nc 监听器
-nc -l "$NC_PORT" &
+nc -l -p "$NC_PORT" &
 NC_PID=$!
 sleep 1
 
