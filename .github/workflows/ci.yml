@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install dependencies
         run: |
@@ -27,11 +29,17 @@ jobs:
           sudo apt-get install -y build-essential libelf-dev libssl-dev \
             bison flex libncurses-dev libmnl-dev ccache perl
 
-      - name: Checkout linux-stable (shallow)
+      - name: Checkout linux-stable (shallow, with retry)
         run: |
-          git clone --depth 1 --branch "$KERNEL_TAG" \
-            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
-            "$LINUX_SRC"
+          for i in 1 2 3 4 5; do
+            git clone --depth 1 --branch "$KERNEL_TAG" \
+              https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+              "$LINUX_SRC" && break
+            echo "Clone attempt $i failed, retrying in $((i*10))s..."
+            rm -rf "$LINUX_SRC"
+            sleep $((i*10))
+          done
+          test -d "$LINUX_SRC/.git"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -67,6 +75,8 @@ jobs:
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install dependencies
         run: |
@@ -74,11 +84,17 @@ jobs:
           sudo apt-get install -y build-essential libelf-dev libssl-dev \
             bison flex libncurses-dev libmnl-dev ccache bc
 
-      - name: Checkout linux-stable (shallow)
+      - name: Checkout linux-stable (shallow, with retry)
         run: |
-          git clone --depth 1 --branch "$KERNEL_TAG" \
-            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
-            "$LINUX_SRC"
+          for i in 1 2 3 4 5; do
+            git clone --depth 1 --branch "$KERNEL_TAG" \
+              https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+              "$LINUX_SRC" && break
+            echo "Clone attempt $i failed, retrying in $((i*10))s..."
+            rm -rf "$LINUX_SRC"
+            sleep $((i*10))
+          done
+          test -d "$LINUX_SRC/.git"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -154,6 +170,8 @@ jobs:
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install dependencies
         run: |
@@ -193,10 +211,33 @@ jobs:
       LINUX_SRC: /home/lai/Code/linux-6.6
       ROOTFS_IMG: /home/lai/Code/qemu-rootfs.img
     steps:
-      - name: Checkout project
-        uses: actions/checkout@v4
-        with:
-          clean: false
+      - name: Checkout project (SSH, with retry)
+        run: |
+          # The self-hosted runner is behind a firewall that blocks port
+          # 443, so actions/checkout (HTTPS) fails with TLS/timeout errors.
+          # Fetch via SSH instead, using the host user's SSH key.
+          cd "$GITHUB_WORKSPACE"
+          REMOTE="git@github.com:h1y2g3l4y5/NET_DELAYACCT.git"
+          if [ ! -d .git ]; then
+            git init
+            git remote add origin "$REMOTE"
+          fi
+          git remote set-url origin "$REMOTE"
+          fetched=0
+          for i in 1 2 3 4 5; do
+            if git fetch --no-tags --prune --depth=1 \
+                 origin "$GITHUB_REF"; then
+              fetched=1
+              break
+            fi
+            echo "Fetch attempt $i failed, retrying in $((i*5))s..."
+            sleep $((i*5))
+          done
+          if [ "$fetched" -ne 1 ]; then
+            echo "::error::All SSH fetch attempts failed"
+            exit 1
+          fi
+          git checkout -f "$GITHUB_SHA"
 
       - name: Run QEMU test pipeline
         run: sudo -E bash ci/qemu/ci-test.sh

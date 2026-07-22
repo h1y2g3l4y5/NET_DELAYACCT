@@ -214,6 +214,16 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 			prog_name, nlh->nlmsg_type, nlh->nlmsg_seq,
 			nlh->nlmsg_pid, nlh->nlmsg_len);
 
+	/* Skip messages with no attributes (e.g. the empty ack reply
+	 * from RESET).  Without this check, all-zero fields would be
+	 * printed as a bogus "proto=? pid=0 inode=0" data record. */
+	if (nlh->nlmsg_len <= NLMSG_SPACE(GENL_HDRLEN)) {
+		if (debug)
+			fprintf(stderr, "%s: [diag] message has no attributes, skipping\n",
+				prog_name);
+		return MNL_CB_OK;
+	}
+
 	mnl_attr_for_each(attr, nlh, GENL_HDRLEN) {
 		switch (mnl_attr_get_type(attr)) {
 		case NET_DELAYACCT_A_TYPE:
