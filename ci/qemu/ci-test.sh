@@ -117,7 +117,7 @@ install -m 0644 -D \
 	"$KERNEL_PATCH_DIR/include-uapi-linux-net-delayacct.h" \
 	/usr/include/linux/net-delayacct.h
 
-make tool 2>&1 | tail -3
+make -B tool 2>&1 | tail -5
 [ -x userspace/get_sockdelays/get_sockdelays ] || { log "Tool build FAILED"; exit 1; }
 log "Tool build OK"
 endlog

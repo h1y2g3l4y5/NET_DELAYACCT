@@ -45,17 +45,30 @@ else
 	timeout 5 /usr/local/bin/get_sockdelays -p 1 2>&1 | head -3 || echo "  (get_sockdelays timed out or failed)"
 fi
 
-# Diagnostic: start nc listener, query with --debug, capture kernel logs
+# Diagnostic: check tool binary, genl family, and query with debug
+echo "=== Diagnostics ==="
+echo "Tool binary info:"
+ls -la /usr/local/bin/get_sockdelays
+strings /usr/local/bin/get_sockdelays | grep -E "debug|version" | head -3
+
+echo "Kernel printk levels:"
+cat /proc/sys/kernel/printk 2>/dev/null || echo "  (not available)"
+
+echo "Genl family listing (/proc/net/generic):"
+cat /proc/net/generic 2>/dev/null || echo "  (not available)"
+
 echo "Diagnostic: nc listener query test..."
 nc -l 19999 &
 NC_DIAG_PID=$!
 sleep 1
 if kill -0 "$NC_DIAG_PID" 2>/dev/null; then
 	echo "  nc pid=$NC_DIAG_PID"
-	echo "  get_sockdelays output:"
-	timeout 5 /usr/local/bin/get_sockdelays --debug -p "$NC_DIAG_PID" 2>&1 | head -10
-	echo "  kernel messages after query:"
-	dmesg | grep -i "net_delayacct" | tail -5
+	echo "  get_sockdelays -d output (stderr+stdout):"
+	timeout 10 /usr/local/bin/get_sockdelays -d -p "$NC_DIAG_PID" 2>&1 | head -30
+	echo "  kernel messages after query (last 15 net_delayacct lines):"
+	dmesg | grep -i "net_delayacct" | tail -15
+	echo "  last 10 kernel messages (any):"
+	dmesg | tail -10
 	kill "$NC_DIAG_PID" 2>/dev/null || true
 	wait "$NC_DIAG_PID" 2>/dev/null || true
 else
@@ -63,7 +76,7 @@ else
 fi
 
 # Always show kernel net_delayacct messages for debugging
-echo "Kernel net_delayacct messages:"
+echo "All kernel net_delayacct messages:"
 dmesg | grep -i "net_delayacct" || echo "  (no net_delayacct kernel messages)"
 
 echo "[guest-init] Starting test suite..."

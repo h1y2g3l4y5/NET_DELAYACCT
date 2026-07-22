@@ -317,14 +317,33 @@ static int send_and_recv(struct mnl_socket *nl, struct nlmsghdr *nlh,
 		{
 			struct nlmsghdr *rnlh = (struct nlmsghdr *)buf;
 			if (debug)
-				fprintf(stderr, "%s: [diag] recvfrom %d bytes type=%u len=%u flags=%u\n",
+				fprintf(stderr, "%s: [diag] recvfrom %d bytes type=%u len=%u flags=%u seq=%u pid=%u (expect seq=%u portid=%u)\n",
 					prog_name, ret, rnlh->nlmsg_type,
-					rnlh->nlmsg_len, rnlh->nlmsg_flags);
+					rnlh->nlmsg_len, rnlh->nlmsg_flags,
+					rnlh->nlmsg_seq, rnlh->nlmsg_pid,
+					seq, portid);
 			if (rnlh->nlmsg_type == NLMSG_ERROR) {
 				struct nlmsgerr *nle = (struct nlmsgerr *)NLMSG_DATA(rnlh);
 				if (debug)
-					fprintf(stderr, "%s: [diag] NLMSG_ERROR error=%d (req type=%u)\n",
-						prog_name, nle->error, nle->msg.nlmsg_type);
+					fprintf(stderr, "%s: [diag] NLMSG_ERROR error=%d (req type=%u seq=%u pid=%u)\n",
+						prog_name, nle->error,
+						nle->msg.nlmsg_type,
+						nle->msg.nlmsg_seq,
+						nle->msg.nlmsg_pid);
+			}
+			/*
+			 * Skip stale messages left over from the
+			 * CTRL_CMD_GETFAMILY request in resolve_family_id().
+			 * The kernel assigns the same portid to all messages
+			 * on a socket, so we only check the seq.  A stale
+			 * CTRL_CMD_NEWFAMILY reply has a different seq than
+			 * the current do_query() request.
+			 */
+			if (rnlh->nlmsg_seq != seq && rnlh->nlmsg_seq != 0) {
+				if (debug)
+					fprintf(stderr, "%s: [diag] skipping stale message (seq=%u, expected %u)\n",
+						prog_name, rnlh->nlmsg_seq, seq);
+				continue;
 			}
 			/* For non-multipart (doit) replies, the kernel sends a
 			 * single message without NLM_F_MULTI and without a
@@ -333,8 +352,11 @@ static int send_and_recv(struct mnl_socket *nl, struct nlmsghdr *nlh,
 			if (!(rnlh->nlmsg_flags & NLM_F_MULTI) &&
 			    rnlh->nlmsg_type != NLMSG_DONE &&
 			    rnlh->nlmsg_type != NLMSG_ERROR) {
-				mnl_cb_run(buf, ret, seq, portid,
-					   parse_msg_cb, ctx);
+				ret = mnl_cb_run(buf, ret, seq, portid,
+						 parse_msg_cb, ctx);
+				if (debug)
+					fprintf(stderr, "%s: [diag] non-multipart mnl_cb_run returned %d\n",
+						prog_name, ret);
 				break;
 			}
 		}
@@ -374,6 +396,11 @@ static int do_query(struct mnl_socket *nl, int family_id,
 
 	if (json)
 		printf("[\n");
+
+	if (debug)
+		fprintf(stderr, "%s: [diag] do_query: family_id=%u cmd=%u attr_type=%u key=%llu\n",
+			prog_name, family_id, cmd, pid_attr_type,
+			(unsigned long long)key);
 
 	int ret = send_and_recv(nl, nlh, &ctx);
 
