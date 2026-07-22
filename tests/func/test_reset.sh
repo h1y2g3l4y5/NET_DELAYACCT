@@ -77,12 +77,15 @@ echo "Post-reset output:"
 echo "$POST_RESET_OUTPUT" | head -5
 
 # 步骤 5：验证重置后所有计数为零或 N/A
-# 输出格式: proto=xxx pid=NNN inode=NNN comm=xxx local=x remote=x rx=<NS>ns/<N>pkts tx=<NS>ns/<N>pkts
-# 提取 rx= 和 tx= 字段，检查是否为 0ns/0pkts
+# 输出格式（每个 socket 3 行）:
+#   proto=xxx pid=NNN inode=NNN comm=xxx local=x remote=x
+#     RX  count=NNN  total=NNN.NNNms  average=NNN.NNNms
+#     TX  count=NNN  total=NNN.NNNms  average=NNN.NNNms
+# 提取 RX/TX 行的 count= 值，检查是否全为零
 NONZERO_COUNT=$(echo "$POST_RESET_OUTPUT" | \
-	grep -E '^proto=' | \
-	sed -n 's/.*rx=\([0-9]*\)ns\/\([0-9]*\)pkts.*tx=\([0-9]*\)ns\/\([0-9]*\)pkts.*/\1 \2 \3 \4/p' | \
-	awk '$1 > 0 || $2 > 0 || $3 > 0 || $4 > 0 {print}' | wc -l)
+	grep 'count=' | \
+	sed -n 's/.*count=\([0-9]*\).*/\1/p' | \
+	awk '$1 > 0 {print}' | wc -l)
 
 if [ "$NONZERO_COUNT" -eq 0 ]; then
 	echo "[PASS] all counters are zero/N/A after reset"

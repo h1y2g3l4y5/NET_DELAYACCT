@@ -179,6 +179,26 @@ static void format_addr(char *out, size_t outsz, __u8 family,
 }
 
 /*
+ * Convert nanoseconds to milliseconds (double for fractional display).
+ * Mirrors the average_ms() macro in the kernel's getdelays.c (L194).
+ */
+static double ns_to_ms(uint64_t ns)
+{
+	return (double)ns / 1000000.0;
+}
+
+/*
+ * Average delay per packet in milliseconds.  Returns 0.0 when count is 0
+ * to avoid division by zero — consistent with getdelays' (c ? c : 1) guard.
+ */
+static double avg_ms(uint64_t total_ns, uint64_t count)
+{
+	if (count == 0)
+		return 0.0;
+	return ns_to_ms(total_ns) / (double)count;
+}
+
+/*
  * Parse one netlink message carrying a net_delayacct socket dump.
  * Returns MNL_CB_OK on success, MNL_CB_ERROR on parse failure.
  */
@@ -269,17 +289,19 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 		printf("\"comm\":\"%s\",", comm ? comm : "");
 		printf("\"local\":\"%s\",\"remote\":\"%s\",",
 		       laddr_str, raddr_str);
-		printf("\"rx\":{\"total_ns\":%" PRIu64 ",\"count\":%" PRIu64 "},",
-		       rx_total, rx_count);
-		printf("\"tx\":{\"total_ns\":%" PRIu64 ",\"count\":%" PRIu64 "}",
-		       tx_total, tx_count);
+		printf("\"rx\":{\"total_ns\":%" PRIu64 ",\"count\":%" PRIu64 ",\"avg_ns\":%" PRIu64 "},",
+		       rx_total, rx_count, rx_count ? rx_total / rx_count : 0);
+		printf("\"tx\":{\"total_ns\":%" PRIu64 ",\"count\":%" PRIu64 ",\"avg_ns\":%" PRIu64 "}",
+		       tx_total, tx_count, tx_count ? tx_total / tx_count : 0);
 		printf("}");
 	} else {
 		printf("proto=%-3s pid=%-7u inode=%-10" PRIu64 " comm=%-16s ",
 		       proto_str(proto), pid, inode, comm ? comm : "");
-		printf("local=%-26s remote=%-26s ", laddr_str, raddr_str);
-		printf("rx=%" PRIu64 "ns/%" PRIu64 "pkts  tx=%" PRIu64 "ns/%" PRIu64 "pkts\n",
-		       rx_total, rx_count, tx_total, tx_count);
+		printf("local=%-26s remote=%-26s\n", laddr_str, raddr_str);
+		printf("  RX  count=%-8" PRIu64 " total=%12.3fms  average=%10.3fms\n",
+		       rx_count, ns_to_ms(rx_total), avg_ms(rx_total, rx_count));
+		printf("  TX  count=%-8" PRIu64 " total=%12.3fms  average=%10.3fms\n",
+		       tx_count, ns_to_ms(tx_total), avg_ms(tx_total, tx_count));
 	}
 	ctx->rec_count++;
 	return MNL_CB_OK;

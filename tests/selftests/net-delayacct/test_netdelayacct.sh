@@ -172,13 +172,16 @@ test_04_reset() {
 	out=$("$GET_SOCKDELAYS" -p "$nc_pid" 2>&1 || true)
 
 	# 验证输出中不包含非零的时延计数
-	# 输出格式: proto=xxx ... rx=<NS>ns/<N>pkts  tx=<NS>ns/<N>pkts
-	# 提取 rx= 和 tx= 字段的数值，检查是否全为零
+	# 输出格式（每个 socket 3 行）:
+	#   proto=xxx pid=NNN inode=NNN comm=xxx local=x remote=x
+	#     RX  count=NNN  total=NNN.NNNms  average=NNN.NNNms
+	#     TX  count=NNN  total=NNN.NNNms  average=NNN.NNNms
+	# 提取 RX/TX 行的 count= 值，检查是否全为零
 	local nonzero
 	nonzero=$(echo "$out" | \
-		grep -E '^proto=' | \
-		sed -n 's/.*rx=\([0-9]*\)ns\/\([0-9]*\)pkts.*tx=\([0-9]*\)ns\/\([0-9]*\)pkts.*/\1 \2 \3 \4/p' | \
-		awk '$1 > 0 || $2 > 0 || $3 > 0 || $4 > 0 {print}' || true)
+		grep 'count=' | \
+		sed -n 's/.*count=\([0-9]*\).*/\1/p' | \
+		awk '$1 > 0 {print}' || true)
 
 	if [ -z "$nonzero" ]; then
 		test_pass "all counters are zero after reset"
