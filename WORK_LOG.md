@@ -1373,3 +1373,102 @@ fi
 | userspace/get_sockdelays/get_sockdelays.c | --debug 标志 + 非 MULTI break 修复 |
 | kernel-patches/net-core-net-delayacct.c | cmd_reset 发送回复 |
 | local-test.sh | SKIP/FAIL 区分处理 |
+
+---
+
+## 第十三轮 — CI doit 回调未触发根因修复 (2026-07-22)
+
+### 问题描述
+
+CI 环境中所有测试返回 "(no matching sockets)"，内核 pr_emerg 日志不出现，
+但本地测试一切正常。核心矛盾：
+
+- CI vmlinux **包含**所有 pr_emerg 字符串（`strings` 确认）
+- CI genl family **已注册**（`framework registered v2 (family=28)` 出现在 dmesg）
+- 但 CI dmesg 中 **无** doit 回调的 pr_emerg 日志
+- 工具返回 0（非错误），输出 "(no matching sockets)"
+
+### 根因分析
+
+**`send_and_recv` 函数 non-multipart 路径丢弃 `mnl_cb_run` 返回值**
+
+```c
+// 旧代码 (BUG)
+if (!(rnlh->nlmsg_flags & NLM_F_MULTI) &&
+    rnlh->nlmsg_type != NLMSG_DONE &&
+    rnlh->nlmsg_type != NLMSG_ERROR) {
+    mnl_cb_run(buf, ret, seq, portid, parse_msg_cb, ctx);  // 返回值被丢弃!
+    break;  // ret 仍是 recvfrom 的字节数 (正数), 非 MNL_CB_ERROR
+}
+return ret == MNL_CB_ERROR ? -EIO : 0;  // 总是返回 0
+```
+
+当 `mnl_cb_run` 因 seq/portid 不匹配返回 `MNL_CB_ERROR` 时，错误被静默忽略，
+函数返回 0，`do_query` 打印 "(no matching sockets)"。
+
+**叠加因素：CI 工具二进制过期**
+
+`make tool` 未重建二进制（Make 认为目标已最新），导致 CI 使用旧版本工具。
+
+### 修复内容
+
+1. **send_and_recv seq 检查** (get_sockdelays.c)
+   - 处理消息前检查 `nlmsg_seq`，跳过 stale 消息
+   - non-multipart 路径捕获 `mnl_cb_run` 返回值
+
+2. **make -B tool** (ci-test.sh)
+   - 强制无条件重建工具二进制
+
+3. **-d 短选项** (guest-init.sh)
+   - `--debug` → `-d`（避免旧二进制不识别长选项）
+
+4. **增强诊断输出** (guest-init.sh + get_sockdelays.c)
+   - `/proc/sys/kernel/printk` 日志级别检查
+   - `/proc/net/generic` genl family 列表
+   - `dmesg | tail -10` 最后 10 条内核消息
+   - do_query 输出 family_id/cmd/attr_type/key
+   - recvfrom 输出 type/len/flags/seq/pid 与期望值对比
+
+### CI 验证结果 (commit ab91f63, kernel #37)
+
+**测试结果：8 PASS / 1 FAIL / 1 SKIP**
+
+| 测试 | 结果 | 说明 |
+|------|------|------|
+| selftest Test 1 (own PID) | ✅ PASS | |
+| selftest Test 2 (nc listener) | ✅ PASS | pid=102, 找到 TCP socket |
+| selftest Test 3 (inode query) | ✅ PASS | inode=463 |
+| selftest Test 4 (reset) | ✅ PASS | |
+| selftest Test 5 (TCP iperf3) | ✅ PASS | |
+| selftest Test 6 (UDP iperf3) | ❌ FAIL | 时序问题：iperf3 UDP 进程退出前查询到 TCP |
+| test_inode_query.sh | ✅ PASS=2 | |
+| test_multi_socket.sh | ⏭️ SKIP | 需要 python3 |
+| test_pid_query.sh | ✅ PASS=2 | |
+| test_reset.sh | ✅ PASS=2 | |
+| test_tcp_udp.sh | ✅ PASS=2 | TCP + UDP 均通过 |
+
+**pr_emerg 日志确认**（CI dmesg 首次出现）：
+```
+net_delayacct: cmd_get_by_pid: querying pid=81
+net_delayacct: iter_task_sockets pid=81 max_fds=256
+net_delayacct: iter fd=3 inode=1111 family=10 proto=6 FOUND
+net_delayacct: one_reply: SEND skb->len=168 nlmsg_type=28 nlmsg_flags=2
+net_delayacct: one_reply: genlmsg_reply ret=0
+```
+
+**-d 诊断输出确认**：
+```
+[diag] do_query: family_id=28 cmd=1 attr_type=7 key=81
+[diag] recvfrom 168 bytes type=28 flags=2 seq=1784706768 pid=85
+[diag] mnl_cb_run returned 1
+[diag] recvfrom 16 bytes type=3 (NLMSG_DONE) flags=2
+[diag] mnl_cb_run returned 0
+```
+
+### 修改文件清单
+
+| 文件 | 改动 |
+|------|------|
+| userspace/get_sockdelays/get_sockdelays.c | seq 检查 + mnl_cb_run 返回值捕获 + 诊断增强 |
+| ci/qemu/ci-test.sh | `make tool` → `make -B tool` |
+| ci/qemu/guest-init.sh | `--debug` → `-d` + printk/genl/dmesg 诊断 |
