@@ -28,6 +28,7 @@ modules.builtin.modinfo
 # Userspace tool binary / 用户态工具产物
 userspace/get_sockdelays/get_sockdelays
 /userspace/get_sockdelays/get_sockdelays
+userspace/get_sockdelays/*.d
 
 # Build directories / 构建目录
 build/
@@ -45,6 +46,7 @@ build-*/
 # IDE files / IDE 配置
 .vscode/
 .idea/
+.trae/
 *.iml
 .project
 .cproject
@@ -81,6 +83,7 @@ test-results/
 
 # QEMU local state (not committed)
 .qemu_last_tested
+ci/qemu/local-initrd.img
 
 # Patch artifacts / 补丁中间产物
 *.patch.rej
