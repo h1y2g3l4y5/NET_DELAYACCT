@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: h1y2g3l4y5 <h1y2g3l4y5@example.com>
+Date: Mon, 20 Jul 2026 00:00:00 +0800
+Subject: [PATCH] net-delayacct: add module to net/core/Makefile
+
+Wire net-delayacct.o into the build when CONFIG_NET_DELAYACCT is
+enabled.
+
+Signed-off-by: h1y2g3l4y5 <h1y2g3l4y5@example.com>
+---
+ net/core/Makefile | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/net/core/Makefile b/net/core/Makefile
+index 000000000000..000000000000
+--- a/net/core/Makefile
++++ b/net/core/Makefile
+@@ -xxx,6 +xxx,7 @@
+ 
+ obj-$(CONFIG_DST_CACHE) += dst_cache.o
+ obj-$(CONFIG_GRO_CELLS) += gro_cells.o
++obj-$(CONFIG_NET_DELAYACCT) += net-delayacct.o
+ obj-$(CONFIG_FAILOVER) += failover.o
+ obj-$(CONFIG_NETDEV_ADDR_LIST_TEST) += dev_addr_lists_test.o
+ obj-$(CONFIG_NET_TEST) += net_test.o

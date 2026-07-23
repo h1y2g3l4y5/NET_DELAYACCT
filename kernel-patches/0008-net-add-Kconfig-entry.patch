@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: h1y2g3l4y5 <h1y2g3l4y5@example.com>
+Date: Mon, 20 Jul 2026 00:00:00 +0800
+Subject: [PATCH] net-delayacct: add Kconfig option
+
+Add CONFIG_NET_DELAYACCT to net/Kconfig, depending on CONFIG_NET.
+When enabled, per-socket RX/TX latency statistics are accumulated
+and exposed via the "net_delayacct" generic netlink family.
+
+Signed-off-by: h1y2g3l4y5 <h1y2g3l4y5@example.com>
+---
+ net/Kconfig | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/net/Kconfig b/net/Kconfig
+index 000000000000..000000000000
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -xxx,6 +xxx,23 @@
+ 	  recommended to enable this feature for faster loadable module
+ 	  support.
+ 
++config NET_DELAYACCT
++	bool "Per-socket network delay accounting"
++	depends on NET
++	default n
++	help
++	  This option enables per-socket network delay accounting, which
++	  measures the receive latency (from packet entering the network
++	  stack to a process reading it to user space) and send latency
++	  (from a process calling send/sendmsg to the packet reaching the
++	  network device driver) for each TCP/UDP socket.
++
++	  The accumulated statistics can be queried via the generic
++	  netlink "net_delayacct" family, either by PID or by socket
++	  inode, using the user-space tool get_sockdelays.
++
++	  If unsure, say N.
++
+ config NET_RX_BUSY_POLL
+ 	bool
+ 	default y

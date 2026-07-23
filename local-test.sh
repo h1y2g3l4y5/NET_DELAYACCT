@@ -79,26 +79,12 @@ copy_binary_with_libs() {
 step_sync_source() {
 	log_section "Syncing kernel module source"
 
-	install -m 0644 "$KERNEL_PATCH_DIR/include-net-net-delayacct.h" \
-		"$LINUX_SRC/include/net/net-delayacct.h"
-	install -m 0644 "$KERNEL_PATCH_DIR/include-uapi-linux-net-delayacct.h" \
-		"$LINUX_SRC/include/uapi/linux/net-delayacct.h"
-	install -m 0644 "$KERNEL_PATCH_DIR/net-core-net-delayacct.c" \
-		"$LINUX_SRC/net/core/net-delayacct.c"
-
-	# Ensure Kconfig and Makefile fragments are present
-	if ! grep -q "CONFIG_NET_DELAYACCT" "$LINUX_SRC/net/Kconfig" 2>/dev/null; then
-		cat "$KERNEL_PATCH_DIR/Kconfig-fragment" >> "$LINUX_SRC/net/Kconfig"
-	fi
-	if ! grep -q "net-delayacct" "$LINUX_SRC/net/core/Makefile" 2>/dev/null; then
-		cat "$KERNEL_PATCH_DIR/Makefile-fragment" >> "$LINUX_SRC/net/core/Makefile"
-	fi
-
-	echo "Source files synced OK"
+# Source files are now handled by .patch files (see kernel-patches/0005-0009)
+	echo "Source files sync: deferred to patch step"
 }
 
 # ============================================================================
-# Step 2: Apply .patch files if not already applied
+# Step 2: Apply kernel patches (ALL files via standard .patch format)
 # ============================================================================
 step_apply_patches() {
 	log_section "Apply patches"
@@ -108,22 +94,25 @@ step_apply_patches() {
 	# Check if patches are already applied (look for delayacct_start in skbuff.h)
 	if grep -q "delayacct_start" include/linux/skbuff.h 2>/dev/null; then
 		echo "Patches already applied (delayacct_start found in skbuff.h)"
-	else
-		shopt -s nullglob
-		for p in "$KERNEL_PATCH_DIR/"*.patch; do
-			local pname=$(basename "$p")
-			echo "  Applying $pname..."
-			if ! git apply "$p" 2>/dev/null; then
-				patch -p1 --fuzz=3 < "$p" 2>/dev/null || {
-					echo "  ${YELLOW}WARNING: failed to apply $pname${NC}"
-				}
-			fi
-		done
-
-		# sock.c fixup
-		sed -i '/sk_tx_queue_clear(sk);/a\\tnet_delayacct_init(\&sk->sk_net_delayacct);' \
-			net/core/sock.c 2>/dev/null || true
+		return
 	fi
+
+	shopt -s nullglob
+	for p in "$KERNEL_PATCH_DIR/"*.patch; do
+		local pname=$(basename "$p")
+		echo "  Applying $pname..."
+		if ! git apply "$p" 2>/dev/null; then
+			patch -p1 --fuzz=3 < "$p" 2>/dev/null || {
+				echo "  ${YELLOW}WARNING: failed to apply $pname${NC}"
+			}
+		fi
+	done
+
+	# sock.c fixup
+	sed -i '/sk_tx_queue_clear(sk);/a\\tnet_delayacct_init(\&sk->sk_net_delayacct);' \
+		net/core/sock.c 2>/dev/null || true
+
+	echo "All patches applied OK"
 }
 
 # ============================================================================

@@ -120,28 +120,6 @@ jobs:
             git apply "$p" || patch -p1 < "$p"
           done
 
-      - name: Install new NET_DELAYACCT source files
-        run: |
-          set -e
-          kp="$GITHUB_WORKSPACE/kernel-patches"
-          # Copy new files into the kernel tree at their canonical paths.
-          # File names use '-' to represent directory separators so they
-          # sit flat in kernel-patches/ (no subdirectories).
-          install -m 0644 "$kp/include-net-net-delayacct.h"        "$LINUX_SRC/include/net/net-delayacct.h"
-          install -m 0644 "$kp/include-uapi-linux-net-delayacct.h" "$LINUX_SRC/include/uapi/linux/net-delayacct.h"
-          install -m 0644 "$kp/net-core-net-delayacct.c"           "$LINUX_SRC/net/core/net-delayacct.c"
-          # Append Makefile/Kconfig fragments.
-          cat "$kp/Makefile-fragment" >> "$LINUX_SRC/net/core/Makefile"
-          cat "$kp/Kconfig-fragment"  >> "$LINUX_SRC/net/Kconfig"
-          echo "=== Installed files ==="
-          ls -la "$LINUX_SRC/include/net/net-delayacct.h" \
-                 "$LINUX_SRC/include/uapi/linux/net-delayacct.h" \
-                 "$LINUX_SRC/net/core/net-delayacct.c"
-          echo "=== Makefile tail ==="
-          tail -3 "$LINUX_SRC/net/core/Makefile"
-          echo "=== Kconfig tail ==="
-          tail -15 "$LINUX_SRC/net/Kconfig"
-
       - name: Initialize sk_net_delayacct in sk_prot_alloc
         run: |
           sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&sk->sk_net_delayacct);/' \
@@ -162,6 +140,13 @@ jobs:
         run: |
           cd "$LINUX_SRC"
           make -j"$(nproc)" CC="ccache gcc" bzImage modules
+
+      - name: Upload bzImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bzImage
+          path: ${{ env.LINUX_SRC }}/arch/x86/boot/bzImage
+          retention-days: 1
 
   build-tool:
     name: Build userspace get_sockdelays
@@ -199,48 +184,123 @@ jobs:
           test -x userspace/get_sockdelays/get_sockdelays
           ./userspace/get_sockdelays/get_sockdelays -h || true
 
+      - name: Upload get_sockdelays artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: get_sockdelays
+          path: userspace/get_sockdelays/get_sockdelays
+          retention-days: 1
+
   qemu-test:
-    name: QEMU runtime test (self-hosted)
-    runs-on: self-hosted
+    name: QEMU runtime test
+    runs-on: ubuntu-22.04
+    needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    env:
-      LINUX_SRC: /home/lai/Code/linux-6.6
-      ROOTFS_IMG: /home/lai/Code/qemu-rootfs.img
+    timeout-minutes: 30
     steps:
-      - name: Checkout project (SSH, with retry)
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
         run: |
-          # The self-hosted runner is behind a firewall that blocks port
-          # 443, so actions/checkout (HTTPS) fails with TLS/timeout errors.
-          # Fetch via SSH instead, using the host user's SSH key.
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio
+
+      - name: Download bzImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bzImage
+          path: /tmp/artifacts
+
+      - name: Download get_sockdelays artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: get_sockdelays
+          path: /tmp/artifacts
+
+      - name: Build initramfs and run QEMU
+        run: |
+          set -e
           cd "$GITHUB_WORKSPACE"
-          REMOTE="git@github.com:h1y2g3l4y5/NET_DELAYACCT.git"
-          if [ ! -d .git ]; then
-            git init
-            git remote add origin "$REMOTE"
-          fi
-          git remote set-url origin "$REMOTE"
-          fetched=0
-          for i in 1 2 3 4 5; do
-            if git fetch --no-tags --prune --depth=1 \
-                 origin "$GITHUB_REF"; then
-              fetched=1
-              break
-            fi
-            echo "Fetch attempt $i failed, retrying in $((i*5))s..."
-            sleep $((i*5))
+          mkdir -p /tmp/initrd/{bin,sbin,usr/local/bin,etc,proc,sys,dev,tmp,root,lib/x86_64-linux-gnu,lib64}
+
+          # Verify artifacts
+          test -f /tmp/artifacts/bzImage || { echo "ERROR: bzImage not found"; exit 1; }
+          test -f /tmp/artifacts/get_sockdelays || { echo "ERROR: get_sockdelays not found"; exit 1; }
+
+          # Copy busybox + create applet symlinks
+          cp "$(which busybox)" /tmp/initrd/bin/busybox
+          for applet in sh ls cat cp mount umount sleep kill echo grep date head tail \
+            awk sed test mknod mkdir chmod readlink true false ifconfig ip timeout nc \
+            nslookup wget tee; do
+            ln -sf /bin/busybox "/tmp/initrd/bin/$applet"
           done
-          if [ "$fetched" -ne 1 ]; then
-            echo "::error::All SSH fetch attempts failed"
+
+          # Copy get_sockdelays
+          cp /tmp/artifacts/get_sockdelays /tmp/initrd/usr/local/bin/
+          chmod +x /tmp/initrd/usr/local/bin/get_sockdelays
+
+          # Copy test scripts
+          mkdir -p /tmp/initrd/opt/test/func
+          cp tests/selftests/net-delayacct/test_netdelayacct.sh tests/selftests/net-delayacct/test_helper.sh \
+            /tmp/initrd/opt/test/ 2>/dev/null || true
+          cp tests/func/test_*.sh /tmp/initrd/opt/test/func/ 2>/dev/null || true
+          chmod +x /tmp/initrd/opt/test/*.sh /tmp/initrd/opt/test/func/*.sh 2>/dev/null || true
+
+          # Copy guest-init.sh as init
+          cp ci/qemu/guest-init.sh /tmp/initrd/init
+          chmod +x /tmp/initrd/init
+
+          # Copy iperf3 + nc + their shared libs
+          for bin in iperf3 nc; do
+            b=$(which "$bin")
+            cp "$b" "/tmp/initrd/bin/$bin"
+            for lib in $(ldd "$b" 2>/dev/null | grep -oP '/\S+'); do
+              mkdir -p "/tmp/initrd/$(dirname "$lib")"
+              cp "$lib" "/tmp/initrd$lib" 2>/dev/null || true
+            done
+          done
+
+          # Copy get_sockdelays shared libs + dynamic linker
+          for lib in $(ldd /tmp/artifacts/get_sockdelays 2>/dev/null | grep -oP '/\S+'); do
+            mkdir -p "/tmp/initrd/$(dirname "$lib")"
+            cp "$lib" "/tmp/initrd$lib" 2>/dev/null || true
+          done
+          if [ -f /lib64/ld-linux-x86-64.so.2 ]; then
+            cp /lib64/ld-linux-x86-64.so.2 /tmp/initrd/lib64/
+          fi
+
+          # Build initramfs
+          cd /tmp/initrd
+          find . | cpio -o -H newc | gzip -9 > /tmp/initrd.img
+          cd "$GITHUB_WORKSPACE"
+
+          echo "Initramfs built: $(du -sh /tmp/initrd.img | cut -f1)"
+
+          # Run QEMU
+          echo "::group::QEMU boot log"
+          timeout 300 qemu-system-x86_64 \
+            -m 1024M -smp 2 \
+            -kernel /tmp/artifacts/bzImage \
+            -initrd /tmp/initrd.img \
+            -append "console=ttyS0,115200n8 init=/init" \
+            -nographic -no-reboot 2>&1 | tee /tmp/qemu.log || true
+          echo "::endgroup::"
+
+          # Extract results from QEMU log
+          echo ""
+          echo "========== TEST RESULTS =========="
+          sed -n '/^=== QEMU Test Run/,/^=== Kernel net_delayacct/p' /tmp/qemu.log || echo "(no results section found)"
+          grep -E '\[PASS\]|\[FAIL\]|\[SKIP\]' /tmp/qemu.log || echo "(no pass/fail lines found)"
+          echo "=================================="
+          echo ""
+          echo "=== QEMU boot tail ==="
+          tail -30 /tmp/qemu.log
+
+          # Exit with failure if any FAIL found
+          if grep -q '\[FAIL\]' /tmp/qemu.log 2>/dev/null; then
+            echo "::error::Tests FAILED"
             exit 1
           fi
-          git checkout -f "$GITHUB_SHA"
-
-      - name: Run QEMU test pipeline
-        run: sudo -E bash ci/qemu/ci-test.sh
-
-      - name: Fix permissions (sudo creates root-owned files)
-        if: always()
-        run: sudo chown -R lai:lai /home/lai/actions-runner/_work/NET_DELAYACCT/

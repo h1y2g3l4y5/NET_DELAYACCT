@@ -82,7 +82,7 @@ dmesg | grep -i "net_delayacct" || echo "  (no net_delayacct kernel messages)"
 echo "[guest-init] Starting test suite..."
 
 # --- Find and run test scripts ---
-TEST_ROOT="/opt/net_delayacct_tests"
+TEST_ROOT="/opt/test"
 RESULT_FILE="/root/test-output.txt"
 
 {
