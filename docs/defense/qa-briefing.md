@@ -121,9 +121,9 @@
 
 ## Q15：测试覆盖率如何？有自动化吗？
 
-**A**：测试覆盖五个层次共 21 个用例。KUnit 单元测试 5 个：init/reset 零值验证、RX/TX 累加验证、并发累加安全（多线程同时累加，验证 count 不丢失）、零起始跳过（delayacct_start=0 时不累加）。功能测试 5 个：test_pid_query.sh、test_inode_query.sh、test_reset.sh、test_multi_socket.sh、test_tcp_udp.sh，覆盖工具的所有命令行选项。selftests 7 个：在内核 selftests 框架下运行，包含自身 PID 查询、nc 监听、inode、reset、TCP/UDP、多 socket。性能测试 3 个：baseline-vs-enabled.sh（基线对比）、long-run.sh（24h 长稳）、concurrent-query.sh（32 并发查询压力）。回归测试 1 个：CONFIG_NET_DELAYACCT=n 行为不变验证。自动化：项目根目录 ci/ci.yml 配置 GitHub Actions，包含内核编译、工具编译、selftests 三个阶段；tests/reports/ 目录自动生成测试报告。
+**A**：测试覆盖五个层次共 21 个用例。KUnit 单元测试 5 个：init/reset 零值验证、RX/TX 累加验证、并发累加安全（多线程同时累加，验证 count 不丢失）、零起始跳过（delayacct_start=0 时不累加）。功能测试 5 个：test_pid_query.sh、test_inode_query.sh、test_reset.sh、test_multi_socket.sh、test_tcp_udp.sh，覆盖工具的所有命令行选项。selftests 7 个：在内核 selftests 框架下运行，包含自身 PID 查询、nc 监听、inode、reset、TCP/UDP、多 socket。性能测试 3 个：baseline-vs-enabled.sh（基线对比）、long-run.sh（24h 长稳）、concurrent-query.sh（32 并发查询压力）。回归测试 1 个：CONFIG_NET_DELAYACCT=n 行为不变验证。自动化：项目根目录 .github/workflows/ci.yml 配置 GitHub Actions，包含内核编译、工具编译、selftests 三个阶段；tests/reports/ 目录自动生成测试报告。
 
-**补充材料**：参见 tests/README.md 测试矩阵；ci/ci.yml CI 配置。
+**补充材料**：参见 tests/README.md 测试矩阵；.github/workflows/ci.yml CI 配置。
 
 ---
 

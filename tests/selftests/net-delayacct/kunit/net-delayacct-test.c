@@ -77,20 +77,20 @@ static void net_delayacct_test_init_reset(struct kunit *test)
 {
 	struct sock *sk = stub_sock_create(test);
 
-	net_delayacct_init(&sk->net_delayacct);
+	net_delayacct_init(&sk->sk_net_delayacct);
 
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_total_ns, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_count, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_total_ns, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_count, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_count, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_count, 0);
 
 	/* Reset on already-zero state must remain zero */
-	net_delayacct_reset(&sk->net_delayacct);
+	net_delayacct_reset(&sk->sk_net_delayacct);
 
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_total_ns, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_count, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_total_ns, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_count, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_count, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_count, 0);
 }
 
 /*
@@ -106,7 +106,7 @@ static void net_delayacct_test_rx_accumulation(struct kunit *test)
 	struct sock *sk = stub_sock_create(test);
 	struct sk_buff *skb = stub_skb_create(test);
 
-	net_delayacct_init(&sk->net_delayacct);
+	net_delayacct_init(&sk->sk_net_delayacct);
 
 	/* Simulate packet entering the protocol stack */
 	net_delayacct_rx_start(skb);
@@ -117,12 +117,12 @@ static void net_delayacct_test_rx_accumulation(struct kunit *test)
 	/* Simulate packet being copied to user space */
 	net_delayacct_rx_end(sk, skb);
 
-	KUNIT_EXPECT_GT(test, sk->net_delayacct.rx_total_ns, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_count, 1);
+	KUNIT_EXPECT_GT(test, sk->sk_net_delayacct.rx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_count, 1);
 
 	/* TX side must remain untouched */
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_total_ns, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_count, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_count, 0);
 }
 
 /*
@@ -138,7 +138,7 @@ static void net_delayacct_test_tx_accumulation(struct kunit *test)
 	struct sock *sk = stub_sock_create(test);
 	struct sk_buff *skb = stub_skb_create(test);
 
-	net_delayacct_init(&sk->net_delayacct);
+	net_delayacct_init(&sk->sk_net_delayacct);
 
 	/* Simulate process entering sendmsg */
 	net_delayacct_tx_start(skb);
@@ -148,12 +148,12 @@ static void net_delayacct_test_tx_accumulation(struct kunit *test)
 	/* Simulate packet reaching the driver via dev_hard_start_xmit */
 	net_delayacct_tx_end(sk, skb);
 
-	KUNIT_EXPECT_GT(test, sk->net_delayacct.tx_total_ns, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_count, 1);
+	KUNIT_EXPECT_GT(test, sk->sk_net_delayacct.tx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_count, 1);
 
 	/* RX side must remain untouched */
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_total_ns, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_count, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_count, 0);
 }
 
 /*
@@ -195,7 +195,7 @@ static void net_delayacct_test_concurrent_accumulation(struct kunit *test)
 	struct task_struct *tasks[CONCURRENCY_THREADS];
 	int i;
 
-	net_delayacct_init(&sk->net_delayacct);
+	net_delayacct_init(&sk->sk_net_delayacct);
 	ctx.sk = sk;
 	atomic_set(&ctx.remaining, CONCURRENCY_THREADS);
 
@@ -210,13 +210,13 @@ static void net_delayacct_test_concurrent_accumulation(struct kunit *test)
 		fsleep(1000);
 
 	/* Expected total count = threads * iterations per thread */
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_count,
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_count,
 			(u64)(CONCURRENCY_THREADS * CONCURRENCY_ITERS));
-	KUNIT_EXPECT_GT(test, sk->net_delayacct.rx_total_ns, 0);
+	KUNIT_EXPECT_GT(test, sk->sk_net_delayacct.rx_total_ns, 0);
 
 	/* No leaks into TX */
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_count, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_count, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_total_ns, 0);
 
 	for (i = 0; i < CONCURRENCY_THREADS; i++)
 		kthread_stop(tasks[i]);
@@ -234,20 +234,20 @@ static void net_delayacct_test_skip_zero_start(struct kunit *test)
 	struct sock *sk = stub_sock_create(test);
 	struct sk_buff *skb = stub_skb_create(test);
 
-	net_delayacct_init(&sk->net_delayacct);
+	net_delayacct_init(&sk->sk_net_delayacct);
 
 	/* delayacct_start is 0 because we kzalloc'd; verify explicitly */
 	KUNIT_EXPECT_EQ(test, (u64)skb->delayacct_start, 0);
 
 	/* RX end without prior start must be a no-op */
 	net_delayacct_rx_end(sk, skb);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_count, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.rx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_count, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_total_ns, 0);
 
 	/* TX end without prior start must be a no-op */
 	net_delayacct_tx_end(sk, skb);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_count, 0);
-	KUNIT_EXPECT_EQ(test, sk->net_delayacct.tx_total_ns, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_count, 0);
+	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_total_ns, 0);
 }
 
 static struct kunit_case net_delayacct_test_cases[] = {

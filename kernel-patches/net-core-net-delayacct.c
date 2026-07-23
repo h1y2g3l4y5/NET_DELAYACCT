@@ -203,12 +203,12 @@ static int net_delayacct_one_reply(struct genl_info *info, int flags,
 	{
 		struct nlmsghdr *nlh = nlmsg_hdr(msg);
 
-		pr_emerg("net_delayacct: one_reply: SEND skb->len=%u nlmsg_type=%u nlmsg_len=%u nlmsg_flags=%u\n",
+		pr_debug("net_delayacct: one_reply: SEND skb->len=%u nlmsg_type=%u nlmsg_len=%u nlmsg_flags=%u\n",
 			 msg->len, nlh->nlmsg_type, nlh->nlmsg_len,
 			 nlh->nlmsg_flags);
 	}
 	ret = genlmsg_reply(msg, info);
-	pr_emerg("net_delayacct: one_reply: genlmsg_reply ret=%d\n", ret);
+	pr_debug("net_delayacct: one_reply: genlmsg_reply ret=%d\n", ret);
 	return ret;
 }
 
@@ -331,7 +331,7 @@ static int net_delayacct_iter_task_sockets(struct task_struct *task,
 
 	spin_lock(&files->file_lock);
 	fdt = files_fdtable(files);
-	pr_emerg("net_delayacct: iter_task_sockets pid=%u max_fds=%u\n",
+	pr_debug("net_delayacct: iter_task_sockets pid=%u max_fds=%u\n",
 		pid, fdt->max_fds);
 	for (fd = 0; fd < fdt->max_fds; fd++) {
 		struct file *file = fdt->fd[fd];
@@ -343,13 +343,13 @@ static int net_delayacct_iter_task_sockets(struct task_struct *task,
 		if (!sk)
 			continue;
 		if (!is_inet_tcp_udp(sk)) {
-			pr_emerg("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u SKIPPED\n",
+			pr_debug("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u SKIPPED\n",
 				fd, (unsigned long long)sock_inode_for(sk),
 				sk->sk_family, sk->sk_protocol);
 			continue;
 		}
 
-		pr_emerg("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u FOUND\n",
+		pr_debug("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u FOUND\n",
 			fd, (unsigned long long)sock_inode_for(sk),
 			sk->sk_family, sk->sk_protocol);
 
@@ -397,7 +397,7 @@ static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
 
 	pid = nla_get_u32(info->attrs[NET_DELAYACCT_A_PID]);
 
-	pr_emerg("net_delayacct: cmd_get_by_pid: querying pid=%u\n", pid);
+	pr_debug("net_delayacct: cmd_get_by_pid: querying pid=%u\n", pid);
 
 	rcu_read_lock();
 	pidp = find_get_pid(pid);
@@ -433,7 +433,7 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 		return -EINVAL;
 	target_inode = nla_get_u64(info->attrs[NET_DELAYACCT_A_INODE]);
 
-	pr_emerg("net_delayacct: cmd_get_by_inode: ENTER target_inode=%llu\n",
+	pr_debug("net_delayacct: cmd_get_by_inode: ENTER target_inode=%llu\n",
 		 (unsigned long long)target_inode);
 
 	rcu_read_lock();
@@ -471,7 +471,7 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 			 * (may be NULL in some kernel versions).
 			 */
 			ino = file_inode(file)->i_ino;
-			pr_emerg("net_delayacct: cmd_get_by_inode: pid=%d fd=%u ino=%llu sk_family=%u sk_proto=%u\n",
+			pr_debug("net_delayacct: cmd_get_by_inode: pid=%d fd=%u ino=%llu sk_family=%u sk_proto=%u\n",
 				 task_pid_nr(task), fd,
 				 (unsigned long long)ino,
 				 sk->sk_family, sk->sk_protocol);
@@ -490,7 +490,7 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 			fput(file);
 			put_files_struct(files);
 			rcu_read_unlock();
-			pr_emerg("net_delayacct: cmd_get_by_inode: MATCH ret=%d\n", ret);
+			pr_debug("net_delayacct: cmd_get_by_inode: MATCH ret=%d\n", ret);
 			return ret;
 		}
 		spin_unlock(&files->file_lock);
@@ -498,7 +498,7 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 	}
 	rcu_read_unlock();
 
-	pr_emerg("net_delayacct: cmd_get_by_inode: EXIT sock_count=%d match_count=%d (returning -ENOENT)\n",
+	pr_debug("net_delayacct: cmd_get_by_inode: EXIT sock_count=%d match_count=%d (returning -ENOENT)\n",
 		 sock_count, match_count);
 	return -ENOENT;
 }

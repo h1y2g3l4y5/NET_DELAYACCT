@@ -1,6 +1,5 @@
 # CI workflow for NET_DELAYACCT
-# NOTE: This file is authored at ci/ci.yml per project layout.
-# To enable it on GitHub, symlink or copy it to .github/workflows/ci.yml.
+# This is the canonical CI file. GitHub Actions reads from .github/workflows/.
 name: net-delayacct-ci
 
 on:

@@ -41,6 +41,7 @@
 
 static const char *prog_name = "get_sockdelays";
 static int debug = 0;
+static uint32_t seq_counter = 0;
 
 static void usage(FILE *out)
 {
@@ -96,7 +97,7 @@ static int resolve_family_id(struct mnl_socket *nl)
 	 * recvfrom() would then pick up that stale ack instead of its own reply,
 	 * causing every query to see "(no matching sockets)". */
 	nlh->nlmsg_flags = NLM_F_REQUEST;
-	nlh->nlmsg_seq = seq = time(NULL);
+	nlh->nlmsg_seq = seq = ++seq_counter;
 
 	struct genlmsghdr *genl = mnl_nlmsg_put_extra_header(nlh, sizeof(*genl));
 	genl->cmd = CTRL_CMD_GETFAMILY;
@@ -404,7 +405,7 @@ static int do_query(struct mnl_socket *nl, int family_id,
 	nlh = mnl_nlmsg_put_header(buf);
 	nlh->nlmsg_type = family_id;
 	nlh->nlmsg_flags = NLM_F_REQUEST;
-	nlh->nlmsg_seq = time(NULL);
+	nlh->nlmsg_seq = ++seq_counter;
 
 	struct genlmsghdr *genl = mnl_nlmsg_put_extra_header(nlh, sizeof(*genl));
 	genl->cmd = cmd;
@@ -444,7 +445,7 @@ static int do_reset(struct mnl_socket *nl, int family_id)
 	nlh = mnl_nlmsg_put_header(buf);
 	nlh->nlmsg_type = family_id;
 	nlh->nlmsg_flags = NLM_F_REQUEST;
-	nlh->nlmsg_seq = time(NULL);
+	nlh->nlmsg_seq = ++seq_counter;
 
 	struct genlmsghdr *genl = mnl_nlmsg_put_extra_header(nlh, sizeof(*genl));
 	genl->cmd = NET_DELAYACCT_CMD_RESET;

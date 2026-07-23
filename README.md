@@ -66,12 +66,15 @@ proto=tcp pid=305 inode=805 owner_task=iperf3 local=[::]:5204 remote=[::]:0
 ├── kernel-patches/          # 针对 linux-6.6 的内核补丁集
 ├── userspace/
 │   └── get_sockdelays/      # 用户态查询工具源码
-├── docs/                    # 设计文档与说明
+├── ci/                      # CI 管道脚本 + 内核 config 片段
+│   └── qemu/                 #   QEMU 测试脚本（guest-init, ci-test 等）
+├── Documentation/networking/ # 内核上游 RST 格式文档
+├── docs/                    # 项目设计文档与说明
 ├── tests/
 │   ├── func/                # 功能测试
 │   ├── perf/                # 性能测试
+│   ├── selftests/           # 内核风格 selftest + KUnit
 │   └── reports/             # 测试报告
-├── ci/                      # CI 配置与内核 config 片段
 ├── Makefile                 # 顶层便捷构建入口
 ├── LICENSE                  # GPL-2.0-only
 ├── README.md
