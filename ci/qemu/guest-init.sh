@@ -1,4 +1,4 @@
-﻿#!/bin/sh
+#!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Guest init script — runs inside the QEMU VM.

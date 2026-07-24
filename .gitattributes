@@ -1,0 +1,10 @@
+# Ensure shell scripts always use LF line endings (critical for QEMU /init)
+*.sh text eol=lf
+local-test.sh text eol=lf
+ci/qemu/guest-init.sh text eol=lf
+ci/qemu/demo-tests.sh text eol=lf
+
+# YAML and patches also need LF
+*.yml text eol=lf
+*.yaml text eol=lf
+*.patch text eol=lf
