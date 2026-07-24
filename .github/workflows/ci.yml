@@ -254,7 +254,8 @@ jobs:
           cp "$(which busybox)" /tmp/initrd/bin/busybox
           for applet in sh ls cat cp mount umount sleep kill echo grep date head tail \
             awk sed test mknod mkdir chmod readlink true false ifconfig ip timeout nc \
-            nslookup wget tee; do
+            nslookup wget tee sort wc uname dmesg sync reboot poweroff halt \
+            modprobe mountpoint strings seq basename dirname tr cut; do
             ln -sf /bin/busybox "/tmp/initrd/bin/$applet"
           done
 

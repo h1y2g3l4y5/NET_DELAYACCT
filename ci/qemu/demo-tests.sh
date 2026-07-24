@@ -1,15 +1,31 @@
-#!/bin/bash
+#!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # demo-tests.sh — get_sockdelays visualization + stress demos
 #
 # Expected to be called from guest-init.sh with basic mounts already set up.
-# Output goes to stdout (captured by guest-init's redirection to result file).
+# Output goes to stdout (captured by guest-init's tee to result file).
+# NOTE: uses POSIX sh only — initramfs has busybox, no bash.
 
 log() { echo "$*"; }
 
 export PATH=/usr/local/bin:/usr/bin:/bin:/sbin
 export GET_SOCKDELAYS=/usr/local/bin/get_sockdelays
+
+# --- Pre-flight checks: confirm tools exist before running demos ---
+log ""
+log "=== demo-tests.sh pre-flight checks ==="
+log "shell: $(readlink /proc/$$/exe 2>/dev/null || echo sh)"
+log "get_sockdelays: $([ -x /usr/local/bin/get_sockdelays ] && echo OK || echo MISSING)"
+log "iperf3: $(command -v iperf3 2>/dev/null || echo MISSING)"
+log "nc: $(command -v nc 2>/dev/null || echo MISSING)"
+log "busybox: $(command -v busybox 2>/dev/null || echo MISSING)"
+
+# If get_sockdelays is missing, abort early with a clear message
+if [ ! -x /usr/local/bin/get_sockdelays ]; then
+	log "FATAL: get_sockdelays not found, aborting demos"
+	exit 1
+fi
 
 # ============================================================================
 # Visualization Demo — get_sockdelays 工具功能演示

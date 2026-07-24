@@ -138,20 +138,25 @@ RESULT_FILE="/root/test-output.txt"
 
     echo ""
     echo "=== Running visualization + stress demos ==="
+    echo "  demo-tests.sh exists: $([ -f /opt/demo-tests.sh ] && echo yes || echo no)"
+    echo "  demo-tests.sh executable: $([ -x /opt/demo-tests.sh ] && echo yes || echo no)"
+    echo "  sh available: $(command -v sh)"
+    echo "  iperf3 available: $(command -v iperf3 2>/dev/null || echo no)"
+    echo "  nc available: $(command -v nc 2>/dev/null || echo no)"
     if [ -x "/opt/demo-tests.sh" ]; then
         set +e
-        timeout 120 bash /opt/demo-tests.sh 2>&1
+        timeout 120 sh /opt/demo-tests.sh 2>&1
         rc=$?
         set -e
         if [ "$rc" -eq 124 ]; then
             echo "  (demos timed out after 120s)"
         elif [ "$rc" -ne 0 ]; then
-            echo "  (demos completed with warnings, rc=$rc)"
+            echo "  (demos exited with rc=$rc)"
         else
             echo "  (demos completed successfully)"
         fi
     else
-        echo "  (demo-tests.sh not found, skipping)"
+        echo "  (demo-tests.sh not found or not executable, skipping)"
     fi
 
     echo ""
