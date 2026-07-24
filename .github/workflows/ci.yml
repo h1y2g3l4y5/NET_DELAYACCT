@@ -115,6 +115,26 @@ jobs:
             echo "No patches to apply."
             exit 0
           fi
+
+          # Fix xxx placeholder line numbers using actual kernel source
+          for p in "${patches[@]}"; do
+            if ! grep -q 'xxx' "$p" 2>/dev/null; then
+              continue
+            fi
+            echo "Fixing placeholder line numbers in $(basename "$p")"
+            if [[ "$p" == *"Kconfig"* ]]; then
+              LINE=$(grep -n "config NET_RX_BUSY_POLL" net/Kconfig | head -1 | cut -d: -f1)
+              START=$((LINE - 8))
+              sed -i "s|@@ -xxx,6 +xxx,23 @@|@@ -${START},6 +${START},23 @@|" "$p"
+              echo "  Kconfig: NET_RX_BUSY_POLL at line $LINE, hunk start=$START"
+            elif [[ "$p" == *"Makefile"* ]]; then
+              LINE=$(grep -n "CONFIG_FAILOVER" net/core/Makefile | head -1 | cut -d: -f1)
+              START=$((LINE - 3))
+              sed -i "s|@@ -xxx,6 +xxx,7 @@|@@ -${START},6 +${START},7 @@|" "$p"
+              echo "  Makefile: FAILOVER at line $LINE, hunk start=$START"
+            fi
+          done
+
           for p in "${patches[@]}"; do
             echo "Applying $p"
             git apply "$p" || patch -p1 < "$p"
