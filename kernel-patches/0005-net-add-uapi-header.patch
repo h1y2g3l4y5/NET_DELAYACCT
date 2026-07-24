@@ -14,7 +14,6 @@ Signed-off-by: h1y2g3l4y5 <h1y2g3l4y5@example.com>
 
 diff --git a/include/uapi/linux/net-delayacct.h b/include/uapi/linux/net-delayacct.h
 new file mode 100644
-index 000000000000..000000000000
 --- /dev/null
 +++ b/include/uapi/linux/net-delayacct.h
 @@ -0,0 +1,64 @@

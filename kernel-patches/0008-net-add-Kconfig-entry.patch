@@ -13,7 +13,6 @@ Signed-off-by: h1y2g3l4y5 <h1y2g3l4y5@example.com>
  1 file changed, 17 insertions(+)
 
 diff --git a/net/Kconfig b/net/Kconfig
-index 000000000000..000000000000
 --- a/net/Kconfig
 +++ b/net/Kconfig
 @@ -xxx,6 +xxx,23 @@

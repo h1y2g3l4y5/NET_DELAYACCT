@@ -12,7 +12,6 @@ Signed-off-by: h1y2g3l4y5 <h1y2g3l4y5@example.com>
  1 file changed, 1 insertion(+)
 
 diff --git a/net/core/Makefile b/net/core/Makefile
-index 000000000000..000000000000
 --- a/net/core/Makefile
 +++ b/net/core/Makefile
 @@ -xxx,6 +xxx,7 @@

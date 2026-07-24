@@ -17,16 +17,15 @@ get_stats/reset helpers declared in include/net/net-delayacct.h.
 
 Signed-off-by: h1y2g3l4y5 <h1y2g3l4y5@example.com>
 ---
- net/core/net-delayacct.c | 661 +++++++++++++++++++++++++++++++++++++++
+ net/core/net-delayacct.c | 660 +++++++++++++++++++++++++++++++++++++++
  1 file changed, 661 insertions(+)
  create mode 100644 net/core/net-delayacct.c
 
 diff --git a/net/core/net-delayacct.c b/net/core/net-delayacct.c
 new file mode 100644
-index 000000000000..000000000000
 --- /dev/null
 +++ b/net/core/net-delayacct.c
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,660 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* Copyright (c) 2026 h1y2g3l4y5 */
 +/*
