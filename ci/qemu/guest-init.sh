@@ -17,8 +17,8 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo "=== QEMU guest boot: $(date -u) ==="
 
-# Watchdog: force poweroff after 120s to prevent CI hang if any step blocks
-( sleep 120; echo "WATCHDOG: forcing poweroff after 120s timeout"; poweroff -f ) &
+# Watchdog: force poweroff after 300s to prevent CI hang (demos take ~2-3 min)
+( sleep 300; echo "WATCHDOG: forcing poweroff after 300s timeout"; poweroff -f ) &
 WATCHDOG_PID=$!
 
 # --- Mount essential filesystems (idempotent — skip if already mounted) ---
@@ -136,8 +136,26 @@ RESULT_FILE="/root/test-output.txt"
 		echo "ERROR: test directory $TEST_ROOT not found"
 	fi
 
-	echo ""
-	echo "=== Test run finished: $(date -u) ==="
+    echo ""
+    echo "=== Running visualization + stress demos ==="
+    if [ -x "/opt/demo-tests.sh" ]; then
+        set +e
+        timeout 120 bash /opt/demo-tests.sh 2>&1
+        rc=$?
+        set -e
+        if [ "$rc" -eq 124 ]; then
+            echo "  (demos timed out after 120s)"
+        elif [ "$rc" -ne 0 ]; then
+            echo "  (demos completed with warnings, rc=$rc)"
+        else
+            echo "  (demos completed successfully)"
+        fi
+    else
+        echo "  (demo-tests.sh not found, skipping)"
+    fi
+
+    echo ""
+    echo "=== Test run finished: $(date -u) ==="
 	echo ""
 	echo "=== Kernel net_delayacct messages (post-test) ==="
 	dmesg | grep -i "net_delayacct" || echo "  (none)"

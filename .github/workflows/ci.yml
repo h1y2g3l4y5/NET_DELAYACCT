@@ -273,6 +273,10 @@ jobs:
           cp ci/qemu/guest-init.sh /tmp/initrd/init
           chmod +x /tmp/initrd/init
 
+          # Copy demo-tests.sh for visualization + stress demos
+          cp ci/qemu/demo-tests.sh /tmp/initrd/opt/demo-tests.sh
+          chmod +x /tmp/initrd/opt/demo-tests.sh
+
           # Copy iperf3 + nc + their shared libs
           # (Remove busybox symlink first, otherwise cp follows it to /bin/busybox)
           for bin in iperf3 nc; do
