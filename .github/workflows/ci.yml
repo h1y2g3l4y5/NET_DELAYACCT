@@ -274,8 +274,10 @@ jobs:
           chmod +x /tmp/initrd/init
 
           # Copy iperf3 + nc + their shared libs
+          # (Remove busybox symlink first, otherwise cp follows it to /bin/busybox)
           for bin in iperf3 nc; do
-            b=$(which "$bin")
+            b=$(which "$bin") || { echo "WARNING: $bin not found, skipping"; continue; }
+            rm -f "/tmp/initrd/bin/$bin"
             cp "$b" "/tmp/initrd/bin/$bin"
             for lib in $(ldd "$b" 2>/dev/null | grep -oP '/\S+'); do
               mkdir -p "/tmp/initrd/$(dirname "$lib")"
