@@ -19,7 +19,7 @@ index 000000000000..000000000000
 @@ -xxx,6 +xxx,23 @@
  	  recommended to enable this feature for faster loadable module
  	  support.
- 
+
 +config NET_DELAYACCT
 +	bool "Per-socket network delay accounting"
 +	depends on NET

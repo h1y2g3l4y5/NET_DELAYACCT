@@ -16,7 +16,7 @@ index 000000000000..000000000000
 --- a/net/core/Makefile
 +++ b/net/core/Makefile
 @@ -xxx,6 +xxx,7 @@
- 
+
  obj-$(CONFIG_DST_CACHE) += dst_cache.o
  obj-$(CONFIG_GRO_CELLS) += gro_cells.o
 +obj-$(CONFIG_NET_DELAYACCT) += net-delayacct.o
