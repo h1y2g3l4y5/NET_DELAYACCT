@@ -159,7 +159,7 @@ RESULT_FILE="/root/test-output.txt"
 	echo ""
 	echo "=== Kernel net_delayacct messages (post-test) ==="
 	dmesg | grep -i "net_delayacct" || echo "  (none)"
-} > "$RESULT_FILE" 2>&1
+} 2>&1 | tee "$RESULT_FILE"
 
 # --- Sync and power off ---
 # Kill the watchdog since we finished normally
