@@ -1,4 +1,4 @@
-# CI workflow for NET_DELAYACCT
+﻿# CI workflow for NET_DELAYACCT
 # This is the canonical CI file. GitHub Actions reads from .github/workflows/.
 name: net-delayacct-ci
 
@@ -374,7 +374,7 @@ jobs:
             echo "**Result: ${PASS} PASS, ${FAIL} FAIL**"
           } >> "$GITHUB_STEP_SUMMARY"
           tail -300 /tmp/qemu.log > /tmp/viz-summary.txt 2>/dev/null || true
-echo "Step summary updated with QEMU output"
+          echo "Step summary updated with QEMU output"
 
       - name: Upload visualization summary
         if: always()
