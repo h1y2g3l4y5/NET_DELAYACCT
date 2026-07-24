@@ -330,3 +330,26 @@ jobs:
             echo "::error::Tests FAILED"
             exit 1
           fi
+
+      - name: Upload QEMU log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-log
+          path: /tmp/qemu.log
+          retention-days: 7
+
+      - name: Generate visualization summary
+        if: always()
+        run: |
+          sed -n '/^=== QEMU Test Run/,/^=== Kernel net_delayacct/p' /tmp/qemu.log > /tmp/viz-summary.txt 2>/dev/null || true
+          grep -E '\[PASS\]|\[FAIL\]|\[SKIP\]' /tmp/qemu.log >> /tmp/viz-summary.txt 2>/dev/null || true
+          echo "Visualization summary: $(wc -l < /tmp/viz-summary.txt) lines"
+
+      - name: Upload visualization summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visualization-summary
+          path: /tmp/viz-summary.txt
+          retention-days: 30
