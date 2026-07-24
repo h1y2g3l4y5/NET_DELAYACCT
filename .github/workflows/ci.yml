@@ -306,9 +306,9 @@ jobs:
 
           echo "Initramfs built: $(du -sh /tmp/initrd.img | cut -f1)"
 
-          # Run QEMU
+          # Run QEMU (TCG mode on GitHub runners is slow, allow 600s)
           echo "::group::QEMU boot log"
-          timeout 300 qemu-system-x86_64 \
+          timeout 600 qemu-system-x86_64 \
             -m 1024M -smp 2 \
             -kernel /tmp/artifacts/bzImage \
             -initrd /tmp/initrd.img \
@@ -322,8 +322,21 @@ jobs:
           sed -n '/^=== QEMU Test Run/,/^=== Kernel net_delayacct/p' /tmp/qemu.log || echo "(no results section found)"
           grep -E '\[PASS\]|\[FAIL\]|\[SKIP\]' /tmp/qemu.log || echo "(no pass/fail lines found)"
           echo "=================================="
+
+          # Visualization demos — extracted separately, NOT inside a group
+          # so they are visible directly in the CI log without expanding.
           echo ""
-          echo "=== QEMU boot tail ==="
+          echo "########## VISUALIZATION DEMOS ##########"
+          if grep -q 'demo-tests.sh pre-flight checks' /tmp/qemu.log 2>/dev/null; then
+            sed -n '/demo-tests.sh pre-flight checks/,/可视化演示结束/p' /tmp/qemu.log || true
+          else
+            echo "(WARNING: demo-tests.sh did not run — check QEMU boot log for errors)"
+            echo "(Possible causes: QEMU timeout, init script crash, missing tools)"
+          fi
+          echo "########## END VISUALIZATION DEMOS ##########"
+
+          echo ""
+          echo "=== QEMU boot tail (last 30 lines) ==="
           tail -30 /tmp/qemu.log
 
           # Exit with failure if any FAIL found

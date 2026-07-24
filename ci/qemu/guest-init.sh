@@ -17,8 +17,8 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo "=== QEMU guest boot: $(date -u) ==="
 
-# Watchdog: force poweroff after 300s to prevent CI hang (demos take ~2-3 min)
-( sleep 300; echo "WATCHDOG: forcing poweroff after 300s timeout"; poweroff -f ) &
+# Watchdog: force poweroff after 540s to prevent CI hang (TCG mode is slow)
+( sleep 540; echo "WATCHDOG: forcing poweroff after 540s timeout"; poweroff -f ) &
 WATCHDOG_PID=$!
 
 # --- Mount essential filesystems (idempotent — skip if already mounted) ---

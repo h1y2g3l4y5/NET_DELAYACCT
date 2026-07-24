@@ -76,9 +76,9 @@ iperf3 -s -p "$TCP_PORT" >/dev/null 2>&1 &
 TCP_PID=$!
 sleep 1
 if kill -0 "$TCP_PID" 2>/dev/null; then
-	iperf3 -c 127.0.0.1 -p "$TCP_PORT" -t 5 >/dev/null 2>&1 &
+	iperf3 -c 127.0.0.1 -p "$TCP_PORT" -t 2 >/dev/null 2>&1 &
 	CLIENT_PID=$!
-	sleep 2
+	sleep 1
 	log "# 服务端 pid=$TCP_PID（拥有监听 socket + 已连接 socket）"
 	log "$ get_sockdelays -p $TCP_PID"
 	/usr/local/bin/get_sockdelays -p "$TCP_PID" 2>&1
@@ -103,9 +103,9 @@ iperf3 -s -p "$UDP_PORT" >/dev/null 2>&1 &
 UDP_PID=$!
 sleep 1
 if kill -0 "$UDP_PID" 2>/dev/null; then
-	iperf3 -c 127.0.0.1 -p "$UDP_PORT" -u -t 10 -b 100M >/dev/null 2>&1 &
+	iperf3 -c 127.0.0.1 -p "$UDP_PORT" -u -t 2 -b 50M >/dev/null 2>&1 &
 	UDP_CLIENT=$!
-	sleep 2
+	sleep 1
 	log "# 服务端 pid=$UDP_PID（同时有 proto=tcp 控制连接 和 proto=udp 数据连接）"
 	log "$ get_sockdelays -p $UDP_PID"
 	/usr/local/bin/get_sockdelays -p "$UDP_PID" 2>&1
@@ -160,9 +160,9 @@ iperf3 -s -p "$JSON_PORT" >/dev/null 2>&1 &
 JSON_PID=$!
 sleep 1
 if kill -0 "$JSON_PID" 2>/dev/null; then
-	iperf3 -c 127.0.0.1 -p "$JSON_PORT" -t 5 >/dev/null 2>&1 &
+	iperf3 -c 127.0.0.1 -p "$JSON_PORT" -t 2 >/dev/null 2>&1 &
 	JSON_CLIENT=$!
-	sleep 2
+	sleep 1
 	log "$ get_sockdelays -j -p $JSON_PID"
 	/usr/local/bin/get_sockdelays -j -p "$JSON_PID" 2>&1
 	kill "$JSON_CLIENT" 2>/dev/null || true
@@ -210,7 +210,7 @@ log "# [Demo 9] 真实场景：TCP 连接百度网站 (www.baidu.com:80)"
 if [ "$EXTERNAL_NET" = "1" ]; then
 	(sleep 8) | nc www.baidu.com 80 >/dev/null 2>&1 &
 	BAIDU_PID=$!
-	sleep 2
+	sleep 1
 	if kill -0 "$BAIDU_PID" 2>/dev/null; then
 		log "$ get_sockdelays -p $BAIDU_PID"
 		/usr/local/bin/get_sockdelays -p "$BAIDU_PID" 2>&1
@@ -243,7 +243,7 @@ if [ "$EXTERNAL_NET" = "1" ]; then
 		log "# DNS 解析: www.bilibili.com → $BILI_IP"
 		(sleep 8) | nc -u -w 10 "$BILI_IP" 443 >/dev/null 2>&1 &
 		BILI_PID=$!
-		sleep 3
+		sleep 2
 		if kill -0 "$BILI_PID" 2>/dev/null; then
 			log "$ get_sockdelays -p $BILI_PID"
 			/usr/local/bin/get_sockdelays -p "$BILI_PID" 2>&1
@@ -253,9 +253,9 @@ if [ "$EXTERNAL_NET" = "1" ]; then
 			iperf3 -s -p "$UDP_FB_PORT" >/dev/null 2>&1 &
 			UDP_FB_PID=$!
 			sleep 1
-			iperf3 -c 127.0.0.1 -p "$UDP_FB_PORT" -u -t 5 -b 50M >/dev/null 2>&1 &
+			iperf3 -c 127.0.0.1 -p "$UDP_FB_PORT" -u -t 2 -b 50M >/dev/null 2>&1 &
 			UDP_FB_CLI=$!
-			sleep 2
+			sleep 1
 			log "# iperf3 -u 模拟视频流（50Mbps, 5s），服务端 pid=$UDP_FB_PID"
 			log "$ get_sockdelays -p $UDP_FB_PID"
 			/usr/local/bin/get_sockdelays -p "$UDP_FB_PID" 2>&1
@@ -290,9 +290,9 @@ iperf3 -s -p "$STRESS_PORT" >/dev/null 2>&1 &
 STRESS_PID=$!
 sleep 1
 if kill -0 "$STRESS_PID" 2>/dev/null; then
-	iperf3 -c 127.0.0.1 -p "$STRESS_PORT" -P 6 -t 3 >/dev/null 2>&1 &
+	iperf3 -c 127.0.0.1 -p "$STRESS_PORT" -P 6 -t 2 >/dev/null 2>&1 &
 	STRESS_CLI=$!
-	sleep 2
+	sleep 1
 	log "# 执行命令：iperf3 -P 6（6 条并行 TCP 连接到服务端 pid=$STRESS_PID）"
 	log "$ get_sockdelays -p $STRESS_PID"
 	/usr/local/bin/get_sockdelays -p "$STRESS_PID" 2>&1
@@ -318,9 +318,9 @@ iperf3 -s -p "$BIG_PORT" >/dev/null 2>&1 &
 BIG_SERV=$!
 sleep 1
 if kill -0 "$BIG_SERV" 2>/dev/null; then
-	iperf3 -c 127.0.0.1 -p "$BIG_PORT" -P 3 -t 5 >/dev/null 2>&1 &
+	iperf3 -c 127.0.0.1 -p "$BIG_PORT" -P 3 -t 2 >/dev/null 2>&1 &
 	BIG_CLI=$!
-	sleep 4
+	sleep 2
 	log "# 执行命令：iperf3 -P 3 -t 5（3 条并行 TCP 流 × 5 秒，不限带宽）"
 	log "# 客户端 pid=$BIG_CLI（3 个数据 socket 同时发送）："
 	log "$ get_sockdelays -p $BIG_CLI"
@@ -353,11 +353,11 @@ iperf3 -s -p "$MIX_PORT_UDP" >/dev/null 2>&1 &
 MIX_UDP_PID=$!
 sleep 1
 if kill -0 "$MIX_TCP_PID" 2>/dev/null && kill -0 "$MIX_UDP_PID" 2>/dev/null; then
-	iperf3 -c 127.0.0.1 -p "$MIX_PORT_TCP" -P 5 -t 3 >/dev/null 2>&1 &
+	iperf3 -c 127.0.0.1 -p "$MIX_PORT_TCP" -P 5 -t 2 >/dev/null 2>&1 &
 	MIX_TCP_CLI=$!
-	iperf3 -c 127.0.0.1 -p "$MIX_PORT_UDP" -u -t 3 -b 50M >/dev/null 2>&1 &
+	iperf3 -c 127.0.0.1 -p "$MIX_PORT_UDP" -u -t 2 -b 50M >/dev/null 2>&1 &
 	MIX_UDP_CLI=$!
-	sleep 2
+	sleep 1
 	log "# TCP 服务端 pid=$MIX_TCP_PID（iperf3 -P 5：1 监听 + 5 数据）："
 	log "$ get_sockdelays -p $MIX_TCP_PID"
 	/usr/local/bin/get_sockdelays -p "$MIX_TCP_PID" 2>&1
