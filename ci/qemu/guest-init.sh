@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Guest init script — runs inside the QEMU VM.
@@ -100,7 +100,7 @@ RESULT_FILE="/root/test-output.txt"
 			if [ -f "$TEST_ROOT/test_netdelayacct.sh" ]; then
 				echo "--- Running test_netdelayacct.sh ---"
 				set +e
-				timeout 30 bash "$TEST_ROOT/test_netdelayacct.sh" 2>&1
+				timeout 30 sh "$TEST_ROOT/test_netdelayacct.sh" 2>&1
 				rc=$?
 				set -e
 				if [ "$rc" -eq 4 ]; then
@@ -117,7 +117,7 @@ RESULT_FILE="/root/test-output.txt"
 					if [ -f "$t" ]; then
 						echo "--- Running $(basename "$t") ---"
 						set +e
-						timeout 30 bash "$t" 2>&1
+						timeout 30 sh "$t" 2>&1
 						rc=$?
 						set -e
 						if [ "$rc" -eq 4 ]; then
