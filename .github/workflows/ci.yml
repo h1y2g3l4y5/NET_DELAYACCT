@@ -308,7 +308,7 @@ jobs:
 
           # Run QEMU (TCG mode on GitHub runners is slow, allow 600s)
           echo "::group::QEMU boot log"
-          timeout 600 qemu-system-x86_64 \
+          timeout 900 qemu-system-x86_64 \
             -m 1024M -smp 2 \
             -kernel /tmp/artifacts/bzImage \
             -initrd /tmp/initrd.img \
@@ -356,9 +356,25 @@ jobs:
       - name: Generate visualization summary
         if: always()
         run: |
-          sed -n '/^=== QEMU Test Run/,/^=== Kernel net_delayacct/p' /tmp/qemu.log > /tmp/viz-summary.txt 2>/dev/null || true
-          grep -E '\[PASS\]|\[FAIL\]|\[SKIP\]' /tmp/qemu.log >> /tmp/viz-summary.txt 2>/dev/null || true
-          echo "Visualization summary: $(wc -l < /tmp/viz-summary.txt) lines"
+          {
+            echo "## QEMU Test Output"
+            echo ""
+            echo "### First 30 lines (boot start)"
+            echo '```'
+            head -30 /tmp/qemu.log 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "### Last 300 lines (init + tests + demos)"
+            echo '```'
+            tail -300 /tmp/qemu.log 2>/dev/null || true
+            echo '```'
+            echo ""
+            PASS=$(grep -c '\[PASS\]' /tmp/qemu.log 2>/dev/null || true)
+            FAIL=$(grep -c '\[FAIL\]' /tmp/qemu.log 2>/dev/null || true)
+            echo "**Result: ${PASS} PASS, ${FAIL} FAIL**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          tail -300 /tmp/qemu.log > /tmp/viz-summary.txt 2>/dev/null || true
+echo "Step summary updated with QEMU output"
 
       - name: Upload visualization summary
         if: always()
