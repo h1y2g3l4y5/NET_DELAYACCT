@@ -216,7 +216,7 @@ jobs:
     runs-on: self-hosted
     needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -230,28 +230,9 @@ jobs:
 
       - name: Setup KVM acceleration
         run: |
-          set -e
-          echo "=== CPU virtualization info ==="
-          grep -E 'vmx|svm|hypervisor' /proc/cpuinfo | head -5 || echo "  (no vmx/svm flags found)"
-
-          echo ""
-          echo "=== Loading KVM modules ==="
-          sudo modprobe kvm 2>/dev/null || echo "  (kvm already loaded or not available)"
-          sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || echo "  (kvm_intel/amd not available, nested virt may be disabled)"
-
-          echo ""
-          echo "=== /dev/kvm status ==="
-          ls -la /dev/kvm 2>/dev/null || echo "  /dev/kvm does not exist"
-
-          if [ -e /dev/kvm ]; then
-            KVM_GROUP=$(stat -c '%G' /dev/kvm 2>/dev/null || echo "kvm")
-            echo "  /dev/kvm group: $KVM_GROUP, perms: $(stat -c '%a' /dev/kvm)"
-            # Ensure the current user can access /dev/kvm
-            sudo chmod 666 /dev/kvm 2>/dev/null || true
-            echo "  /dev/kvm permissions set to 666"
-          else
-            echo "::warning::KVM not available on this runner. QEMU will be very slow."
-          fi
+          echo "=== QEMU acceleration detection ==="
+          ls -la /dev/kvm 2>/dev/null && echo "  /dev/kvm: exists" || echo "  /dev/kvm: not found"
+          grep -Ec 'vmx|svm' /proc/cpuinfo 2>/dev/null && echo "  CPU: hardware virtualization supported" || echo "  CPU: no vmx/svm (nested virt disabled)"
 
       - name: Download bzImage artifact
         uses: actions/download-artifact@v4
@@ -334,10 +315,20 @@ jobs:
 
           echo "Initramfs built: $(du -sh /tmp/initrd.img | cut -f1)"
 
-          # Run QEMU with KVM acceleration (self-hosted runner has /dev/kvm)
+          # Run QEMU — prefer KVM, fall back to TCG if /dev/kvm unavailable
           echo "::group::QEMU boot log"
-          timeout 300 qemu-system-x86_64 \
-            -machine q35,accel=kvm \
+          if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
+            QEMU_ACCEL="kvm"
+            QEMU_TO=300
+            echo "QEMU mode: kvm (timeout=${QEMU_TO}s)"
+          else
+            QEMU_ACCEL="tcg"
+            QEMU_TO=600
+            echo "QEMU mode: tcg — /dev/kvm not available (timeout=${QEMU_TO}s)"
+          fi
+
+          timeout $QEMU_TO qemu-system-x86_64 \
+            -machine q35,accel=$QEMU_ACCEL \
             -m 1024M -smp 2 \
             -kernel /tmp/artifacts/bzImage \
             -initrd /tmp/initrd.img \
