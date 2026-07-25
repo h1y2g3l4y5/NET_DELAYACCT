@@ -315,25 +315,30 @@ jobs:
 
           echo "Initramfs built: $(du -sh /tmp/initrd.img | cut -f1)"
 
-          # Run QEMU — prefer KVM, fall back to TCG if /dev/kvm unavailable
+          # Run QEMU — try KVM first, retry with TCG if KVM init fails.
+          # /dev/kvm may exist as a device node even when the kernel module
+          # isn't loaded, so we detect the real failure by grepping QEMU stderr.
           echo "::group::QEMU boot log"
-          if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
-            QEMU_ACCEL="kvm"
-            QEMU_TO=300
-            echo "QEMU mode: kvm (timeout=${QEMU_TO}s)"
-          else
-            QEMU_ACCEL="tcg"
-            QEMU_TO=600
-            echo "QEMU mode: tcg — /dev/kvm not available (timeout=${QEMU_TO}s)"
-          fi
 
-          timeout $QEMU_TO qemu-system-x86_64 \
-            -machine q35,accel=$QEMU_ACCEL \
-            -m 1024M -smp 2 \
+          echo "QEMU attempt 1: kvm (timeout=300s)"
+          timeout 300 qemu-system-x86_64 \
+            -machine q35,accel=kvm -m 1024M -smp 2 \
             -kernel /tmp/artifacts/bzImage \
             -initrd /tmp/initrd.img \
             -append "console=ttyS0,115200n8 init=/init" \
             -nographic -no-reboot 2>&1 | tee /tmp/qemu.log || true
+
+          if grep -qE 'Could not access KVM|failed to initialize kvm' /tmp/qemu.log 2>/dev/null; then
+            echo ""
+            echo "KVM unavailable — retrying with TCG (timeout=600s)..."
+            timeout 600 qemu-system-x86_64 \
+              -machine q35,accel=tcg -m 1024M -smp 2 \
+              -kernel /tmp/artifacts/bzImage \
+              -initrd /tmp/initrd.img \
+              -append "console=ttyS0,115200n8 init=/init" \
+              -nographic -no-reboot 2>&1 | tee /tmp/qemu.log || true
+          fi
+
           echo "::endgroup::"
 
           # Extract structured test results from QEMU log
@@ -348,9 +353,18 @@ jobs:
           echo "=== QEMU boot tail (last 30 lines) ==="
           tail -30 /tmp/qemu.log
 
-          # Exit with failure if any FAIL found
-          if grep -q '\[FAIL\]' /tmp/qemu.log 2>/dev/null; then
-            echo "::error::Tests FAILED"
+          # Exit with failure if any FAIL found, or if NO tests ran at all
+          PASS_N=$(grep -c '\[PASS\]' /tmp/qemu.log 2>/dev/null || echo 0)
+          FAIL_N=$(grep -c '\[FAIL\]' /tmp/qemu.log 2>/dev/null || echo 0)
+          SKIP_N=$(grep -c '\[SKIP\]' /tmp/qemu.log 2>/dev/null || echo 0)
+
+          if [ "$FAIL_N" -gt 0 ]; then
+            echo "::error::Tests FAILED (${PASS_N}P/${FAIL_N}F/${SKIP_N}S)"
+            exit 1
+          fi
+
+          if [ "$PASS_N" -eq 0 ] && [ "$FAIL_N" -eq 0 ] && [ "$SKIP_N" -eq 0 ]; then
+            echo "::error::No tests executed — QEMU likely failed to boot"
             exit 1
           fi
 
