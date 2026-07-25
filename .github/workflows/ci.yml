@@ -213,10 +213,10 @@ jobs:
 
   qemu-test:
     name: QEMU runtime test (KVM)
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
