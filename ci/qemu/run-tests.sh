@@ -225,15 +225,25 @@ if _require iperf3; then
 	_SRV=$!
 	sleep 1
 	if kill -0 "$_SRV" 2>/dev/null; then
-		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -u -t 5 -b 10M >/dev/null 2>&1 || true
+		# 客户端必须后台运行 (&)，否则同步阻塞 5s 后 UDP socket 已被清理
+		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -u -t 5 -b 10M >/dev/null 2>&1 &
+		_CLI=$!
 		sleep 2
-		OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
-		UDP_LINES=$(echo "$OUT" | grep -c 'proto=udp' || true)
-
-		if [ "$UDP_LINES" -ge 1 ]; then
-			_pass "proto=udp found ($UDP_LINES socket(s))"
+		if kill -0 "$_CLI" 2>/dev/null; then
+			# 同时查客户端和服务端，UDP 可能只在其中一侧可见
+			SRV_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+			CLI_OUT=$("$GET_SOCKDELAYS" -p "$_CLI" 2>&1 || true)
+			SRV_UDP=$(echo "$SRV_OUT" | grep -c 'proto=udp' || true)
+			CLI_UDP=$(echo "$CLI_OUT" | grep -c 'proto=udp' || true)
+			TOTAL_UDP=$((SRV_UDP + CLI_UDP))
+			if [ "$TOTAL_UDP" -ge 1 ]; then
+				_pass "proto=udp found (server=$SRV_UDP, client=$CLI_UDP)"
+			else
+				_fail "no proto=udp in output (server=$SRV_UDP, client=$CLI_UDP)"
+			fi
+			_kill "$_CLI"
 		else
-			_fail "no proto=udp in output"
+			_fail "iperf3 UDP client exited before query"
 		fi
 		_kill "$_SRV"
 	else
@@ -415,15 +425,17 @@ if _require iperf3; then
 		_CLI=$!
 		sleep 2
 		if kill -0 "$_CLI" 2>/dev/null; then
-			OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
-			# 最大 RX count 应 >= 100（大流量）
-			MAX_RX=$(echo "$OUT" | awk '/RX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
-			MAX_TX=$(echo "$OUT" | awk '/TX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
+			# TCP 大流量：server 侧 RX 高（接收数据），client 侧 TX 高（发送数据）
+			# 只查一侧必然有一方计数极低（server TX=ACK，client RX=ACK）
+			SRV_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+			CLI_OUT=$("$GET_SOCKDELAYS" -p "$_CLI" 2>&1 || true)
+			MAX_SRV_RX=$(echo "$SRV_OUT" | awk '/RX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
+			MAX_CLI_TX=$(echo "$CLI_OUT" | awk '/TX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
 
-			if [ "${MAX_RX:-0}" -ge 100 ] && [ "${MAX_TX:-0}" -ge 100 ]; then
-				_pass "max RX=$MAX_RX, max TX=$MAX_TX (both >=100)"
+			if [ "${MAX_SRV_RX:-0}" -ge 100 ] && [ "${MAX_CLI_TX:-0}" -ge 100 ]; then
+				_pass "server RX=$MAX_SRV_RX, client TX=$MAX_CLI_TX (both >=100)"
 			else
-				_fail "max RX=$MAX_RX, max TX=$MAX_TX (expect >=100)"
+				_fail "server RX=$MAX_SRV_RX, client TX=$MAX_CLI_TX (expect >=100)"
 			fi
 			_kill "$_CLI"
 		else
