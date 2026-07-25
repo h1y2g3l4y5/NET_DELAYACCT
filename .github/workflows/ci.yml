@@ -288,7 +288,7 @@ jobs:
           if [ -f /bin/bash ]; then
             cp /bin/bash /tmp/initrd/bin/bash
             chmod +x /tmp/initrd/bin/bash
-            for lib in $(ldd /bin/bash 2>/dev/null | grep -oP '/\S+'); do
+            for lib in $(ldd /bin/bash 2>/dev/null | grep -o '/[^ ]*' || true); do
               mkdir -p "/tmp/initrd/$(dirname "$lib")"
               cp "$lib" "/tmp/initrd$lib" 2>/dev/null || true
             done
@@ -312,14 +312,14 @@ jobs:
             b=$(which "$bin") || { echo "WARNING: $bin not found, skipping"; continue; }
             rm -f "/tmp/initrd/bin/$bin"
             cp "$b" "/tmp/initrd/bin/$bin"
-            for lib in $(ldd "$b" 2>/dev/null | grep -oP '/\S+'); do
+            for lib in $(ldd "$b" 2>/dev/null | grep -o '/[^ ]*' || true); do
               mkdir -p "/tmp/initrd/$(dirname "$lib")"
               cp "$lib" "/tmp/initrd$lib" 2>/dev/null || true
             done
           done
 
           # Copy get_sockdelays shared libs + dynamic linker
-          for lib in $(ldd /tmp/artifacts/get_sockdelays 2>/dev/null | grep -oP '/\S+'); do
+          for lib in $(ldd /tmp/artifacts/get_sockdelays 2>/dev/null | grep -o '/[^ ]*' || true); do
             mkdir -p "/tmp/initrd/$(dirname "$lib")"
             cp "$lib" "/tmp/initrd$lib" 2>/dev/null || true
           done
@@ -348,13 +348,7 @@ jobs:
           # Extract structured test results from QEMU log
           echo ""
           echo "========== TEST RESULTS SUMMARY =========="
-          sed -n '/NET_DELAYACCT Unified Test Suite/,/NET_DELAYACCT Test Results/{
-            /NET_DELAYACCT Test Results/{
-              N;N;N;N;N;N;N;N;N;N
-              p
-              q
-            }
-          }' /tmp/qemu.log || echo "(no results box found)"
+          grep -A6 "NET_DELAYACCT Test Results" /tmp/qemu.log || echo "(no results box found)"
           echo ""
           grep -E '\[PASS\]|\[FAIL\]|\[SKIP\]' /tmp/qemu.log || echo "(no pass/fail lines found)"
           echo "==========================================="
