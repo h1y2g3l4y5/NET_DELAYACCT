@@ -67,6 +67,34 @@ _kill() {
 	wait "$1" 2>/dev/null || true
 }
 
+# 失败诊断：打印 get_sockdelays 输出 + 进程状态 + 协议/计数摘要
+_show_output() {
+	local label="${1:-get_sockdelays output}"
+	local data="${2:-}"
+	local pid="${3:-}"
+
+	echo "    ┌── $label ──────────────────────────────"
+	if [ -n "$data" ]; then
+		echo "$data" | sed 's/^/    │ /'
+	else
+		echo "    │ (empty output)"
+	fi
+	local tcp=$(echo "$data" | grep -c 'proto=tcp' || true)
+	local udp=$(echo "$data" | grep -c 'proto=udp' || true)
+	local lines=$(echo "$data" | grep -c 'proto=' || true)
+	local rx_sum=$(echo "$data" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
+	local tx_sum=$(echo "$data" | awk '/TX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
+	echo "    │ summary: lines=$lines (tcp=$tcp udp=$udp) rx_sum=$rx_sum tx_sum=$tx_sum"
+	if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+		if kill -0 "$pid" 2>/dev/null; then
+			echo "    │ PID $pid: alive"
+		else
+			echo "    │ PID $pid: not running (exited)"
+		fi
+	fi
+	echo "    └──────────────────────────────────────────"
+}
+
 # ============================================================
 # 测试开始
 # ============================================================
@@ -105,6 +133,7 @@ if _require iperf3; then
 			if [ "$DATA_LINES" -ge 1 ] && [ "$HAS_TCP" -ge 1 ]; then
 				_pass "data_lines=$DATA_LINES, proto=tcp found"
 			else
+				_show_output "get_sockdelays -p $_CLI" "$OUT" "$_CLI"
 				_fail "data_lines=$DATA_LINES, proto=tcp=$HAS_TCP"
 			fi
 			_kill "$_CLI"
@@ -140,6 +169,7 @@ if _require nc readlink; then
 			if echo "$OUT" | grep -q "inode=$INODE"; then
 				_pass "inode=$INODE matched"
 			else
+				_show_output "get_sockdelays -i $INODE" "$OUT"
 				_fail "inode=$INODE not in output"
 			fi
 		else
@@ -177,6 +207,7 @@ if _require iperf3; then
 		if [ "$NONZERO" -eq 0 ]; then
 			_pass "all counters=0 after reset (pre data=$PRE_DATA lines)"
 		else
+			_show_output "after reset (get_sockdelays -R then -p $_SRV)" "$POST" "$_SRV"
 			_fail "$NONZERO non-zero counter(s) after reset"
 		fi
 		_kill "$_SRV"
@@ -209,8 +240,9 @@ if _require iperf3; then
 				_pass "proto=tcp found ($TCP_LINES socket(s)), RX=0 (timing)"
 			fi
 		else
-			_fail "no proto=tcp in output"
-		fi
+				_show_output "get_sockdelays -p $_SRV" "$OUT" "$_SRV"
+				_fail "no proto=tcp in output"
+			fi
 		_kill "$_SRV"
 	else
 		_fail "iperf3 server failed to start"
@@ -239,6 +271,8 @@ if _require iperf3; then
 			if [ "$TOTAL_UDP" -ge 1 ]; then
 				_pass "proto=udp found (server=$SRV_UDP, client=$CLI_UDP)"
 			else
+				_show_output "get_sockdelays -p $_SRV (server)" "$SRV_OUT" "$_SRV"
+				_show_output "get_sockdelays -p $_CLI (client)" "$CLI_OUT" "$_CLI"
 				_fail "no proto=udp in output (server=$SRV_UDP, client=$CLI_UDP)"
 			fi
 			_kill "$_CLI"
@@ -278,6 +312,8 @@ if _require iperf3; then
 			if [ "$CLI_LINES" -ge 1 ] && [ "$SRV_LINES" -ge 6 ]; then
 				_pass "client(parent)=$CLI_LINES, server=$SRV_LINES sockets"
 			else
+				_show_output "get_sockdelays -p $_CLI (client parent)" "$CLI_OUT" "$_CLI"
+				_show_output "get_sockdelays -p $_SRV (server)" "$SRV_OUT" "$_SRV"
 				_fail "client(parent)=$CLI_LINES (expect>=1), server=$SRV_LINES (expect>=6)"
 			fi
 			_kill "$_CLI"
@@ -318,6 +354,7 @@ if _require iperf3; then
 		if [ "$HAS_PROTO" -ge 1 ] && [ "$HAS_RX" -ge 1 ]; then
 			_pass "valid JSON with proto/rx fields"
 		else
+			_show_output "get_sockdelays -j -p $_SRV" "$OUT" "$_SRV"
 			_fail "missing JSON fields (proto=$HAS_PROTO, rx=$HAS_RX)"
 		fi
 		_kill "$_CLI"
@@ -341,6 +378,7 @@ if _require nc; then
 		if [ -n "$OUT" ]; then
 			_pass "debug output produced ($(echo "$OUT" | wc -l) lines)"
 		else
+			_show_output "get_sockdelays -d -p $_NC" "$OUT"
 			_fail "debug output empty"
 		fi
 		_kill "$_NC"
@@ -401,6 +439,7 @@ if _require iperf3; then
 			if [ "$FAILS" -eq 0 ]; then
 				_pass "sockets=$SOCK_COUNT, RX=$RX_SUM packets, TX=$TX_SUM packets"
 			else
+				_show_output "get_sockdelays -p $_SRV" "$OUT" "$_SRV"
 				_fail "$FAILS check(s) failed (sockets=$SOCK_COUNT, RX=$RX_SUM, TX=$TX_SUM)"
 			fi
 			_kill "$_CLI"
@@ -435,6 +474,8 @@ if _require iperf3; then
 			if [ "${MAX_SRV_RX:-0}" -ge 100 ] && [ "${MAX_CLI_TX:-0}" -ge 100 ]; then
 				_pass "server RX=$MAX_SRV_RX, client TX=$MAX_CLI_TX (both >=100)"
 			else
+				_show_output "get_sockdelays -p $_SRV (server)" "$SRV_OUT" "$_SRV"
+				_show_output "get_sockdelays -p $_CLI (client)" "$CLI_OUT" "$_CLI"
 				_fail "server RX=$MAX_SRV_RX, client TX=$MAX_CLI_TX (expect >=100)"
 			fi
 			_kill "$_CLI"
@@ -494,6 +535,8 @@ if _require iperf3; then
 		if [ "$FAILS" -eq 0 ]; then
 			_pass "TCP(srv tcp=$TCP_TCP udp=$TCP_UDP) UDP(srv tcp=$UDP_TCP udp=$UDP_UDP)"
 		else
+			_show_output "TCP server (get_sockdelays -p $_TCP_SRV)" "$TCP_OUT" "$_TCP_SRV"
+			_show_output "UDP server (get_sockdelays -p $_UDP_SRV)" "$UDP_OUT" "$_UDP_SRV"
 			_fail "$FAILS protocol isolation check(s) failed"
 		fi
 
@@ -628,6 +671,11 @@ TOTAL=$((_TOTAL_OK + _TOTAL_FAIL))
 if [ "$_CRASH" -eq 0 ] && [ "$OOPS" -eq 0 ]; then
 	_pass "$TOTAL queries (ok=$_TOTAL_OK fail=$_TOTAL_FAIL), ${_duration}s, no oops"
 else
+	if [ "$OOPS" -gt 0 ]; then
+		echo "    ┌── dmesg oops (last 100 lines) ─────────────"
+		dmesg 2>/dev/null | tail -100 | sed 's/^/    │ /'
+		echo "    └───────────────────────────────────────────"
+	fi
 	_fail "crashed=$_CRASH workers, oops=$OOPS, queries=$TOTAL"
 fi
 
