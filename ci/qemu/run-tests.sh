@@ -359,8 +359,8 @@ if _require iperf3; then
 		if kill -0 "$_CLI" 2>/dev/null; then
 			OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 			SOCK_COUNT=$(echo "$OUT" | grep -c 'proto=tcp' || true)
-			RX_SUM=$(echo "$OUT" | grep 'RX  count=' | awk '{s+=$3} END{print s+0}')
-			TX_SUM=$(echo "$OUT" | grep 'TX  count=' | awk '{s+=$3} END{print s+0}')
+			RX_SUM=$(echo "$OUT" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
+			TX_SUM=$(echo "$OUT" | awk '/TX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
 
 			FAILS=0
 			# 预期: 1 监听 + 8 数据 = 9
@@ -413,8 +413,8 @@ if _require iperf3; then
 		if kill -0 "$_CLI" 2>/dev/null; then
 			OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 			# 最大 RX count 应 >= 100（大流量）
-			MAX_RX=$(echo "$OUT" | grep 'RX  count=' | awk '{print $3}' | sort -rn | head -1)
-			MAX_TX=$(echo "$OUT" | grep 'TX  count=' | awk '{print $3}' | sort -rn | head -1)
+			MAX_RX=$(echo "$OUT" | awk '/RX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
+			MAX_TX=$(echo "$OUT" | awk '/TX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
 
 			if [ "${MAX_RX:-0}" -ge 100 ] && [ "${MAX_TX:-0}" -ge 100 ]; then
 				_pass "max RX=$MAX_RX, max TX=$MAX_TX (both >=100)"

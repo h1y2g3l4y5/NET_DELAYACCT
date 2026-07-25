@@ -1,4 +1,4 @@
-﻿# CI workflow for NET_DELAYACCT
+# CI workflow for NET_DELAYACCT
 # This is the canonical CI file. GitHub Actions reads from .github/workflows/.
 name: net-delayacct-ci
 
@@ -227,6 +227,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio
+
+      - name: Setup KVM acceleration
+        run: |
+          set -e
+          echo "=== CPU virtualization info ==="
+          grep -E 'vmx|svm|hypervisor' /proc/cpuinfo | head -5 || echo "  (no vmx/svm flags found)"
+
+          echo ""
+          echo "=== Loading KVM modules ==="
+          sudo modprobe kvm 2>/dev/null || echo "  (kvm already loaded or not available)"
+          sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || echo "  (kvm_intel/amd not available, nested virt may be disabled)"
+
+          echo ""
+          echo "=== /dev/kvm status ==="
+          ls -la /dev/kvm 2>/dev/null || echo "  /dev/kvm does not exist"
+
+          if [ -e /dev/kvm ]; then
+            KVM_GROUP=$(stat -c '%G' /dev/kvm 2>/dev/null || echo "kvm")
+            echo "  /dev/kvm group: $KVM_GROUP, perms: $(stat -c '%a' /dev/kvm)"
+            # Ensure the current user can access /dev/kvm
+            sudo chmod 666 /dev/kvm 2>/dev/null || true
+            echo "  /dev/kvm permissions set to 666"
+          else
+            echo "::warning::KVM not available on this runner. QEMU will be very slow."
+          fi
 
       - name: Download bzImage artifact
         uses: actions/download-artifact@v4
