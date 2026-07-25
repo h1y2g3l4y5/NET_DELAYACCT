@@ -264,20 +264,14 @@ step_create_initramfs() {
 		done
 	fi
 
-	# Copy test scripts (func + selftests)
-	if [ -d "$PROJECT_DIR/tests/func" ]; then
-		cp "$PROJECT_DIR/tests/func/test_"*.sh "$INITRD_DIR/opt/test/" 2>/dev/null || true
+	# Copy unified test script
+	if [ -f "$PROJECT_DIR/ci/qemu/run-tests.sh" ]; then
+		cp "$PROJECT_DIR/ci/qemu/run-tests.sh" "$INITRD_DIR/opt/run-tests.sh"
+		chmod +x "$INITRD_DIR/opt/run-tests.sh"
 	fi
-	# Copy selftest suite (test_netdelayacct.sh + helper)
-	if [ -d "$PROJECT_DIR/tests/selftests/net-delayacct" ]; then
-		cp "$PROJECT_DIR/tests/selftests/net-delayacct/test_netdelayacct.sh" \
-		   "$PROJECT_DIR/tests/selftests/net-delayacct/test_helper.sh" \
-		   "$INITRD_DIR/opt/test/" 2>/dev/null || true
-	fi
-	chmod +x "$INITRD_DIR/opt/test/"*.sh 2>/dev/null || true
 
-	# Init script (extracted to ci/qemu/demo-init.sh for independent editing)
-	cp "$PROJECT_DIR/ci/qemu/demo-init.sh" "$INITRD_DIR/init"
+	# Init script (uses same guest-init.sh as CI)
+	cp "$PROJECT_DIR/ci/qemu/guest-init.sh" "$INITRD_DIR/init"
 
 	chmod +x "$INITRD_DIR/init"
 

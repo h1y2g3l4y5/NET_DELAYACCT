@@ -212,11 +212,11 @@ jobs:
           retention-days: 1
 
   qemu-test:
-    name: QEMU runtime test
-    runs-on: ubuntu-22.04
+    name: QEMU runtime test (KVM)
+    runs-on: self-hosted
     needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -240,7 +240,7 @@ jobs:
           name: get_sockdelays
           path: /tmp/artifacts
 
-      - name: Build initramfs and run QEMU
+      - name: Build initramfs and run QEMU (KVM)
         run: |
           set -e
           cd "$GITHUB_WORKSPACE"
@@ -259,27 +259,30 @@ jobs:
             ln -sf /bin/busybox "/tmp/initrd/bin/$applet"
           done
 
+          # Copy bash (test scripts use bash syntax)
+          if [ -f /bin/bash ]; then
+            cp /bin/bash /tmp/initrd/bin/bash
+            chmod +x /tmp/initrd/bin/bash
+            for lib in $(ldd /bin/bash 2>/dev/null | grep -oP '/\S+'); do
+              mkdir -p "/tmp/initrd/$(dirname "$lib")"
+              cp "$lib" "/tmp/initrd$lib" 2>/dev/null || true
+            done
+          fi
+
           # Copy get_sockdelays
           cp /tmp/artifacts/get_sockdelays /tmp/initrd/usr/local/bin/
           chmod +x /tmp/initrd/usr/local/bin/get_sockdelays
 
-          # Copy test scripts
-          mkdir -p /tmp/initrd/opt/test/func
-          cp tests/selftests/net-delayacct/test_netdelayacct.sh tests/selftests/net-delayacct/test_helper.sh \
-            /tmp/initrd/opt/test/ 2>/dev/null || true
-          cp tests/func/test_*.sh /tmp/initrd/opt/test/func/ 2>/dev/null || true
-          chmod +x /tmp/initrd/opt/test/*.sh /tmp/initrd/opt/test/func/*.sh 2>/dev/null || true
+          # Copy unified test script
+          mkdir -p /tmp/initrd/opt
+          cp ci/qemu/run-tests.sh /tmp/initrd/opt/run-tests.sh
+          chmod +x /tmp/initrd/opt/run-tests.sh
 
           # Copy guest-init.sh as init
           cp ci/qemu/guest-init.sh /tmp/initrd/init
           chmod +x /tmp/initrd/init
 
-          # Copy demo-tests.sh for visualization + stress demos
-          cp ci/qemu/demo-tests.sh /tmp/initrd/opt/demo-tests.sh
-          chmod +x /tmp/initrd/opt/demo-tests.sh
-
           # Copy iperf3 + nc + their shared libs
-          # (Remove busybox symlink first, otherwise cp follows it to /bin/busybox)
           for bin in iperf3 nc; do
             b=$(which "$bin") || { echo "WARNING: $bin not found, skipping"; continue; }
             rm -f "/tmp/initrd/bin/$bin"
@@ -306,9 +309,10 @@ jobs:
 
           echo "Initramfs built: $(du -sh /tmp/initrd.img | cut -f1)"
 
-          # Run QEMU (TCG mode on GitHub runners is slow, allow 600s)
+          # Run QEMU with KVM acceleration (self-hosted runner has /dev/kvm)
           echo "::group::QEMU boot log"
-          timeout 900 qemu-system-x86_64 \
+          timeout 300 qemu-system-x86_64 \
+            -machine q35,accel=kvm \
             -m 1024M -smp 2 \
             -kernel /tmp/artifacts/bzImage \
             -initrd /tmp/initrd.img \
@@ -316,24 +320,19 @@ jobs:
             -nographic -no-reboot 2>&1 | tee /tmp/qemu.log || true
           echo "::endgroup::"
 
-          # Extract results from QEMU log
+          # Extract structured test results from QEMU log
           echo ""
-          echo "========== TEST RESULTS =========="
-          sed -n '/^=== QEMU Test Run/,/^=== Kernel net_delayacct/p' /tmp/qemu.log || echo "(no results section found)"
+          echo "========== TEST RESULTS SUMMARY =========="
+          sed -n '/NET_DELAYACCT Unified Test Suite/,/NET_DELAYACCT Test Results/{
+            /NET_DELAYACCT Test Results/{
+              N;N;N;N;N;N;N;N;N;N
+              p
+              q
+            }
+          }' /tmp/qemu.log || echo "(no results box found)"
+          echo ""
           grep -E '\[PASS\]|\[FAIL\]|\[SKIP\]' /tmp/qemu.log || echo "(no pass/fail lines found)"
-          echo "=================================="
-
-          # Visualization demos — extracted separately, NOT inside a group
-          # so they are visible directly in the CI log without expanding.
-          echo ""
-          echo "########## VISUALIZATION DEMOS ##########"
-          if grep -q 'demo-tests.sh pre-flight checks' /tmp/qemu.log 2>/dev/null; then
-            sed -n '/demo-tests.sh pre-flight checks/,/可视化演示结束/p' /tmp/qemu.log || true
-          else
-            echo "(WARNING: demo-tests.sh did not run — check QEMU boot log for errors)"
-            echo "(Possible causes: QEMU timeout, init script crash, missing tools)"
-          fi
-          echo "########## END VISUALIZATION DEMOS ##########"
+          echo "==========================================="
 
           echo ""
           echo "=== QEMU boot tail (last 30 lines) ==="
@@ -353,33 +352,29 @@ jobs:
           path: /tmp/qemu.log
           retention-days: 7
 
-      - name: Generate visualization summary
+      - name: Generate CI summary
         if: always()
         run: |
           {
-            echo "## QEMU Test Output"
+            echo "## NET_DELAYACCT Test Results"
             echo ""
-            echo "### First 30 lines (boot start)"
-            echo '```'
-            head -30 /tmp/qemu.log 2>/dev/null || true
-            echo '```'
-            echo ""
-            echo "### Last 300 lines (init + tests + demos)"
+            echo "### Test Suite Output (last 300 lines)"
             echo '```'
             tail -300 /tmp/qemu.log 2>/dev/null || true
             echo '```'
             echo ""
             PASS=$(grep -c '\[PASS\]' /tmp/qemu.log 2>/dev/null || true)
             FAIL=$(grep -c '\[FAIL\]' /tmp/qemu.log 2>/dev/null || true)
-            echo "**Result: ${PASS} PASS, ${FAIL} FAIL**"
+            SKIP=$(grep -c '\[SKIP\]' /tmp/qemu.log 2>/dev/null || true)
+            echo "**Result: ${PASS} PASS, ${FAIL} FAIL, ${SKIP} SKIP**"
           } >> "$GITHUB_STEP_SUMMARY"
-          tail -300 /tmp/qemu.log > /tmp/viz-summary.txt 2>/dev/null || true
-          echo "Step summary updated with QEMU output"
+          tail -300 /tmp/qemu.log > /tmp/test-summary.txt 2>/dev/null || true
+          echo "Step summary updated"
 
-      - name: Upload visualization summary
+      - name: Upload test summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: visualization-summary
-          path: /tmp/viz-summary.txt
+          name: test-summary
+          path: /tmp/test-summary.txt
           retention-days: 30

@@ -3,13 +3,14 @@
 #
 # Guest init script — runs inside the QEMU VM.
 #
-# Invoked via kernel cmdline: init=/sbin/qemu-init
+# Invoked via kernel cmdline: init=/init
 #
 # 1. Mount essential filesystems
 # 2. Bring up loopback
-# 3. Run the selftest suite
-# 4. Write results to /root/test-output.txt
-# 5. Power off
+# 3. Diagnostics + genl family verification
+# 4. Run unified test suite (run-tests.sh)
+# 5. Write results to /root/test-output.txt
+# 6. Power off
 
 set -e
 
@@ -17,8 +18,8 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo "=== QEMU guest boot: $(date -u) ==="
 
-# Watchdog: force poweroff after 540s to prevent CI hang (TCG mode is slow)
-( sleep 540; echo "WATCHDOG: forcing poweroff after 540s timeout"; poweroff -f ) &
+# Watchdog: force poweroff after 360s (KVM fast, but self-hosted runner may be slow)
+( sleep 360; echo "WATCHDOG: forcing poweroff after 360s timeout"; poweroff -f ) &
 WATCHDOG_PID=$!
 
 # --- Mount essential filesystems (idempotent — skip if already mounted) ---
@@ -79,10 +80,8 @@ fi
 echo "All kernel net_delayacct messages:"
 dmesg | grep -i "net_delayacct" || echo "  (no net_delayacct kernel messages)"
 
-echo "[guest-init] Starting test suite..."
+echo "[guest-init] Starting unified test suite..."
 
-# --- Find and run test scripts ---
-TEST_ROOT="/opt/test"
 RESULT_FILE="/root/test-output.txt"
 
 {
@@ -90,77 +89,35 @@ RESULT_FILE="/root/test-output.txt"
 	echo "Kernel: $(uname -r)"
 	echo ""
 
-	if [ -d "$TEST_ROOT" ]; then
-		export GET_SOCKDELAYS="/usr/local/bin/get_sockdelays"
+	if [ -x "/usr/local/bin/get_sockdelays" ]; then
+		echo "get_sockdelays binary: OK"
 
-		if [ -x "/usr/local/bin/get_sockdelays" ]; then
-			echo "get_sockdelays binary: OK"
-
-			# Run the selftest suite
-			if [ -f "$TEST_ROOT/test_netdelayacct.sh" ]; then
-				echo "--- Running test_netdelayacct.sh ---"
-				set +e
-				timeout 30 sh "$TEST_ROOT/test_netdelayacct.sh" 2>&1
-				rc=$?
-				set -e
-				if [ "$rc" -eq 4 ]; then
-					echo "  (SKIP: dependencies not met)"
-				elif [ "$rc" -ne 0 ]; then
-					echo "  (test failed or timed out, rc=$rc)"
-				fi
-				echo ""
+		# Run the unified test suite
+		if [ -x "/opt/run-tests.sh" ]; then
+			echo "--- Running run-tests.sh (unified test suite) ---"
+			set +e
+			# Use bash if available (test scripts use bash syntax), fall back to sh
+			if command -v bash >/dev/null 2>&1; then
+				timeout 240 bash /opt/run-tests.sh 2>&1
+			else
+				timeout 240 sh /opt/run-tests.sh 2>&1
 			fi
-
-			# Run functional tests
-			if [ -d "$TEST_ROOT/func" ]; then
-				for t in "$TEST_ROOT/func/test_"*.sh; do
-					if [ -f "$t" ]; then
-						echo "--- Running $(basename "$t") ---"
-						set +e
-						timeout 30 sh "$t" 2>&1
-						rc=$?
-						set -e
-						if [ "$rc" -eq 4 ]; then
-							echo "  (SKIP: dependencies not met)"
-						elif [ "$rc" -ne 0 ]; then
-							echo "  (test failed or timed out, rc=$rc)"
-						fi
-						echo ""
-					fi
-				done
+			rc=$?
+			set -e
+			if [ "$rc" -eq 124 ]; then
+				echo "  (tests timed out after 240s)"
+			elif [ "$rc" -ne 0 ]; then
+				echo "  (tests exited with rc=$rc)"
 			fi
 		else
-			echo "ERROR: get_sockdelays binary not found"
+			echo "ERROR: /opt/run-tests.sh not found"
 		fi
 	else
-		echo "ERROR: test directory $TEST_ROOT not found"
+		echo "ERROR: get_sockdelays binary not found"
 	fi
 
-    echo ""
-    echo "=== Running visualization + stress demos ==="
-    echo "  demo-tests.sh exists: $([ -f /opt/demo-tests.sh ] && echo yes || echo no)"
-    echo "  demo-tests.sh executable: $([ -x /opt/demo-tests.sh ] && echo yes || echo no)"
-    echo "  sh available: $(command -v sh)"
-    echo "  iperf3 available: $(command -v iperf3 2>/dev/null || echo no)"
-    echo "  nc available: $(command -v nc 2>/dev/null || echo no)"
-    if [ -x "/opt/demo-tests.sh" ]; then
-        set +e
-        timeout 120 sh /opt/demo-tests.sh 2>&1
-        rc=$?
-        set -e
-        if [ "$rc" -eq 124 ]; then
-            echo "  (demos timed out after 120s)"
-        elif [ "$rc" -ne 0 ]; then
-            echo "  (demos exited with rc=$rc)"
-        else
-            echo "  (demos completed successfully)"
-        fi
-    else
-        echo "  (demo-tests.sh not found or not executable, skipping)"
-    fi
-
-    echo ""
-    echo "=== Test run finished: $(date -u) ==="
+	echo ""
+	echo "=== Test run finished: $(date -u) ==="
 	echo ""
 	echo "=== Kernel net_delayacct messages (post-test) ==="
 	dmesg | grep -i "net_delayacct" || echo "  (none)"

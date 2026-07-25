@@ -1681,3 +1681,317 @@ func tests: ALL PASS
 |------|------|
 | local-test.sh | 重写 Demo 11-13 压力测试逻辑；-smp 1 适配 TCG |
 | docs/get_sockdelays_demo.log | 新建：14 个 Demo 完整可视化输出 + 中文注释 |
+
+---
+
+## 2026-07-24
+
+## 第十六轮 — CI 迁移到 GitHub 托管 + BOM/CRLF 修复 + 压力测试时序修复 (2026-07-24)
+
+### 任务概述
+
+将 CI 从 VMware 自托管 runner 迁移到 GitHub 托管 ubuntu-22.04，修复 guest-init.sh 的 BOM/CRLF 问题，
+创建 demo-tests.sh 可视化演示脚本，分析并修复压力测试中的 RX/TX 统计异常。
+
+---
+
+### CI 迁移：自托管 Runner → GitHub 托管
+
+#### 动机
+
+自托管 runner（VMware Linux VM）存在多个不稳定性问题：
+- VMware NAT 服务不定期断连
+- DNS 不通（网关不提供 DNS 服务）导致 DNS 解析超时
+- 虚拟机资源有限（3.8 GB），内核编译约需 20 分钟
+- Runner 离线期间无法触发 CI
+- 需要手动维护 VM 环境
+
+#### 实施
+
+修改 `.github/workflows/ci.yml` 中的 `runs-on` 从 `self-hosted` 改为 `ubuntu-22.04`。
+
+遇到的挑战：
+1. **编译依赖缺失**：GitHub 托管环境未预装内核编译工具链，需在 CI 步骤中安装 `build-essential flex bison libssl-dev libelf-dev libmnl-dev qemu-system-x86` 等
+2. **内核编译耗时**：2 核 CPU 完整编译约 20-30 分钟，使用 `ccache` 加速
+3. **initramfs 构建方式变更**：从预构建的 Debian rootfs 改为动态下载 busybox 及其依赖，将 `get_sockdelays`、`iperf3`、`nc` 及其共享库打包进 initramfs
+
+#### 可视化演示增强
+
+为解决 CI 中测试结果不可见的问题：
+- 创建 `ci/qemu/demo-tests.sh`：14 个 Demo，涵盖基础功能、真实网络场景、严格压力测试
+- 使用 `tee` 将演示输出同时写入文件和串口控制台
+- CI artifacts 中包含 `qemu-log` 和 `visualization-summary` 两个文件，供用户下载查看
+
+---
+
+### BOM/CRLF 问题修复
+
+#### 问题现象
+
+QEMU guest 启动后 guest-init.sh 无法执行，内核报 `Kernel panic - not syncing: Attempted to kill init!`。
+
+#### 根因
+
+在 Windows 上编辑的 `guest-init.sh` 包含：
+1. **BOM（`EF BB BF`）**：文件开头 3 字节，导致 shebang `#!/bin/sh` 被内核识别为非法格式
+2. **CRLF 行尾（`0D 0A`）**：每行末尾多出 `\r`，进一步破坏脚本解析
+
+内核执行 `/init` 时无法识别为合法可执行文件，init 进程退出触发 panic。
+
+#### 修复
+
+使用 Python 脚本批量清理所有 `ci/qemu/*.sh` 文件：
+
+```python
+import glob
+for f in glob.glob(r'd:\\Program\\NET_DELAYACCT\\ci\\qemu\\*.sh'):
+    with open(f, 'rb') as fh:
+        raw = fh.read()
+    raw = raw.replace(b'\xef\xbb\xbf', b'').replace(b'\r\n', b'\n')
+    with open(f, 'wb') as fh:
+        fh.write(raw)
+```
+
+#### 结果
+
+修复后 QEMU guest 正常启动，guest-init.sh 执行成功，测试结果正常输出到串口控制台。
+
+---
+
+### Patch 标准化
+
+#### 动机
+
+此前使用 `sudo install` 直接拷贝源码文件到内核树，不符合内核代码提交流程。
+
+#### 实施
+
+将内核修改拆分为 9 个标准 patch 文件，放入 `kernel-patches/` 目录：
+
+```
+0001-net-delayacct-add-uapi-header.patch      # UAPI 头文件
+0002-net-delayacct-add-sock-field.patch       # struct sock 新增字段
+0003-net-delayacct-add-skbuff-field.patch     # struct sk_buff 新增字段
+0004-net-delayacct-add-kconfig.patch          # Kconfig 新增选项
+0005-net-delayacct-add-makefile.patch         # Makefile 新增编译目标
+0006-net-add-internal-header.patch            # include/net/net-delayacct.h
+0007-net-core-add-module.patch                # net/core/net-delayacct.c
+0008-net-add-rx-instrumentation.patch         # RX 收包路径打桩
+0009-net-add-tx-instrumentation.patch         # TX 发包路径打桩
+```
+
+CI 流程中使用 `git apply` 依次应用补丁，解决了之前 `install` 方式的溯源和规范问题。
+
+---
+
+### 压力测试 RX/TX 异常分析
+
+#### 问题 1：`local=[::]:6996 remote=[::]:0` 含义
+
+**这是正常现象。** IPv6 监听 socket 或尚未建立连接的 socket 会显示此格式：
+- `[::]` = IPv6 通配地址（全零），等同于 IPv4 的 `0.0.0.0`
+- `[::]:0` = 远程地址和端口均为 0，表示"无远端对等方"
+
+#### 问题 2：RX=0, TX≠0
+
+根因在于 **RX 与 TX 的统计时机不同**：
+
+- TX：`sendmsg()` → `tcp_sendmsg_locked` 设 `delayacct_start` → `dev_hard_start_xmit` 统计 TX → **立即计数**
+- RX：`__netif_receive_skb_core` 设 `delayacct_start` → 但 `net_delayacct_rx_end` 在 `tcp_recvmsg_locked`（用户态 `recvmsg()`）才统计
+
+因此当查询时 `recvmsg()` 尚未完成，TX 已计数但 RX 仍为 0。
+
+另外 `net_delayacct_rx_end` 中有 `if (!start) return;` 检查 — 如果 skb 绕过 `__netif_receive_skb_core`（某些特殊路径），`delayacct_start` 为 0，RX 计数被跳过。
+
+#### 问题 3：压力测试 RX=TX=0
+
+根因是 `demo-tests.sh` 中 Demo 11/12/13 的**时序 bug**：
+
+```bash
+# 旧代码 (BUG)
+iperf3 -c 127.0.0.1 -p PORT -P 6 -t 2 &   # 2 秒后退出
+sleep 1
+get_sockdelays -p PID 2>&1                 # 第一次查询（可能还存在）
+SOCK_COUNT=$(get_sockdelays -p PID ...)     # 第二次查询 → iperf3 已退出 → socket 全关闭
+RX_SUM=$(get_sockdelays -p PID ...)         # 所有 socket 已消失 → RX=TX=0
+```
+
+在 TCG 模式（纯软件模拟）下 guest 运行缓慢，`-t 2` 的 2 秒窗口更短，问题更严重。
+
+#### 修复方案
+
+1. **捕获输出替代二次查询**：将第一次 `get_sockdelays` 输出保存到 shell 变量，后续验证分析从变量提取，不再调用第二次 `get_sockdelays`
+2. **延长 iperf3 时长**：`-t 2` → `-t 3`（Demo 3/4/11/12/13）
+3. **延长查询前等待**：`sleep 1` → `sleep 2`（确保更多流量通过后再查询）
+
+修复后流程：
+```bash
+iperf3 -c 127.0.0.1 -p PORT -P 6 -t 3 &   # 3 秒后退出
+sleep 2
+OUT=$(get_sockdelays -p PID 2>&1)           # 捕获输出到变量
+echo "$OUT"
+SOCK_COUNT=$(echo "$OUT" | grep -c '^proto=')
+RX_SUM=$(echo "$OUT" | grep 'RX  count=' | awk ...)
+# 不再二次查询
+```
+
+### 修改文件清单
+
+| 文件 | 改动 |
+|------|------|
+| ci/qemu/demo-tests.sh | Demo 3/4 延长 -t → 3s、sleep → 2s |
+| ci/qemu/demo-tests.sh | Demo 11/12/13 输出捕获到变量替代二次查询、-t → 3s、sleep → 2s |
+| ci/qemu/guest-init.sh | 移除 BOM + CRLF → LF 行尾修复 |
+| .github/workflows/ci.yml | 迁移到 ubuntu-22.04 + 动态构建 initramfs |
+| kernel-patches/*.patch | 标准化为 9 个 Git patch 文件 |
+| DEVELOPMENT_FLOW.md | 添加第十五、十六阶段 |
+| WORK_LOG.md | 本文档 |
+
+---
+
+## 2026-07-24
+
+## 第十七轮 — 测试套件重构与 CI 架构优化
+
+### 任务概述
+
+分析现有测试方法的问题，重构测试套件：
+1. 合并重复的 selftest + func tests + demo-tests.sh → 统一 `run-tests.sh`
+2. 给所有测试加结构化 PASS/FAIL 断言
+3. CI qemu-test 从 GitHub 托管切回自托管 runner（KVM 加速）
+4. CI 输出可读性改进（框式汇总、PASS/FAIL/SKIP 统计）
+
+---
+
+### 问题分析
+
+#### 现有测试的 5 个核心问题
+
+| # | 问题 | 详情 |
+|---|------|------|
+| 1 | 测试代码重复度高 | 3 套独立测试（selftest 7 项 + func 5 项 + demo 14 项）覆盖完全相同功能 |
+| 2 | 测试用例不明确 | demo-tests.sh 只打印输出不判定 PASS/FAIL |
+| 3 | 压力测试未到位 | 代码里写了 `-P 6` 并发但由于时序 bug + 不断言，形同虚设 |
+| 4 | 数据正确性未验证 | 从不检查 count>0、total_ms>0 等数值合理性 |
+| 5 | 性能影响未知 | `tests/perf/` 下的基准测试从未在 CI 中运行 |
+
+#### TCG vs KVM
+
+| 特性 | TCG（GitHub 托管） | KVM（自托管） |
+|------|-------------------|--------------|
+| CPU 速度 | 原生 5-10% | 原生 95% |
+| test 运行时间 | 3-5 分钟 | ~30 秒 |
+| sleep 可靠性 | 不可靠（计时器延迟） | 可靠 |
+| 时序竞争 | 严重 | 基本不存在 |
+| 嵌套虚拟化 | 不需要 | 需要 /dev/kvm |
+
+GitHub 标准 ubuntu-22.04 runner 是 Azure VM，不暴露 `/dev/kvm`。付费 larger runner 才支持嵌套虚拟化。
+
+---
+
+### 实施
+
+#### 1. 创建统一测试脚本 `ci/qemu/run-tests.sh`
+
+合并后的测试结构（13 项，分 5 个部分）：
+
+**第一部分：基础功能（6 项）**
+| Test | 名称 | 场景 | 断言 |
+|------|------|------|------|
+| 01 | PID 查询 | iperf3 客户端 | data_lines>=1, proto=tcp |
+| 02 | Inode 查询 | nc listener → 提取 inode | inode 精确匹配 |
+| 03 | 重置计数器 | -R 后检查 | count=0 |
+| 04 | TCP 路径 | iperf3 服务端 | proto=tcp, RX 有数据 |
+| 05 | UDP 路径 | iperf3 -u | proto=udp |
+| 06 | 多 Socket | -P 4 并行流 | client>=4, server>=5 |
+
+**第二部分：工具展示（2 项）**
+| Test | 名称 | 断言 |
+|------|------|------|
+| 07 | JSON 输出 | 含 "proto"+"rx" 字段 |
+| 08 | Debug 模式 | 输出非空 |
+
+**第三部分：压力测试（3 项，加断言）**
+| Test | 名称 | 场景 | 断言 |
+|------|------|------|------|
+| 09 | 高并发 | -P 8 | sockets>=9, RX>0, TX>0 |
+| 10 | 大流量 | -P 4 不限速 | max RX>=100, max TX>=100 |
+| 11 | 混合协议 | TCP + UDP 同时 | TCP srv 纯 tcp, UDP srv 含 tcp+udp |
+
+**第四部分：边界条件（1 项）**
+| Test | 名称 | 断言 |
+|------|------|------|
+| 12 | 边界条件 | PID 1 OK, 99999 报错, -h 有用法, -V 正常 |
+
+**第五部分：稳定性（1 项）**
+| Test | 名称 | 场景 | 断言 |
+|------|------|------|------|
+| 13 | 并发查询压力 | 16 workers × 20 queries | 无 worker 崩溃, dmesg 无 oops |
+
+每项测试都有结构化 `[PASS]`/`[FAIL]`/`[SKIP]` 输出，末尾有框式汇总。
+
+#### 2. CI 拆分：qemu-test 切回自托管 runner
+
+```
+checkpatch     → ubuntu-22.04 (免费 GitHub runner)
+build-kernel   → ubuntu-22.04 (免费 GitHub runner)
+build-tool     → ubuntu-22.04 (免费 GitHub runner)
+qemu-test      → self-hosted   (VMware Linux VM, 有 KVM)
+```
+
+QEMU 参数从 TCG 改为 KVM：
+```bash
+# 旧：TCG 模式（GitHub 托管）
+qemu-system-x86_64 -m 1024M -smp 2 ...
+
+# 新：KVM 模式（自托管）
+qemu-system-x86_64 -machine q35,accel=kvm -m 1024M -smp 2 ...
+```
+
+#### 3. CI 输出改进
+
+```
+╔══════════════════════════════════════════════════════════╗
+║        NET_DELAYACCT Unified Test Suite                  ║
+╠══════════════════════════════════════════════════════════╣
+...
+╠══════════════════════════════════════════════════════════╣
+║  Tests run:  13     PASS: 12     FAIL: 0     SKIP: 1   ║
+╠══════════════════════════════════════════════════════════╣
+║  RESULT: ALL PASS                                        ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+Summary 增加 SKIP 统计：`**Result: ${PASS} PASS, ${FAIL} FAIL, ${SKIP} SKIP**`
+
+#### 4. 删除旧文件
+
+| 删除的文件 | 原因 |
+|-----------|------|
+| `tests/func/test_*.sh` (5 个) | 功能重复，已合并到 run-tests.sh |
+| `tests/selftests/.../test_netdelayacct.sh` | 同上 |
+| `ci/qemu/demo-tests.sh` | 同上 |
+| `ci/qemu/demo-init.sh` | 与 demo-tests.sh 重复，local-test.sh 改用 guest-init.sh |
+
+---
+
+### 修改文件清单
+
+| 文件 | 改动 |
+|------|------|
+| `ci/qemu/run-tests.sh` | **新建**：统一测试套件（13 项，结构化 PASS/FAIL） |
+| `ci/qemu/guest-init.sh` | 简化：保留诊断 + 直接调用 run-tests.sh |
+| `.github/workflows/ci.yml` | qemu-test: `ubuntu-22.04`→`self-hosted`，QEMU KVM 模式，简化 initramfs |
+| `local-test.sh` | 改用 run-tests.sh + guest-init.sh，移除旧测试文件引用 |
+| `tests/func/test_*.sh` (5 个) | **删除**：功能重复 |
+| `tests/selftests/.../test_netdelayacct.sh` | **删除**：功能重复 |
+| `ci/qemu/demo-tests.sh` | **删除**：功能重复 |
+| `ci/qemu/demo-init.sh` | **删除**：功能重复 |
+
+---
+
+### 待解决
+
+- 自托管 runner 需要保持在线（VMware VM 需运行 + runner service 需启动）
+- `tests/perf/baseline-vs-enabled.sh`（需要两套内核对比编译）仍未入 CI
+- `tests/perf/long-run.sh`（24 小时稳定性）不适合 CI

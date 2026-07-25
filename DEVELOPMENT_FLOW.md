@@ -676,10 +676,363 @@ QEMU `-smp 2` 改为 `-smp 1`，避免 sandbox 环境下 TCG 多线程被挂起�
 
 ---
 
-## 18. 一句话总结
+## 18. 第十五阶段：CI 迁移到 GitHub 托管 + Patch 标准化 (2026-07-24)
+
+### 18.1 背景
+
+此前 CI 依赖 VMware Linux VM 上的自托管 runner，存在以下问题：
+- VMware NAT 服务不定期断连
+- DNS 不通导致 DNS 解析超时
+- 虚拟机资源有限（3.8 GB），编译慢
+- Runner 离线期间无法触发 CI
+
+### 18.2 CI 迁移：自托管 → GitHub 托管 ubuntu-22.04
+
+#### 核心变更
+
+将 `ci.yml` 中的 runner 从 `self-hosted`/`netdelay-runner` 改为 `ubuntu-22.04`：
+
+```yaml
+runs-on: ubuntu-22.04
+```
+
+#### 遇到的挑战与解决
+
+**(1) 编译依赖缺失**
+
+GitHub 托管环境不像自托管 VM 那样预装了所有编译依赖。需要：
+- 手动安装 `build-essential`、`flex`、`bison`、`libssl-dev`、`libelf-dev` 等
+- 安装 `libmnl-dev` 用于编译用户态工具 `get_sockdelays`
+- 安装 `qemu-system-x86` 用于 QEMU 测试
+
+**(2) 内核编译耗时问题**
+
+GitHub 托管 runner 2 核 CPU，内核完整编译约 20-30 分钟。通过以下优化加速：
+- 使用 `ccache` 缓存编译结果
+- 合理配置 `make -j$(nproc)` 并行编译
+- 限制不必要的内核配置选项，缩小编译范围
+
+**(3) initramfs 构建方式变更**
+
+自托管 runner 使用预先准备好的 Debian rootfs 镜像。迁移后改为动态构建 initramfs：
+- 从 Ubuntu 包仓库下载 `busybox` 及其依赖
+- 将 `get_sockdelays` 二进制及依赖库（libmnl、libc 等）打包进 initramfs
+- 打包 `iperf3` 和 `nc` 用于可视化演示和压力测试
+- 总大小约 8-10 MB
+
+### 18.3 Patch 标准化
+
+此前内核修改使用 `sudo install` 直接拷贝源码文件到内核树，不符合内核代码提交流程。本次将所有修改拆分为标准 patch 文件：
+
+```
+kernel-patches/
+  0001-net-delayacct-add-uapi-header.patch
+  0002-net-delayacct-add-sock-field.patch
+  0003-net-delayacct-add-skbuff-field.patch
+  0004-net-delayacct-add-kconfig.patch
+  0005-net-delayacct-add-makefile.patch
+  0006-net-add-internal-header.patch
+  0007-net-core-add-module.patch
+  0008-net-add-rx-instrumentation.patch
+  0009-net-add-tx-instrumentation.patch
+```
+
+CI 流程中使用 `git apply` 依次应用补丁，解决了之前 `install` 方式的以下问题：
+- 源码同步不够明确（直接覆盖，难以追溯变更）
+- 无法用 `git diff` 查看修改
+- 不符合内核社区的 patch 提交流程
+
+### 18.4 BOM/CRLF 问题修复
+
+#### 问题现象
+
+QEMU guest 启动后，`/init` 脚本（`guest-init.sh`）无法执行，内核报：
+
+```
+Kernel panic - not syncing: Attempted to kill init!
+```
+
+#### 根因
+
+在 Windows 上编辑的 shell 脚本文件存在两个行尾问题：
+
+1. **BOM（Byte Order Mark）**：文件开头有 `EF BB BF` 三个字节
+2. **CRLF 行尾**：每行以 `\r\n`（`0D 0A`）而非 `\n`（`0A`）结尾
+
+内核执行 `/init` 时，shebang `#!/bin/sh` 变为 `\xEF\xBB\xBF#!/bin/sh\r`，内核无法识别为合法脚本，init 进程退出触发 kernel panic。
+
+#### 修复
+
+使用 Python 批量修复所有 shell 脚本：
+
+```python
+import glob
+for f in glob.glob(r'd:\\Program\\NET_DELAYACCT\\ci\\qemu\\*.sh'):
+    with open(f, 'rb') as fh:
+        raw = fh.read()
+    raw = raw.replace(b'\xef\xbb\xbf', b'').replace(b'\r\n', b'\n')
+    with open(f, 'wb') as fh:
+        fh.write(raw)
+```
+
+### 18.5 demo-tests.sh 可视化演示 + 压力测试
+
+从 `local-test.sh` 中抽取 Demo 测试逻辑，独立为 `ci/qemu/demo-tests.sh`：
+
+- **14 个 Demo**，分为三部分
+- 第一部分（Demo 1-8）：基础功能演示（帮助、版本、TCP/UDP/Inode/JSON/Reset/Debug）
+- 第二部分（Demo 9-10）：真实网络场景（TCP 连接百度、UDP 连接 B站）
+- 第三部分（Demo 11-14）：严格压力测试（高并发多连接、大流量高计数、TCP+UDP 混合、边界条件）
+
+CI 中使用 `tee` 将输出同时写入日志文件和串口控制台，确保可视化结果在 QEMU boot log 中可见。测试结果同时存放于 CI artifacts（`qemu-log` 和 `visualization-summary`）。
+
+---
+
+## 19. 第十六阶段：压力测试 RX/TX 异常分析与修复 (2026-07-24)
+
+### 19.1 问题现象
+
+用户审查 CI 测试结果时发现三个异常：
+
+| 现象 | 描述 |
+|------|------|
+| `local=[::]:6996 remote=[::]:0` | IPv6 通配地址，无远程对端 |
+| RX=0, TX≠0 | 部分 socket 有发送流量但无接收统计 |
+| RX=TX=0 | 部分压力测试结果显示没有流量经过 |
+
+### 19.2 `local=[::]:6996 remote=[::]:0` 含义
+
+**这是正常行为，不是 bug。**
+
+- `[::]` = IPv6 未指定地址（全零，等同于 IPv4 的 `0.0.0.0`）
+- `:6996` = 本地端口
+- `[::]:0` = 远端地址/端口均为零（尚未建立连接）
+
+这种格式出现在：
+- **TCP 监听 socket**（iperf3 服务端监听端口）
+- **iperf3 控制连接**（使用 IPv6 socket，尚未连接到服务端）
+- **刚创建但未 connect() 的 socket**
+
+### 19.3 RX=0, TX≠0 根因
+
+查看打桩代码后，找到根本原因在于 RX 与 TX 的**统计时机不同**：
+
+- **TX 统计路径**：
+  ```
+  用户态 sendmsg() → tcp_sendmsg_locked → net_delayacct_tx_start(skb)
+  → ... → dev_hard_start_xmit → net_delayacct_tx_end(sk, skb) → TX count++
+  ```
+  TX 在数据包到达网卡驱动时**立即**计数，只要 `sendmsg()` 被调用就会产生 TX。
+
+- **RX 统计路径**：
+  ```
+  中断/NAPI → __netif_receive_skb_core → net_delayacct_rx_start(skb)
+  → ... TCP 协议栈处理 ...
+  → 用户态 recvmsg() → tcp_recvmsg_locked → net_delayacct_rx_end(sk, skb) → RX count++
+  ```
+  RX **必须等用户态调用 `recvmsg()`** 才计数。
+
+因此，当查询时机在用户态尚未调用 `recvmsg()` 时（或 `recvmsg()` 正在处理中但尚未完成），就会看到 TX>0 但 RX=0。
+
+此外，`net_delayacct_rx_end` 中检查 `skb->delayacct_start != 0`：
+```c
+if (!start)  // skb->delayacct_start 为 0 则直接返回
+    return;
+```
+如果 `__netif_receive_skb_core` 未设置该字段（例如某些绕过主接收路径的情况），RX end 就是 no-op。
+
+### 19.4 压力测试 RX=TX=0 根因
+
+根因是 `demo-tests.sh` 中 Demo 11/12/13 的**时序 bug**：
+
+```bash
+# 旧代码 (BUG)
+iperf3 -c 127.0.0.1 -p "$PORT" -P 6 -t 2 &  # 启动客户端（2 秒后退出）
+sleep 1
+get_sockdelays -p "$PID" 2>&1                    # 第一次查询（还能查到）
+# 再用 get_sockdelays 做第二次查询用于验证（BUG！）
+SOCK_COUNT=$(get_sockdelays -p "$PID" ... | grep ...)   # 第二次查询 → 客户端已退出
+RX_SUM=$(get_sockdelays -p "$PID" ... | grep ...)        # socket 全关闭 → RX=TX=0
+```
+
+关键问题：
+1. `-t 2` 只有 2 秒 → `sleep 1` + 第一次查询耗时 → 第二次查询时 iperf3 已经退出
+2. 第二次查询时所有数据 socket 已关闭 → `get_sockdelays` 返回 `(no matching sockets)` → RX=TX=0
+3. 在 TCG 模式下 guest 时间感知可能更快，进一步加剧时序问题
+
+### 19.5 修复方案
+
+**1. demo-tests.sh 压力测试时序修复**
+
+核心思路：**捕获第一次查询的输出到变量，所有验证分析都从变量中提取，不再二次查询**：
+
+```bash
+# 新代码 (FIXED)
+iperf3 -c 127.0.0.1 -p "$PORT" -P 6 -t 3 &  # -t 延长到 3 秒
+sleep 2                                         # 等待更多流量
+OUT=$(get_sockdelays -p "$PID" 2>&1)           # 捕获输出到变量
+echo "$OUT"                                      # 显示原始输出
+SOCK_COUNT=$(echo "$OUT" | grep -c '^proto=')  # 从变量提取统计
+RX_SUM=$(echo "$OUT" | grep 'RX  count=' | ...)  # 不再调用 get_sockdelays
+TX_SUM=$(echo "$OUT" | grep 'TX  count=' | ...)
+```
+
+修复涉及的 Demo：
+- Demo 11：`-t 2`→`-t 3`、`sleep 1`→`sleep 2`、输出捕获到变量
+- Demo 12：同上
+- Demo 13：同上
+- Demo 3/4：`-t 2`→`-t 3`、`sleep 1`→`sleep 2`（基础 TCP/UDP 查询也需要足够流量）
+
+**2. 添加中文注释说明**
+
+在 `demo-tests.sh` 关键 Demo 的注释中增加了：
+- 在进程活跃期间查询的重要性说明
+- 为何 RX/TX 可能为 0 的说明
+
+### 19.6 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `ci/qemu/demo-tests.sh` | Demo 3/4 延长 iperf3 时长和等待时间 |
+| `ci/qemu/demo-tests.sh` | Demo 11/12/13 捕获输出到变量替代二次查询 |
+| `DEVELOPMENT_FLOW.md` | 添加第十五、十六阶段记录 |
+| `WORK_LOG.md` | 添加 2026-07-24 工作记录 |
+
+---
+
+## 20. 一句话总结
 
 这一轮开发的主线是：
 
-**先把 Generic Netlink 主通信链路打通，再把本地 QEMU 测试环境修到足够接近 CI，然后修复测试脚本判定逻辑和工具/内核剩余 bug，最后解决 CI 环境特有的 doit 回调未触发问题，实现 CI 全绿。**
+**先把 Generic Netlink 主通信链路打通，再把本地 QEMU 测试环境修到足够接近 CI，然后修复测试脚本判定逻辑和工具/内核剩余 bug，接着解决 CI 环境特有的 doit 回调未触发问题实现 CI 全绿，最后迁移 CI 到 GitHub 托管环境并修复压力测试中的时序 bug。**
 
-最终结果：本地测试 8 PASS / 0 FAIL / 1 SKIP；CI selftest 8/8 PASS + func 测试全 PASS。
+最终结果：本地测试 8 PASS / 0 FAIL / 1 SKIP；CI selftest 8/8 PASS + func 测试全 PASS；CI 完全运行在 GitHub 托管环境，不再依赖自托管 VM。
+
+---
+
+## 21. 第十七阶段：测试套件重构 + CI 架构优化 (2026-07-24)
+
+### 21.1 动机
+
+本轮开发前存在 5 个测试层面的问题：
+
+| # | 问题 | 详情 |
+|---|------|------|
+| 1 | 测试代码重复 | 3 套独立测试覆盖完全相同功能 |
+| 2 | 测试用例不明确 | demo-tests.sh 只打印不判定 |
+| 3 | 压力测试未到位 | 高并发/大流量测试无断言 |
+| 4 | 数据正确性未验证 | count>0 等数值合理性从不检查 |
+| 5 | 性能影响未知 | `tests/perf/` 的基准测试未入 CI |
+
+此外，GitHub 托管 runner 只能用 TCG 模式（纯软件模拟 CPU），导致：
+- 测试运行慢 20-50 倍
+- `sleep` 不可靠（软件计时器会延迟）
+- 时序竞争严重（iperf3 `-t 2` 配合 `sleep 1` 经常错过）
+
+### 21.2 测试套件合并
+
+合并前 → 合并后的对应关系：
+
+```
+合并前（3 套，共 ~30 项，代码 ~1200 行）
+├── selftest (test_netdelayacct.sh)  7 项
+├── func tests (test_*.sh ×5)        ~10 项
+└── demo-tests.sh                    14 项
+
+合并后（1 套，13 项，代码 ~500 行）
+└── ci/qemu/run-tests.sh
+    ├── 第一部分：基础功能      Test 01-06 (PID/Inode/Reset/TCP/UDP/Multi)
+    ├── 第二部分：工具展示      Test 07-08 (JSON/Debug)
+    ├── 第三部分：压力测试      Test 09-11 (高并发/大流量/混合协议)
+    ├── 第四部分：边界条件      Test 12 (PID 1/不存在PID/-h/-V)
+    └── 第五部分：稳定性        Test 13 (16 workers × 20 concurrent queries)
+```
+
+每项测试都有明确的 [PASS]/[FAIL]/[SKIP] 断言和框式汇总输出。
+
+### 21.3 CI 架构优化
+
+#### 问题：GitHub 托管 runner 不支持 KVM
+
+GitHub 标准的 `ubuntu-22.04` runner 运行在 Azure VM 中，不暴露 `/dev/kvm`。付费 larger runner ($0.008/分钟) 才支持嵌套虚拟化，对开源项目不划算。
+
+#### 方案：混合架构 — 编译用免费 runner，QEMU 用自托管 runner
+
+```
+checkpatch     → ubuntu-22.04 (免费)
+build-kernel   → ubuntu-22.04 (免费)
+build-tool     → ubuntu-22.04 (免费)
+qemu-test      → self-hosted   (VMware Linux VM, KVM 加速)
+```
+
+- 编译（最耗时）仍用 GitHub 免费 runner
+- QEMU 测试用自托管 + KVM，快且可靠
+- 自托管 runner 仅 qemu-test 需要在线，降低运维压力
+
+QEMU 参数变更：
+```bash
+# 旧：TCG 模式
+qemu-system-x86_64 -m 1024M -smp 2 ...
+
+# 新：KVM 模式
+qemu-system-x86_64 -machine q35,accel=kvm -m 1024M -smp 2 ...
+```
+
+Timeout 从 900s → 300s（KVM 快 10+ 倍）。
+
+### 21.4 CI 输出可读性
+
+改进前（旧的 selftest + func + demo 混在一起）：
+```
+[PASS] own PID query executed without crash
+[PASS] nc listener found in output
+...
+proto=tcp pid=123 local=127.0.0.1:5201 remote=127.0.0.1:12345
+  RX  count=342  total=12.345ms  average=0.036ms
+...
+```
+
+改进后（框式汇总 + 每行带判定）：
+```
+╔══════════════════════════════════════════════════════════════╗
+║        NET_DELAYACCT Unified Test Suite                      ║
+╠══════════════════════════════════════════════════════════════╣
+║  Sections: 基础功能 / 工具展示 / 压力测试 / 边界条件 / 稳定性   ║
+╚══════════════════════════════════════════════════════════════╝
+
+┌── 第一部分：基础功能 ──┐
+  Test 01: PID 查询 (iperf3 客户端)
+    [PASS] data_lines=3, proto=tcp found
+  Test 02: Inode 查询 (nc 监听端)
+    [PASS] inode=45678 matched
+  ...
+
+╔══════════════════════════════════════════════════════════════╗
+║  Tests run:  13     PASS: 12     FAIL: 0     SKIP: 1       ║
+╠══════════════════════════════════════════════════════════════╣
+║  RESULT: ALL PASS                                            ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+### 21.5 删除的旧文件
+
+| 文件 | 原因 |
+|------|------|
+| `tests/func/test_*.sh` (5 个) | 功能完全被 run-tests.sh 覆盖 |
+| `tests/selftests/.../test_netdelayacct.sh` | 同上 |
+| `ci/qemu/demo-tests.sh` | 同上 |
+| `ci/qemu/demo-init.sh` | 与 demo-tests.sh 重复，local-test.sh 改用 guest-init.sh |
+
+### 21.6 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `ci/qemu/run-tests.sh` | **新建**：统一测试套件 |
+| `ci/qemu/guest-init.sh` | 简化为诊断 + 调用 run-tests.sh |
+| `.github/workflows/ci.yml` | qemu-test 切回 self-hosted + KVM |
+| `local-test.sh` | 改用 run-tests.sh + guest-init.sh |
+
+### 21.7 后续计划
+
+- `tests/perf/baseline-vs-enabled.sh`（需两套内核对比）待入 CI
+- `tests/perf/long-run.sh`（24h 稳定性）不适合 CI，留作手动测试
