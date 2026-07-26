@@ -373,9 +373,9 @@ jobs:
           {
             echo "## NET_DELAYACCT Test Results"
             echo ""
-            echo "### Test Suite Output (last 300 lines)"
+            echo "### Test Suite Output (last 500 lines)"
             echo '```'
-            tail -300 /tmp/qemu.log 2>/dev/null || true
+            tail -500 /tmp/qemu.log 2>/dev/null || true
             echo '```'
             echo ""
             PASS=$(grep -c '\[PASS\]' /tmp/qemu.log 2>/dev/null || true)
@@ -383,7 +383,7 @@ jobs:
             SKIP=$(grep -c '\[SKIP\]' /tmp/qemu.log 2>/dev/null || true)
             echo "**Result: ${PASS} PASS, ${FAIL} FAIL, ${SKIP} SKIP**"
           } >> "$GITHUB_STEP_SUMMARY"
-          tail -300 /tmp/qemu.log > /tmp/test-summary.txt 2>/dev/null || true
+          tail -500 /tmp/qemu.log > /tmp/test-summary.txt 2>/dev/null || true
           echo "Step summary updated"
 
       - name: Upload test summary
