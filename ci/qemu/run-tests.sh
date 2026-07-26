@@ -73,7 +73,7 @@ _show_output() {
 	local data="${2:-}"
 	local pid="${3:-}"
 
-	echo "    ┌── $label ──────────────────────────────"
+	echo "    ┌─ $label ──────────────────────────────────────────"
 	if [ -n "$data" ]; then
 		echo "$data" | sed 's/^/    │ /'
 	else
@@ -84,7 +84,8 @@ _show_output() {
 	local lines=$(echo "$data" | grep -c 'proto=' || true)
 	local rx_sum=$(echo "$data" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
 	local tx_sum=$(echo "$data" | awk '/TX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
-	echo "    │ summary: lines=$lines (tcp=$tcp udp=$udp) rx_sum=$rx_sum tx_sum=$tx_sum"
+	printf "    │ summary: lines=%-3s (tcp=%-3s udp=%-3s) rx_sum=%-6s tx_sum=%-6s\n" \
+		"$lines" "$tcp" "$udp" "$rx_sum" "$tx_sum"
 	if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
 		if kill -0 "$pid" 2>/dev/null; then
 			echo "    │ PID $pid: alive"
@@ -92,25 +93,45 @@ _show_output() {
 			echo "    │ PID $pid: not running (exited)"
 		fi
 	fi
-	echo "    └──────────────────────────────────────────"
+	echo "    └──────────────────────────────────────────────────────"
 }
 
 # 测试说明
 _desc() {
-	echo "  原理: $1"
-	echo "  实现: $2"
-	echo "  断言: $3"
+	echo ""
+	echo "  · 原理: $1"
+	echo "  · 实现: $2"
+	echo "  · 断言: $3"
 }
 
-# 打印 get_sockdelays 工具输出
+# 打印 get_sockdelays 工具输出（宽度自动适配内容）
 _output() {
 	local label="${1:-get_sockdelays output}"
 	local data="${2:-}"
-	if [ -n "$data" ]; then
-		echo "  ┌── $label ──────────────────────────────"
-		echo "$data" | sed 's/^/  │ /'
-		echo "  └──────────────────────────────────────────"
+	if [ -z "$data" ]; then
+		return
 	fi
+	# 计算最长行宽度（含前缀 "  │ " = 5 chars，取整到 4 的倍数方便对齐）
+	local maxw=0 linew=0
+	while IFS= read -r line; do
+		linew=${#line}
+		[ "$linew" -gt "$maxw" ] && maxw=$linew
+	done <<EOF
+$label
+$data
+EOF
+	# 盒宽度: 最长行 + 前缀 5 + 余量 3，最小 60
+	local boxw=$((maxw + 8))
+	[ "$boxw" -lt 60 ] && boxw=60
+	# 确保偶数宽度（上下边框奇数会歪）
+	[ $((boxw % 2)) -eq 1 ] && boxw=$((boxw + 1))
+
+	local line="$(printf '%*s' "$boxw" '' | tr ' ' '─')"
+	echo "  ┌${line}"
+	printf "  │ %s\n" "$label"
+	echo "  ├${line}"
+	echo "$data" | sed 's/^/  │ /'
+	printf "  └%s\n" "$line"
 }
 
 # ============================================================
