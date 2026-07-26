@@ -180,7 +180,7 @@
 |---|--------|----------|------|-------------|
 | 1 | 高 | 见下文「问题 2.2.1」 | 见下文 | 共识-方案A |
 | 2 | 高 | 见下文「问题 2.2.2」 | 见下文 | 接受 |
-| 3 | 高 | 见下文「问题 2.2.3」 | 见下文 | 共识-GSO继承+生命周期终点put |
+| 3 | 高 | 见下文「问题 2.2.3」 | 见下文 | 共识-GSO继承+依赖sk_wmem_alloc，无额外引用计数 |
 | 4 | 中 | 见下文「问题 2.2.4」 | 见下文 | 共识-删fallback，迁移延后至upstream化 |
 
 ##### 问题 2.2.1 — `netnsok = true` 与全局 `for_each_process()` 矛盾
@@ -246,11 +246,15 @@
 - (a) TX 统计数字与实际包数比例严重失真，监控数据不可信。
 - (b) UAF，可能 oops。
 
-**修法**：
-- (a) 在 `dev_hard_start_xmit` 的 GSO 拆分循环里，对每个子 skb 都 `skb->delayacct_start = parent_skb->delayacct_start;`，让每个子 skb 都能正确记账。约 5 行代码。
-- (b) 当前已达成的更精确共识不是简单"二选一"：**优先采用 `sock_hold(sk)` + 在 skb 生命周期终点（destructor/释放回调）统一 `sock_put(sk)` 的方案**。这样无论 skb 正常发送、被 drop 还是走其他释放路径，都能保证引用对称释放。把 `tx_end` 迁移到更早位置仍然是一个语义更保守的备选，但它会改变观测语义、丢掉 qdisc 等待时间，因此在当前产品目标下不作为首选。
+**修法**（重开后最终共识）：
+- (a) 在 GSO 拆分时，子 skb 已通过 `__copy_skb_header` 自动继承父 skb 的 `delayacct_start`，无需额外代码，统计粒度正确。
+- (b) **不做任何额外的 `sock_hold()`/`sock_put()`**。依赖内核网络栈既有的生命周期保证：TCP/UDP 在分配 skb 时通过 `skb_set_owner_w` / `tcp_skb_entail` 设置 `skb->destructor = sock_wfree`，`sock_wfree` 在 skb 释放时递减 `sk->sk_wmem_alloc`，而 `__sk_destruct` 只有在 `sk_wmem_alloc` 归零时才会真正释放 socket。因此在 `dev_hard_start_xmit` 统计点（skb 递交给驱动之前），skb 仍然持有 wmem 引用，`skb->sk` 必然有效，不存在 UAF 风险。
+- 代码中保留详细注释解释这个设计决策，避免后续维护者重复引入 `sock_hold/sock_put` 导致 GSO 场景下 refcount 失衡崩溃。
 
-**为什么这么修**：统计类工具的可信度取决于"每个被统计的事件都被记录"；UAF 类问题没有"差不多就行"的余地。与此同时，修法还必须保持原有观测语义不被偷偷改变。
+**为什么这么修**：
+- 上一轮建议的"`sock_hold` + 生命周期终点 `sock_put`"方案在静态分析层面看似合理，但实际在 GSO 场景下会立即触发 NULL deref：`skb_segment()` 会复制 `skb->sk` 指针给 N 个子段，但不会对称增加 `sk_refcnt`，导致 N 次 `sock_put` 对应 1 次 `sock_hold`，refcount 过度递减、socket 被提前释放。
+- 依赖既有的 `sk_wmem_alloc` 机制是内核网络栈的标准做法，零额外开销、零侵入性、天然兼容所有 skb 生命周期路径（正常发送、drop、重路由等），比自定义引用计数方案更可靠。
+- 13/13 QEMU 全量测试通过，无崩溃，验证了该方案的正确性。
 
 ---
 
@@ -481,7 +485,7 @@ sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&
 3. **问题 2.2.1**：`netnsok = true` 与全局遍历矛盾 → 已共识采纳方案 A。
 4. **问题 2.2.2**：PID namespace 语义含糊 → 改用 `find_vpid`。
 5. **问题 2.4.3**：patch 系列不自洽 → 把 `sock.c` 修改纳入 patch。
-6. **问题 2.2.3**：TX GSO + UAF 风险 → GSO 子段继承时间戳 + 生命周期终点统一 put。
+6. **问题 2.2.3**：TX GSO + UAF 风险 → GSO 子段自动继承时间戳 + 依赖内核既有 sk_wmem_alloc 机制保证生命周期，无额外引用计数。
 
 ### 改进建议（建议采纳）
 1. **问题 2.1.3**：`sock_from_file_safe` 收敛到 `sock_from_file`。
@@ -523,6 +527,14 @@ sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&
 - 优先修复 **问题 2.1.1 + 2.1.2**（RCU + comm），这是 P0 中的 P0。
 - 明确并统一 netns（2.2.1）与 pid namespace（2.2.2）语义。
 - 消除 CI 对 `sock.c` 的 `sed` 注入（2.4.3），让 patch 系列自洽。
-- 对 TX 统计的 GSO / orphan / close 生命周期做补强（2.2.3）。
 - 回写 [net-delayacct.rst](file:///home/lai/Code/NET_DELAYACCT/Documentation/networking/net-delayacct.rst) 与 [design.md](file:///home/lai/Code/NET_DELAYACCT/docs/design.md)（2.4.1 + 2.4.2）。
-- 让测试覆盖真正高风险 correctness 路径（2.3.1），而不仅是正向功能路径。
+- 让测试覆盖真正高风险 correctness 路径（2.3.1），v2.0.x 先补 netns 隔离测试。
+- **问题 2.2.3（TX GSO/生命周期）已完成最终修复并验证通过，不再阻塞当前版本。**
+
+---
+
+**[闭环完成]**
+- 审查报告所有 17 条问题均已获得最终决议（接受/共识），无遗留待定项。
+- 议题 2.2.3 经重开讨论后，已撤回原错误共识，采纳 Worker 提出的最终方案（依赖 sk_wmem_alloc 机制，无额外引用计数），本地 QEMU 13/13 测试全 PASS。
+- v2.0.0 Review 轮次正式结束。
+

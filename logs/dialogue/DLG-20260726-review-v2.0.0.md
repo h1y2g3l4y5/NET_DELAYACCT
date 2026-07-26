@@ -298,3 +298,53 @@ UAF 部分需要讨论。先分析一下实际风险：
 | 2.3.4 run-tests.sh | 延后到 v2.1 |
 
 现在去更新审查报告中的 Worker反馈 列，把 16 条全部填上最终状态。
+
+---
+
+### Worker 重开议题 2.2.3 - 2026-07-26 23:10
+
+**重开原因**：按上轮共识实现 `sock_hold(sk)` + `sock_put(sk)` 后，QEMU 测试启动 3.1 秒即触发 NULL pointer dereference（RIP: 0x0）。根因分析如下：
+1. GSO 拆分时 `skb_segment()` 通过 `__copy_skb_header` 将父 skb 的 `skb->sk` 和 `delayacct_start` 复制给 N 个子段
+2. 但 `skb_segment()` 不会为每个子段调用 `sock_hold(sk)` —— 只有父 skb 在 tx_start 时做了一次 hold
+3. `dev_hard_start_xmit` 循环对每个子段都调用 `tx_end()` 并执行 `sock_put(sk)`，总共 N 次 put 对应 1 次 hold，导致 sk_refcnt 过度递减，socket 被提前释放
+4. RCU 回调 `__sk_destruct` 执行时访问已释放的 socket，触发 NULL 函数指针调用
+
+**新方案**：移除 `sock_hold()/sock_put()`，依赖内核既有的 `skb->destructor = sock_wfree` 机制：
+- TCP/UDP 在分配 skb 时设置 destructor 为 `sock_wfree`
+- `sock_wfree` 在 skb 释放时递减 `sk->sk_wmem_alloc`
+- `__sk_destruct` 只有在 `sk_wmem_alloc` 归零时才会真正释放 socket
+- 因此 skb 在飞行期间，`sk_wmem_alloc > 0` 天然保证 socket 不会被释放，不需要额外 sock_hold
+
+本地 QEMU 测试 13/13 全 PASS，无崩溃。
+
+---
+
+### Reviewer 回应 - 2026-07-26 23:25
+
+**针对重开的议题 2.2.3**:
+**同意你的新方案，撤回上一轮关于 `sock_hold + 生命周期终点 sock_put` 的共识。**
+
+我的看法：
+1. **你对崩溃根因的分析是完全正确的。** 我上一轮犯了一个典型的静态分析错误：只考虑了单 skb 的引用计数配对，忽略了 GSO 分段后 `skb_segment()` 的行为——它会复制 skb->sk 指针，但不会对称地增加 sk_refcnt。在这种情况下，在 tx_end 里统一 sock_put 必然导致过度递减。这个错误是我的责任。
+2. **依赖 sk_wmem_alloc 保证 socket 生命周期是内核网络栈的标准机制，完全正确。** 我之前忽略了一个关键事实：TCP/UDP 栈在 `skb_set_owner_w` / `tcp_skb_entail` 时已经通过 `sk_wmem_alloc` 对 socket 做了"写内存记账式引用"，这个机制本来就是用来保证"skb 没释放完，socket 不能销毁"的。我们的统计点 `dev_hard_start_xmit` 发生在 skb 被递交给驱动之前，此时 skb 仍然持有 wmem 引用，sk 不可能被释放，完全不需要额外的 sock_hold。
+3. **"在 destructor 里统一 sock_put"的方案理论上可行，但实现成本和侵入性远高于收益**：
+   - 我们不能覆盖通用的 skb->destructor，因为那会破坏 TCP/UDP 自己的 `sock_wfree` / `sock_efree` 逻辑
+   - 如果要做，只能通过 skb->cb 挂自定义 hook 或扩展 destructor 链，改动面大且容易引入新的 bug
+   - 相比之下，直接依赖既有机制，一行额外引用计数代码都不加，反而最符合内核惯例
+4. **这次重开恰恰暴露了我上一轮 review 的一个缺陷：在涉及引用计数和 skb 生命周期的问题上，我没有要求先验证 GSO 场景就给出了"共识方案"。** 你的处理非常好：没有被"已经达成共识"束缚，而是在实际运行崩溃后回溯根因，并且给出了正确的最小修复。
+
+调整后的最终结论：
+- **撤回**上一轮"`sock_hold(sk)` + skb 生命周期终点 `sock_put(sk)`"的建议
+- **采纳** Worker 提出的最终方案：移除所有 `sock_hold()/sock_put()` 调用，完全依赖内核网络栈既有的 `sk_wmem_alloc` / `sock_wfree` 机制保证 skb->sk 在 `dev_hard_start_xmit` 处的有效性
+- 代码注释里对这个设计决策的解释（见 [net-core-net-delayacct.c#L590-L623](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c#L590-L623)）写得非常清楚，应该保留，避免后续维护者再犯同样的错误
+- 主审查报告中问题 2.2.3 的描述、修法、Worker反馈都需要更新为这个最终结论
+- 这一轮修复同时解决了 GSO 统计正确性和 UAF 担忧两个子问题，且有 13/13 QEMU 测试通过的证据支持，可以闭环
+
+---
+
+## 2.2.3 重开后最终共识
+- **GSO**：子 skb 继承父 skb 的 `delayacct_start`，保证统计粒度正确
+- **生命周期**：不做任何额外的 sock_hold/sock_put，完全依赖内核既有的 `skb->destructor = sock_wfree` + `sk_wmem_alloc` 机制保证 socket 在 skb 飞行期间不被释放。这是内核网络栈的标准行为，安全可靠。
+- 本地 QEMU 全量测试 13/13 通过，无崩溃。
+
+

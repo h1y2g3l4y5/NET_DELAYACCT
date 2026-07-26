@@ -18,7 +18,7 @@ diff --git a/net/Kconfig b/net/Kconfig
 @@ -327,6 +327,23 @@
  	  Cgroup subsystem for use as general purpose socket classid marker that is
  	  being used in cls_cgroup and for netfilter matching.
- 
+
 +config NET_DELAYACCT
 +	bool "Per-socket network delay accounting"
 +	depends on NET
