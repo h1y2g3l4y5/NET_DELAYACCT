@@ -585,7 +585,20 @@ void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb)
 void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb)
 {
 	skb->delayacct_start = ktime_get_ns();
-	sock_hold(sk);
+	/*
+	 * Note on skb->sk lifetime: we intentionally do NOT call
+	 * sock_hold(sk) here.  The skb is owned by the originating
+	 * socket via skb->destructor (sock_wfree for TCP/UDP), which
+	 * keeps sk->sk_wmem_alloc > 0 and thereby prevents the socket
+	 * from being freed while the skb is in flight.  Adding an
+	 * extra sock_hold() here would break refcount accounting
+	 * under GSO: skb_segment() splits the parent skb into N
+	 * segments, each inheriting skb->sk and delayacct_start,
+	 * but only the parent ever called sock_hold().  The N
+	 * sock_put() calls in tx_end would then over-decrement
+	 * sk_refcnt and trigger premature socket free + NULL
+	 * deref in __sk_destruct (see issue 2.2.3 dialogue).
+	 */
 }
 
 void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
@@ -606,13 +619,10 @@ void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
 	n->stats.tx_count++;
 	spin_unlock(&n->lock);
 
-	/* Release the reference acquired in net_delayacct_tx_start().
-	 * NOTE: if the skb is dropped between tx_start and here (e.g.
-	 * in qdisc), this sock_put() is never reached and the ref
-	 * leaks.  A future improvement is to move the sock_put() into
-	 * a skb destructor callback.
+	/* No sock_put() here: see the note in net_delayacct_tx_start().
+	 * skb->sk lifetime is managed by skb->destructor (sock_wfree),
+	 * which the originating socket set when it owned the skb.
 	 */
-	sock_put(sk);
 }
 
 void net_delayacct_get_stats(struct sock *sk,

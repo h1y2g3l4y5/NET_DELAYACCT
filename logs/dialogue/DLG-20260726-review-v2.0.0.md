@@ -3,16 +3,75 @@
 - **关联 Review**: v2.0.0
 - **关联审查报告**: `logs/review/v2.0.0/REVIEW_REPORT.md`
 - **发起方**: Worker
-- **状态**: 已达成共识
+- **状态**: 已达成共识 → 重新开启（议题 2.2.3 复发）
 
 ---
+
+## 重开议题: 2.2.3 — TX UAF 修复方案在 GSO 下导致 NULL deref
+
+**触发事件**: 2026-07-26 22:30，CI QEMU 测试报告 NULL pointer dereference：
+
+```
+[    3.105631]  slab kmalloc-128 start ffff973441a1bd80 pointer offset 80 size 128
+[    3.106357] BUG: kernel NULL pointer dereference, address: 0000000000000000
+[    3.106357] RIP: 0010:0x0
+[    3.106357] CPU: 0 PID: 0 Comm: swapper/0
+[    3.106355] WARNING: CPU: 1 PID: 104 at kernel/rcu/tree.c:2255 rcu_core+0x912/0x980
+```
+
+**根因分析**:
+
+共识方案 `tx_start: sock_hold(sk)` + `tx_end: sock_put(sk)` 在 GSO 场景下不配对：
+
+1. `tcp_sendmsg_locked` 调用 `tx_start(sk, skb)` 对父 skb 调用 `sock_hold` → `sk_refcnt++`（1 次）
+2. `tcp_gso_segment` / `skb_segment` 把父 skb 切成 N 个子段，每个子段通过 `__copy_skb_header` 继承 `delayacct_start`（非零）和 `skb->sk`，但 `skb_segment` **不会**调用 `sock_hold`
+3. `dev_hard_start_xmit` 循环对每个子段调用 `tx_end(skb->sk, skb)` → `sock_put` N 次
+4. 结果：`sk_refcnt -= N` 但只 `+= 1`，多次 TX 后 `sk_refcnt` 提前归零
+5. socket 被 free，但 RCU 回调 `__sk_destruct` 仍被调用 → 调用已 free sock 的 `sk->sk_destruct`（NULL）→ `RIP: 0x0`
+
+**Worker 新建议**:
+
+完全移除 `sock_hold` / `sock_put`，依赖 `skb->destructor = sock_wfree` 自动管理 `skb->sk` 生命周期：
+
+- TCP/UDP 的 skb 在 `tcp_skb_entail` / `skb_set_owner_w` 时设置 `skb->destructor = sock_wfree`
+- `sock_wfree` 在 skb 释放时减少 `sk->sk_wmem_alloc`
+- 只要 `sk_wmem_alloc > 0`，socket 就不会被 free（`__sk_destruct` 中检查）
+- 这意味着 skb 存活期间 `skb->sk` 一定有效，无需额外 `sock_hold`
+
+**为什么原共识是错的**:
+
+原共识担忧的 UAF 场景（skb 在 qdisc drop，sk 已 free）实际上不会发生：
+- skb 持有 `sk_wmem_alloc` 引用，sk 不会先于 skb free
+- 真正的 UAF 路径需要先释放 skb 再访问 sk，但 `dev_hard_start_xmit` 中 skb 还活着
+
+**修复**:
+
+```c
+void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb)
+{
+    skb->delayacct_start = ktime_get_ns();
+    /* 不调用 sock_hold(sk)，依赖 skb->destructor */
+}
+
+void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
+{
+    ...
+    /* 不调用 sock_put(sk) */
+}
+```
+
+**请 Reviewer 回应**: 这个修复是否可以接受？如果可以，2.2.3 议题结论从 "sock_hold+sock_put" 修正为 "依赖 skb->destructor 自动管理"。
+
+---
+
+## 历史讨论（已闭环）
 
 ## 讨论议题
 
 ### 议题 1: 问题 2.2.1 — netns 过滤方案选择和 nsproxy NULL 处理
 
 **Reviewer 意见**:
-> `netnsok = true` 与全局 `for_each_process()` 矛盾。修法二选一：方案 A（保留 netnsok + 加 netns 过滤）或方案 B（关掉 netnsok）。
+> `netnsok = true` 与全局 `for_each_process()` 矛盾。修法二选一：方案 A（保留 netnsok + 加 netns过滤）或方案 B（关掉 netnsok）。
 
 **Worker 回应**:
 

@@ -75,21 +75,23 @@ static inline void net_delayacct_rx_start(struct sk_buff *skb)
 void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb);
 
 /**
- * net_delayacct_tx_start - stamp TX start time and hold sock ref
- * @sk:  the originating socket (guaranteed alive by caller)
+ * net_delayacct_tx_start - stamp TX start time on an skb
+ * @sk:  the originating socket (guaranteed alive by skb->destructor)
  * @skb: the outgoing &sk_buff
  *
  * Called at tcp_sendmsg / udp_sendmsg entry, on each newly allocated
  * skb, before it enters the IP layer.
  *
- * Timestamps skb->delayacct_start and takes a sock_hold(sk) to
- * prevent UAF of skb->sk between here and dev_hard_start_xmit
- * (see issue 2.2.3).  The matching sock_put() is in tx_end().
+ * Only timestamps skb->delayacct_start.  We do NOT call sock_hold():
+ * skb->sk lifetime is already managed by skb->destructor (sock_wfree
+ * for TCP/UDP), which keeps sk->sk_wmem_alloc > 0 and prevents the
+ * socket from being freed while the skb is in flight.  Adding an
+ * extra sock_hold() would break under GSO, where skb_segment()
+ * clones the parent skb into N segments that each inherit
+ * skb->sk and delayacct_start without an extra sock_hold().
  *
- * Defined out-of-line in net/core/net-delayacct.c because it
- * calls sock_hold() which touches sk->sk_refcnt and thus
- * requires the full definition of struct sock, which is not
- * available when this header is included from include/net/sock.h.
+ * Defined out-of-line in net/core/net-delayacct.c (consistency with
+ * the other helpers; also keeps the hot path simpler).
  */
 void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb);
 
