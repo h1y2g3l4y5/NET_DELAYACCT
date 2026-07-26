@@ -21,27 +21,20 @@
 #include <net/sock.h>
 #include <net/net-delayacct.h>
 
-#define CONCURRENCY_ITERS	100
-#define CONCURRENCY_THREADS	4
-
 /*
- * Fallback definition of KUNIT_DEFINE_TEST_SUITE for kernels that do
- * not yet provide it (e.g. Linux 6.6). This macro defines a struct
- * kunit_suite and registers it via kunit_test_suite().
+ * NOTE: If submitting upstream, this test file should be moved to
+ * net/core/net-delayacct-test.c and registered in lib/Kconfig.kunit
+ * under CONFIG_NET_DELAYACCT_KUNIT_TEST.
  */
-#ifndef KUNIT_DEFINE_TEST_SUITE
-#define KUNIT_DEFINE_TEST_SUITE(suite_name, test_cases)			\
-	static struct kunit_suite suite_name = {				\
-		.name = __stringify(suite_name),				\
-		.test_cases = test_cases,					\
-	};								\
-	kunit_test_suite(suite_name)
-#endif
 
 /*
- * Build a minimal stub sock for testing.  A real struct sock requires
- * extensive initialization; we only need the net_delayacct field so a
- * zeroed allocation suffices.
+ * Build a minimal stub sock for testing.
+ *
+ * NOTE: This is a zeroed allocation of struct sock (~440 bytes) and is
+ * sufficient for pure-logic tests (init/reset/accumulation counting) but
+ * does NOT exercise real protocol-stack concurrency or RCU contexts.
+ * For correctness testing of RCU/sleep/netns paths, use integration
+ * tests (e.g., QEMU-based netns isolation tests).
  */
 static struct sock *stub_sock_create(struct kunit *test)
 {
@@ -140,8 +133,11 @@ static void net_delayacct_test_tx_accumulation(struct kunit *test)
 
 	net_delayacct_init(&sk->sk_net_delayacct);
 
-	/* Simulate process entering sendmsg */
-	net_delayacct_tx_start(skb);
+	/* Simulate process entering sendmsg.  In the real path,
+	 * skb->sk is set by the protocol stack; stub it here.
+	 */
+	skb->sk = sk;
+	net_delayacct_tx_start(sk, skb);
 
 	fsleep(1000);
 
@@ -178,13 +174,12 @@ static int concurrency_thread_fn(void *data)
 	struct sk_buff skb_stub;
 	int i;
 
-	for (i = 0; i < CONCURRENCY_ITERS; i++) {
+	for (i = 0; i < CONCURRENCY_ITERS && !kthread_should_stop(); i++) {
 		memset(&skb_stub, 0, sizeof(skb_stub));
 		net_delayacct_rx_start(&skb_stub);
 		net_delayacct_rx_end(ctx->sk, &skb_stub);
 	}
 
-	atomic_dec(&ctx->remaining);
 	return 0;
 }
 
@@ -205,9 +200,9 @@ static void net_delayacct_test_concurrent_accumulation(struct kunit *test)
 		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, tasks[i]);
 	}
 
-	/* Wait for all threads to finish */
-	while (atomic_read(&ctx.remaining) > 0)
-		fsleep(1000);
+	/* kthread_stop() waits for each thread to exit */
+	for (i = 0; i < CONCURRENCY_THREADS; i++)
+		kthread_stop(tasks[i]);
 
 	/* Expected total count = threads * iterations per thread */
 	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.rx_count,
@@ -217,9 +212,6 @@ static void net_delayacct_test_concurrent_accumulation(struct kunit *test)
 	/* No leaks into TX */
 	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_count, 0);
 	KUNIT_EXPECT_EQ(test, sk->sk_net_delayacct.tx_total_ns, 0);
-
-	for (i = 0; i < CONCURRENCY_THREADS; i++)
-		kthread_stop(tasks[i]);
 }
 
 /*

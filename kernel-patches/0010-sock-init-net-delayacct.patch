@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: laiguo-liang <2909269677@qq.com>
+Date: Sat, 26 Jul 2026 22:30:00 +0800
+Subject: [PATCH] net-delayacct: initialize sk_net_delayacct in sk_prot_alloc
+
+Call net_delayacct_init() in sk_prot_alloc() right after
+sk_tx_queue_clear(), so every newly allocated sock has its
+per-socket delay accounting state zeroed.  Previously this was
+done via a CI sed script; moving it into a formal patch makes
+the patch series self-consistent (see review issue 2.4.3).
+
+Signed-off-by: laiguo-liang <2909269677@qq.com>
+---
+ net/core/sock.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/net/core/sock.c b/net/core/sock.c
+index a6944844553a..8965e4ec7d5f 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1990,6 +1990,7 @@ struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
+ 		if (!try_module_get(prot->owner))
+ 			goto out_free_sec;
+ 		sk_tx_queue_clear(sk);
++		net_delayacct_init(&sk->sk_net_delayacct);
+ 	}
+
+ 	return sk;

@@ -42,7 +42,7 @@ NET_DELAYACCT 在 Linux 6.6 内核中参考 `CONFIG_DELAYACCT` 的设计思想�
 
 **接受场景**：
 
-- 执行 `./get_sockdelays -r`。
+- 执行 `./get_sockdelays -R`。
 - 工具输出 `Statistics reset for all sockets`。
 - 后续查询的时延从 0 开始累加。
 
@@ -161,7 +161,7 @@ NET_DELAYACCT 在 Linux 6.6 内核中参考 `CONFIG_DELAYACCT` 的设计思想�
 |------|------|
 | `-p <pid>` | 查询指定 PID 的所有 socket 时延 |
 | `-i <inode>` | 查询指定 inode 的 socket 时延 |
-| `-r` | 重置所有 socket 时延统计 |
+| `-R` | 重置所有 socket 时延统计 |
 | `-n` | 输出时延单位为 ns（默认 μs） |
 | `-d` | dump 模式，循环输出 |
 | `-t <interval>` | dump 间隔（秒，默认 1） |
@@ -172,7 +172,7 @@ NET_DELAYACCT 在 Linux 6.6 内核中参考 `CONFIG_DELAYACCT` 的设计思想�
 - `make -C tools/net get_sockdelays` 构建成功。
 - `./get_sockdelays -p <pid>` 输出多行，每行一个 socket。
 - `./get_sockdelays -i <inode>` 输出单行。
-- `./get_sockdelays -r` 输出确认信息。
+- `./get_sockdelays -R` 输出确认信息。
 - 平均时延 = 累计时延 / 计数；计数为 0 时显示 `N/A`。
 - 输出表头与字段对齐，IPv4/IPv6 地址正确格式化。
 
@@ -275,7 +275,7 @@ NET_DELAYACCT 在 Linux 6.6 内核中参考 `CONFIG_DELAYACCT` 的设计思想�
 
 - [ ] `tools/net/get_sockdelays.c` 存在，结构参考 `getdelays.c`
 - [ ] `tools/net/Makefile` 可通过 `make -C tools/net get_sockdelays` 构建出可执行文件
-- [ ] 命令行支持 `-p <pid>`、`-i <inode>`、`-r`、`-h`、`-n`、`-d`、`-t <interval>`
+- [ ] 命令行支持 `-p <pid>`、`-i <inode>`、`-R`、`-h`、`-n`、`-d`、`-t <interval>`
 - [ ] 通过 `genl_ctrl_search_by_name` 正确解析 family
 - [ ] `GET_BY_PID` 可发送并接收多消息回复
 - [ ] `GET_BY_INODE` 可发送并接收单条回复
@@ -292,7 +292,7 @@ NET_DELAYACCT 在 Linux 6.6 内核中参考 `CONFIG_DELAYACCT` 的设计思想�
 - [ ] KUnit 单元测试覆盖累加、重置、并发安全，全部通过
 - [ ] `tests/func/test_pid_query.sh` 验证 `-p` 多 socket 输出，通过
 - [ ] `tests/func/test_inode_query.sh` 验证 `-i` 输出，通过
-- [ ] `tests/func/test_reset.sh` 验证 `-r` 后统计归零，通过
+- [ ] `tests/func/test_reset.sh` 验证 `-R` 后统计归零，通过
 - [ ] `tests/func/test_multi_socket.sh` 验证单进程多 socket 分别显示，通过
 - [ ] `tests/func/test_tcp_udp.sh` 分别验证 TCP、UDP 路径，通过
 - [ ] `tests/perf/baseline-vs-enabled.sh` 输出开启前后吞吐/RTT 对比数据

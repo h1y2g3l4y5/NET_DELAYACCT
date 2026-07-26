@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2026 h1y2g3l4y5 */
+/* Copyright (c) 2026 laiguo-liang <2909269677@qq.com> */
 /*
  * net/core/net-delayacct.c - Per-socket network delay accounting
  *
@@ -86,7 +86,7 @@ static const struct genl_ops net_delayacct_ops[] = {
 	},
 };
 
-static struct genl_family net_delayacct_genl_family __ro_after_init = {
+static struct genl_family net_delayacct_genl_family = {
 	.name		= "net_delayacct",
 	.version	= 1,
 	.maxattr	= NET_DELAYACCT_A_MAX,
@@ -200,15 +200,7 @@ static int net_delayacct_one_reply(struct genl_info *info, int flags,
 	}
 	genlmsg_end(msg, hdr);
 
-	{
-		struct nlmsghdr *nlh = nlmsg_hdr(msg);
-
-		pr_debug("net_delayacct: one_reply: SEND skb->len=%u nlmsg_type=%u nlmsg_len=%u nlmsg_flags=%u\n",
-			 msg->len, nlh->nlmsg_type, nlh->nlmsg_len,
-			 nlh->nlmsg_flags);
-	}
 	ret = genlmsg_reply(msg, info);
-	pr_debug("net_delayacct: one_reply: genlmsg_reply ret=%d\n", ret);
 	return ret;
 }
 
@@ -267,36 +259,13 @@ static bool is_inet_tcp_udp(struct sock *sk)
 }
 
 /**
- * sock_from_file_safe - resolve a &struct file to a &struct sock
- * @file: file pointer (must be S_IFSOCK)
+ * Resolve a &struct file to a &struct sock via sock_from_file().
  *
- * TODO: sock_from_file() is available on recent kernels; on 6.6 we
- * fall back to SOCKET_I(file_inode(file))->sk which is always
- * available via <net/sock.h>.
+ * sock_from_file() is available since 5.15+ and is the canonical helper.
  */
 static struct sock *sock_from_file_safe(struct file *file)
 {
-	struct inode *inode;
-	struct socket *sock;
-
-	if (!file)
-		return NULL;
-	inode = file_inode(file);
-	if (!S_ISSOCK(inode->i_mode))
-		return NULL;
-
-	sock = SOCKET_I(inode);
-	if (!sock) {
-		pr_info_ratelimited("net_delayacct: sock_from_file_safe: SOCKET_I returned NULL for inode %lu\n",
-				    inode->i_ino);
-		return NULL;
-	}
-	if (!sock->sk) {
-		pr_info_ratelimited("net_delayacct: sock_from_file_safe: sock->sk is NULL for inode %lu\n",
-				    inode->i_ino);
-		return NULL;
-	}
-	return sock->sk;
+	return sock_from_file(file);
 }
 
 /* Iterate every socket fd of @task and emit a reply for each
@@ -331,8 +300,6 @@ static int net_delayacct_iter_task_sockets(struct task_struct *task,
 
 	spin_lock(&files->file_lock);
 	fdt = files_fdtable(files);
-	pr_debug("net_delayacct: iter_task_sockets pid=%u max_fds=%u\n",
-		pid, fdt->max_fds);
 	for (fd = 0; fd < fdt->max_fds; fd++) {
 		struct file *file = fdt->fd[fd];
 		struct sock *sk;
@@ -342,16 +309,8 @@ static int net_delayacct_iter_task_sockets(struct task_struct *task,
 		sk = sock_from_file_safe(file);
 		if (!sk)
 			continue;
-		if (!is_inet_tcp_udp(sk)) {
-			pr_debug("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u SKIPPED\n",
-				fd, (unsigned long long)sock_inode_for(sk),
-				sk->sk_family, sk->sk_protocol);
+		if (!is_inet_tcp_udp(sk))
 			continue;
-		}
-
-		pr_debug("net_delayacct: iter fd=%u inode=%llu family=%u proto=%u FOUND\n",
-			fd, (unsigned long long)sock_inode_for(sk),
-			sk->sk_family, sk->sk_protocol);
 
 		/* Hold a reference while we drop file_lock to send. */
 		get_file(file);
@@ -397,10 +356,8 @@ static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
 
 	pid = nla_get_u32(info->attrs[NET_DELAYACCT_A_PID]);
 
-	pr_debug("net_delayacct: cmd_get_by_pid: querying pid=%u\n", pid);
-
 	rcu_read_lock();
-	pidp = find_get_pid(pid);
+	pidp = find_vpid(pid);
 	if (!pidp) {
 		rcu_read_unlock();
 		return -ESRCH;
@@ -411,6 +368,17 @@ static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
 		rcu_read_unlock();
 		return -ESRCH;
 	}
+
+	/* netns consistency: when netnsok=true, ensure the resolved task
+	 * lives in the caller's network namespace (see issue 2.2.1).
+	 */
+	if (task->nsproxy &&
+	    task->nsproxy->net_ns != current->nsproxy->net_ns) {
+		rcu_read_unlock();
+		put_pid(pidp);
+		return -ESRCH;
+	}
+
 	get_task_struct(task);
 	rcu_read_unlock();
 
@@ -433,15 +401,20 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 		return -EINVAL;
 	target_inode = nla_get_u64(info->attrs[NET_DELAYACCT_A_INODE]);
 
-	pr_debug("net_delayacct: cmd_get_by_inode: ENTER target_inode=%llu\n",
-		 (unsigned long long)target_inode);
-
 	rcu_read_lock();
 	for_each_process(task) {
 		struct files_struct *files;
 		struct fdtable *fdt;
 		unsigned int fd;
 		int ret;
+
+		/* netns isolation: skip tasks outside the caller's
+		 * network namespace (see issue 2.2.1).  Kernel threads
+		 * have nsproxy == NULL and should also be skipped.
+		 */
+		if (!task->nsproxy ||
+		    task->nsproxy->net_ns != current->nsproxy->net_ns)
+			continue;
 
 		task_lock(task);
 		files = task->files;
@@ -466,40 +439,46 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 			if (!is_inet_tcp_udp(sk))
 				continue;
 			sock_count++;
-			/* Use file_inode directly — more reliable than
-			 * sock_inode_for() which depends on sk->sk_socket->file
-			 * (may be NULL in some kernel versions).
-			 */
 			ino = file_inode(file)->i_ino;
-			pr_debug("net_delayacct: cmd_get_by_inode: pid=%d fd=%u ino=%llu sk_family=%u sk_proto=%u\n",
-				 task_pid_nr(task), fd,
-				 (unsigned long long)ino,
-				 sk->sk_family, sk->sk_protocol);
 			if (ino != target_inode)
 				continue;
 			match_count++;
 
+			/* Grab references and copy comm under
+			 * task_lock; then exit RCU before the
+			 * netlink reply which may sleep (GFP_KERNEL
+			 * allocation inside genlmsg_new — see issues
+			 * 2.1.1 and 2.1.2).
+			 */
 			get_file(file);
 			sock_hold(sk);
-			spin_unlock(&files->file_lock);
+			get_task_struct(task);
 
-			ret = net_delayacct_one_reply(info, 0, sk,
-						      task_pid_nr(task),
-						      task->comm, ino);
-			sock_put(sk);
-			fput(file);
-			put_files_struct(files);
-			rcu_read_unlock();
-			pr_debug("net_delayacct: cmd_get_by_inode: MATCH ret=%d\n", ret);
-			return ret;
+			{
+				char comm[TASK_COMM_LEN];
+
+				task_lock(task);
+				memcpy(comm, task->comm, TASK_COMM_LEN);
+				task_unlock(task);
+
+				spin_unlock(&files->file_lock);
+				rcu_read_unlock();
+
+				ret = net_delayacct_one_reply(info, 0, sk,
+							      task_pid_nr(task),
+							      comm, ino);
+				sock_put(sk);
+				fput(file);
+				put_task_struct(task);
+				put_files_struct(files);
+				return ret;
+			}
 		}
 		spin_unlock(&files->file_lock);
 		put_files_struct(files);
 	}
 	rcu_read_unlock();
 
-	pr_debug("net_delayacct: cmd_get_by_inode: EXIT sock_count=%d match_count=%d (returning -ENOENT)\n",
-		 sock_count, match_count);
 	return -ENOENT;
 }
 
@@ -513,6 +492,13 @@ static int net_delayacct_cmd_reset(struct sk_buff *skb,
 		struct files_struct *files;
 		struct fdtable *fdt;
 		unsigned int fd;
+
+		/* netns isolation: skip tasks outside the caller's
+		 * network namespace (see issue 2.2.1).
+		 */
+		if (!task->nsproxy ||
+		    task->nsproxy->net_ns != current->nsproxy->net_ns)
+			continue;
 
 		task_lock(task);
 		files = task->files;
@@ -610,6 +596,14 @@ void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
 	n->stats.tx_total_ns += delta;
 	n->stats.tx_count++;
 	spin_unlock(&n->lock);
+
+	/* Release the reference acquired in net_delayacct_tx_start().
+	 * NOTE: if the skb is dropped between tx_start and here (e.g.
+	 * in qdisc), this sock_put() is never reached and the ref
+	 * leaks.  A future improvement is to move the sock_put() into
+	 * a skb destructor callback.
+	 */
+	sock_put(sk);
 }
 
 void net_delayacct_get_stats(struct sock *sk,
@@ -657,4 +651,4 @@ module_exit(net_delayacct_exit);
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Per-socket network delay accounting");
-MODULE_AUTHOR("h1y2g3l4y5 <h1y2g3l4y5@example.com>");
+MODULE_AUTHOR("laiguo-liang <2909269677@qq.com>");

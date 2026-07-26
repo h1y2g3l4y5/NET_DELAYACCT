@@ -125,7 +125,7 @@
 - FR-4：RX 路径插桩（__netif_receive_skb_core / tcp_recvmsg / __skb_recv_udp）
 - FR-5：TX 路径插桩（tcp_sendmsg / udp_sendmsg / dev_hard_start_xmit）
 - FR-6：Generic Netlink 接口（GET_BY_PID / GET_BY_INODE / RESET）
-- FR-7：get_sockdelays 工具（-p / -i / -r / -n / -d / -t / -h）
+- FR-7：get_sockdelays 工具（-p / -i / -R / -n / -d / -t / -h）
 - FR-8：文档与测试（Documentation/networking/net-delayacct.rst + selftests）
 
 **配图说明**：左侧 5 个用户故事图标，右侧 8 个功能需求编号卡片，用箭头连接故事到对应需求。
@@ -483,7 +483,7 @@ spin_unlock(&files->file_lock);
 6. 按 PID 查询（sudo ./get_sockdelays -p <pid>）—— 期望多行 TCP socket
 7. 从 /proc/<pid>/fd 取 inode（ls -l /proc/<pid>/fd | grep socket）
 8. 按 inode 查询（sudo ./get_sockdelays -i <inode>）—— 期望单行
-9. 重置统计（sudo ./get_sockdelays -r）
+9. 重置统计（sudo ./get_sockdelays -R）
 10. 再次查询验证归零
 11. 多 socket 演示（启动 nc + iperf3，查询同一 PID）
 

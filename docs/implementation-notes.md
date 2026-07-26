@@ -15,7 +15,7 @@
 |------|------|-----------|----------|
 | 第 1 周 | 前期准备 | Task 1 - Task 5 | 仓库初始化、CI 配置、6.6 内核编译环境、DELAYACCT 与协议栈研究、`docs/design.md` 定稿 |
 | 第 2 周 | 内核框架实现 | Task 6 - Task 10 | Kconfig/Makefile、UAPI 与内部头文件、`struct sock`/`struct sk_buff` 字段、RX/TX 插桩、generic netlink family 注册 |
-| 第 3 周 | 用户态工具 | Task 11 - Task 15 | `tools/net/get_sockdelays.c` 骨架、netlink 通信、`-p`/`-i`/`-r`/`-n`/`-h` 选项、格式化输出 |
+| 第 3 周 | 用户态工具 | Task 11 - Task 15 | `tools/net/get_sockdelays.c` 骨架、netlink 通信、`-p`/`-i`/`-R`/`-n`/`-h` 选项、格式化输出 |
 | 第 4 周 | 测试验收与文档 | Task 16 - Task 22 | KUnit 单测、功能/性能/压力测试脚本、测试报告、内核用户文档、开发文档、答辩材料 |
 
 各阶段的关键依赖关系:
@@ -400,7 +400,7 @@ while (rem >= NLA_HDRLEN) {
 | test_01_query_own_pid | 查询自身 PID, 工具不崩溃 | PASS |
 | test_02_nc_listener_pid | nc 监听后连接, PID 查询输出非空 | PASS |
 | test_03_inode_query | 从 /proc/<pid>/fd 提取 inode, -i 查询返回单行 | PASS |
-| test_04_reset | -r 重置后所有计数为零 | PASS |
+| test_04_reset | -R 重置后所有计数为零 | PASS |
 | test_05_tcp_path | iperf3 TCP 流量, 输出含 TCP 类型 | PASS |
 | test_06_udp_path | iperf3 -u UDP 流量, 输出含 UDP 类型 | PASS |
 | test_07_multi_socket | nc + iperf3 并发, 多 socket 输出多行 | PASS |

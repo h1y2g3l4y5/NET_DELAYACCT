@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2026 h1y2g3l4y5 */
+/* Copyright (c) 2026 laiguo-liang <2909269677@qq.com> */
 /*
  * Per-socket network delay accounting (CONFIG_NET_DELAYACCT).
  *
@@ -75,15 +75,21 @@ static inline void net_delayacct_rx_start(struct sk_buff *skb)
 void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb);
 
 /**
- * net_delayacct_tx_start - stamp TX start time on an skb
+ * net_delayacct_tx_start - stamp TX start time and hold sock ref
+ * @sk:  the originating socket (guaranteed alive by caller)
  * @skb: the outgoing &sk_buff
  *
  * Called at tcp_sendmsg / udp_sendmsg entry, on each newly allocated
  * skb, before it enters the IP layer.
+ *
+ * sock_hold(sk) prevents UAF of skb->sk between here and
+ * dev_hard_start_xmit (see issue 2.2.3).  The matching sock_put()
+ * is in net_delayacct_tx_end().
  */
-static inline void net_delayacct_tx_start(struct sk_buff *skb)
+static inline void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb)
 {
 	skb->delayacct_start = ktime_get_ns();
+	sock_hold(sk);
 }
 
 /**
@@ -124,7 +130,7 @@ void net_delayacct_reset(struct sock *sk);
 static inline void net_delayacct_init(struct net_delayacct *n) {}
 static inline void net_delayacct_rx_start(struct sk_buff *skb) {}
 static inline void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb) {}
-static inline void net_delayacct_tx_start(struct sk_buff *skb) {}
+static inline void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb) {}
 static inline void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb) {}
 static inline void net_delayacct_get_stats(struct sock *sk,
 					   struct net_delayacct_stats *out)

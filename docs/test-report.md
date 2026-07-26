@@ -17,7 +17,7 @@
 测试范围:
 
 - 单元测试（KUnit）: 5 个用例, 覆盖累加、重置、并发安全、zero-start 防护。
-- 功能测试: 5 个用例, 覆盖 `-p`/`-i`/`-r` 命令、多 socket、TCP/UDP 路径。
+- 功能测试: 5 个用例, 覆盖 `-p`/`-i`/`-R` 命令、多 socket、TCP/UDP 路径。
 - 性能测试: 3 个用例, 覆盖基线对比、长跑稳定性、并发查询。
 - 回归测试: `CONFIG_NET_DELAYACCT=n` 内核行为与原生 6.6 一致。
 
@@ -68,7 +68,7 @@
 | 单元测试 (KUnit) | test_skip_zero_start | 同上 | PASS | zero-start skb 被跳过 |
 | 功能测试 | test_pid_query | tests/func/test_pid_query.sh | PASS | -p 输出含 TCP |
 | 功能测试 | test_inode_query | tests/func/test_inode_query.sh | PASS | -i 输出单行 |
-| 功能测试 | test_reset | tests/func/test_reset.sh | PASS | -r 后计数归零 |
+| 功能测试 | test_reset | tests/func/test_reset.sh | PASS | -R 后计数归零 |
 | 功能测试 | test_multi_socket | tests/func/test_multi_socket.sh | PASS | 多 socket 输出多行 |
 | 功能测试 | test_tcp_udp | tests/func/test_tcp_udp.sh | PASS | TCP/UDP 类型分别识别 |
 | 性能测试 | baseline-vs-enabled | tests/perf/baseline-vs-enabled.sh | PASS | 吞吐下降 < 2% |
@@ -186,10 +186,10 @@
 
 #### 4.2.3 test_reset
 
-- **描述**: 产生流量后执行 `-r`, 验证所有计数归零。
+- **描述**: 产生流量后执行 `-R`, 验证所有计数归零。
 - **步骤**:
   1. `nc -l 12347` + `nc 127.0.0.1 12347` 产生流量。
-  2. `get_sockdelays -r`。
+  2. `get_sockdelays -R`。
   3. `get_sockdelays -p <pid>`。
   4. 验证输出中无非零时延计数。
 - **期望**: 重置后所有计数为零或 N/A。
@@ -371,7 +371,7 @@ UDP 吞吐对比（iperf3 -u）:
 
 ### 7.1 测试结论
 
-- **功能**: 14 个用例全部通过, per-socket 收发时延统计功能正确, `-p`/`-i`/`-r` 命令行为符合需求。
+- **功能**: 14 个用例全部通过, per-socket 收发时延统计功能正确, `-p`/`-i`/`-R` 命令行为符合需求。
 - **性能**: 开启 `CONFIG_NET_DELAYACCT` 后吞吐下降 < 2%, TCP_RR 时延上升 < 5%, CPU 额外占用约 1.2%, 满足 NFR-1 性能要求。
 - **稳定性**: 24h 长跑无内存泄漏、无死锁、无 oops, 满足生产可用性。
 - **并发**: 32 进程并发查询无 race, spinlock 与 RCU 设计正确。

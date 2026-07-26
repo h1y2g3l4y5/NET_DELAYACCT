@@ -257,7 +257,7 @@ TCP   127.0.0.1    42592  127.0.0.1   5201   iperf3  4257  18.4        12.8     
 **命令**：
 
 ```bash
-sudo ./userspace/get_sockdelays/get_sockdelays -r
+sudo ./userspace/get_sockdelays/get_sockdelays -R
 ```
 
 **期望输出**：
@@ -268,7 +268,7 @@ Statistics reset for all sockets
 
 **讲解词**：
 
-> `sudo ./get_sockdelays -r` 重置所有 socket 的时延统计。
+> `sudo ./get_sockdelays -R` 重置所有 socket 的时延统计。
 > 输出确认信息 "Statistics reset for all sockets"。
 > 这个功能对应 US-3 用户故事：在内核升级或配置变更后，从干净基线重新开始观测。
 > RESET 命令需要 CAP_NET_ADMIN 权限，防止普通用户误清统计。
@@ -470,7 +470,7 @@ ls -l /proc/<pid>/fd | grep socket
 **排查命令**：
 
 ```bash
-sudo ./get_sockdelays -r   # 确认加了 sudo
+sudo ./get_sockdelays -R   # 确认加了 sudo
 # 立即查询（不 sleep）
 sudo ./get_sockdelays -p <pid>
 ```
@@ -575,7 +575,7 @@ sudo ./userspace/get_sockdelays/get_sockdelays -i "$INODE"
 
 # Step 8
 echo "=== Step 8: reset ==="
-sudo ./userspace/get_sockdelays/get_sockdelays -r
+sudo ./userspace/get_sockdelays/get_sockdelays -R
 
 # Step 9
 echo "=== Step 9: query again ==="

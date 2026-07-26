@@ -186,49 +186,45 @@ struct sock;
 #ifdef CONFIG_NET_DELAYACCT
 
 struct net_delayacct {
-    spinlock_t                 lock;         /* 保护 stats 与 pending 字段 */
+    spinlock_t                 lock;         /* 保护 stats 并发访问 */
     struct net_delayacct_stats stats;
-    ktime_t                    rx_start;     /* 暂未使用（RX start 在 skb 上） */
-    ktime_t                    tx_start;     /* 暂未使用（TX start 在 skb 上） */
-    bool                       rx_pending;
-    bool                       tx_pending;
 };
 
 /* 在 struct sock 中嵌入: sk->sk_net_delayacct */
 
-void net_delayacct_sock_init(struct sock *sk);
+void net_delayacct_init(struct net_delayacct *n);
 void net_delayacct_rx_start(struct sk_buff *skb);
 void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb);
-void net_delayacct_tx_start(struct sk_buff *skb);
+void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb);
 void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb);
-void net_delayacct_sock_reset(struct sock *sk);
+void net_delayacct_reset(struct sock *sk);
+void net_delayacct_get_stats(struct sock *sk,
+                             struct net_delayacct_stats *out);
 
 static inline void net_delayacct_init(struct net_delayacct *n)
 {
     spin_lock_init(&n->lock);
-    n->stats.rx_total_ns = 0;
-    n->stats.rx_count = 0;
-    n->stats.tx_total_ns = 0;
-    n->stats.tx_count = 0;
-    n->rx_start = 0;
-    n->tx_start = 0;
-    n->rx_pending = false;
-    n->tx_pending = false;
+    memset(&n->stats, 0, sizeof(n->stats));
 }
 
 #else  /* !CONFIG_NET_DELAYACCT */
 
 struct net_delayacct { /* empty placeholder, 0 bytes */ };
 
-static inline void net_delayacct_sock_init(struct sock *sk) {}
+static inline void net_delayacct_init(struct net_delayacct *n) {}
 static inline void net_delayacct_rx_start(struct sk_buff *skb) {}
 static inline void net_delayacct_rx_end(struct sock *sk,
                                         struct sk_buff *skb) {}
-static inline void net_delayacct_tx_start(struct sk_buff *skb) {}
+static inline void net_delayacct_tx_start(struct sock *sk,
+                                          struct sk_buff *skb) {}
 static inline void net_delayacct_tx_end(struct sock *sk,
                                         struct sk_buff *skb) {}
-static inline void net_delayacct_sock_reset(struct sock *sk) {}
-static inline void net_delayacct_init(struct net_delayacct *n) {}
+static inline void net_delayacct_reset(struct sock *sk) {}
+static inline void net_delayacct_get_stats(struct sock *sk,
+                                           struct net_delayacct_stats *out)
+{
+    memset(out, 0, sizeof(*out));
+}
 
 #endif /* CONFIG_NET_DELAYACCT */
 
