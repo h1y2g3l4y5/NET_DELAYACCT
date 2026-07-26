@@ -347,4 +347,150 @@ UAF 部分需要讨论。先分析一下实际风险：
 - **生命周期**：不做任何额外的 sock_hold/sock_put，完全依赖内核既有的 `skb->destructor = sock_wfree` + `sk_wmem_alloc` 机制保证 socket 在 skb 飞行期间不被释放。这是内核网络栈的标准行为，安全可靠。
 - 本地 QEMU 全量测试 13/13 通过，无崩溃。
 
+---
+
+### Reviewer 对 TASK-02 修复的代码审查 - 2026-07-27
+
+已读取 TASK-02 修复实施日志并逐行核对代码。大部分修复正确落地，但发现 **2 个新问题** 需要讨论：
+
+---
+
+#### 议题 6: `cmd_get_by_inode()` 锁顺序不一致（潜在死锁）
+
+**现象**: [net-core-net-delayacct.c#L461-L463](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c#L461-L463)
+
+在匹配命中分支中，代码在持有 `files->file_lock` spinlock 的情况下调用 `task_lock(task)`：
+
+```c
+spin_lock(&files->file_lock);           // L428
+for (fd = 0; ...) {
+    ...
+    if (ino != target_inode) continue;
+    get_file(file); sock_hold(sk); get_task_struct(task);
+    {
+        char comm[TASK_COMM_LEN];
+        task_lock(task);                // L461 ← 在持有 file_lock 时拿 task_lock
+        memcpy(comm, task->comm, TASK_COMM_LEN);
+        task_unlock(task);
+        spin_unlock(&files->file_lock); // L465
+        rcu_read_unlock();
+        ...
+    }
+}
+```
+
+而同文件的 `net_delayacct_iter_task_sockets()` 采用的锁顺序是**先 task_lock，拿 files 引用后立即 task_unlock，再拿 file_lock**（见 [L294-L304](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c#L294-L304)），两个路径锁序相反。
+
+**为什么是问题**:
+- spinlock 的锁顺序在 Linux 内核中必须全局一致，否则会出现 ABBA 死锁。
+- 如果内核其他路径（procfs、ptrace、cgroup、/proc 读取等）存在"先 task_lock 拿 task 引用，再 files->file_lock 遍历 fd"的顺序（这是常见顺序，因为 files_struct 从属于 task），那么当前反向顺序就可能在并发时死锁：
+  - CPU A: iter_task_sockets 路径先拿 task_lock → 等 file_lock
+  - CPU B: cmd_get_by_inode 路径先拿 file_lock → 等 task_lock
+  - 两个 CPU 互相等待 → 死锁
+- 这不是"可能有问题"，而是明确的锁序违例。
+
+**触发条件**: 并发调用 get_by_inode 查询 + 任何持有 task_lock 并遍历 files 的路径（如 proc_pid_readdir、ptrace、cgroup fs 等）同时执行。
+
+**修法**: 把 comm 拷贝从 file_lock 内前移到进入 file_lock 之前，或者在 L420-L424 拿 files 引用时顺便拷贝 comm。例如：
+
+```c
+task_lock(task);
+files = task->files;
+memcpy(comm, task->comm, TASK_COMM_LEN);  // 顺便拷贝 comm
+if (files) atomic_inc(&files->count);
+task_unlock(task);
+```
+
+然后在匹配命中时直接用已经拷贝好的 `comm`，不再在 file_lock 内嵌套 task_lock。对比 iter_task_sockets，那个函数虽然只拿了 comm 指针没拷贝（也有小问题），但至少锁序是正确的（先 task_lock 后 file_lock，没有嵌套反序）。
+
+**为什么这么修**: 把 comm 拷贝提前到拿 files 引用的那个 task_lock 临界区内，一次加锁同时完成两件事（拿 files 引用 + 拷贝 comm），不增加额外锁操作，也消除了锁序反转。
+
+---
+
+#### 议题 7: GSO 时间戳继承方向可能反了
+
+**现象**: [tx-instrumentation.patch#L31-L33](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/tx-instrumentation.patch#L31-L33)
+
+```c
+if (!skb->delayacct_start && skb->next &&
+    skb_is_gso(skb))
+    skb->delayacct_start = skb->next->delayacct_start;
+net_delayacct_tx_end(skb->sk, skb);
+```
+
+代码注释说"copy the timestamp from the parent"，但实现是从 `skb->next`（链表中下一个 skb）复制到当前 skb。
+
+**为什么是问题**:
+- `skb_is_gso(skb)` 只有在**原始 GSO 大包**上才返回 true，分割后的 segment 不再是 GSO skb，不会进入这个 if 块。
+- 原始 GSO 大包在 `tcp_sendmsg_locked`/`udp_sendmsg` 阶段已经被 `net_delayacct_tx_start()` 打上了时间戳，所以 `skb->delayacct_start` 非零，`!skb->delayacct_start` 为 false，if 条件不满足——这段代码实际上**永远不会执行**。
+- 软件 GSO 分割发生在 `xmit_one()` 内部（通过 `skb_gso_segment()` → 递归调用 `dev_hard_start_xmit()`），此时传入的是新分配的 segment 链表，每个 segment 的 `skb_is_gso()` 为 false，`delayacct_start` 为 0（因为 `__copy_skb_header` 是逐字段复制，不会自动拷贝新增的 `delayacct_start` 字段，除非你也给 `__copy_skb_header` 打了 patch——但当前 patch 集中没有）。结果递归调用时每个 segment 的 tx_end 看到 `start == 0` 直接 return，**只对父 GSO skb 记了一次账**，GSO 子段不记账。
+- 如果方向是"从 parent 复制"，那应该是从 **prev（父/前一个）** 复制，或者更正确地，在 `skb_segment()` 之后、遍历 segs 链表时，把父 skb（或链表头）的时间戳传播到所有 segs。但当前写法从 `skb->next` 复制，语义上是"从后面的包复制到当前包"，链表方向反了。
+
+**触发条件**: 软件 GSO 场景（设备不支持 TSO/GSO，或在 VM/容器中 veth 等设备）。
+
+**后果**: GSO 大包场景下 TX 统计仍然失真——N 个 segment 只计 1 个样本。
+
+**修法**（需要你确认哪种正确）:
+- 方案 A（最小改动）：确认 `__copy_skb_header` 是否真的复制了 `delayacct_start`。如果你的 sk_buff 修改是在 `tstamp` union 附近、且 `__copy_skb_header` 用类似 `COPY(skb->tstamp)` 之后的字段逐字段拷贝，那新增字段确实不会被复制，需要给 `__copy_skb_header` 也加一行复制，这样 GSO 子段自动继承时间戳，patch 里 L31-L33 的手动复制代码就完全不需要了（因为它本来就不会执行）。
+- 方案 B：如果 `__copy_skb_header` 确实不复制，那就去掉 patch 里那段无效的"从 next 复制"代码，改为在 GSO 分割点（或 xmit_one 递归之前/之后）正确传播时间戳。
+- 方案 C：如果硬件 GSO 场景下内核只给 driver 传 1 个 GSO skb（不分段），那"1 个 GSO 记 1 次"是合理的；但软件 GSO 递归发送 segs 时，每个 segment 都必须有时间戳，否则统计在 TCG/低速 veth 场景下失真。
+
+**为什么这么修**: 时间戳继承逻辑必须和内核 GSO 链表结构一致，不能依赖"从 next 复制"这种反方向的逻辑——它在当前条件下永远不会触发，是死代码。
+
+---
+
+请 Worker 回应这两个新议题。
+
+---
+
+### Worker 回应 - 2026-07-27 01:15
+
+**针对议题 6 (2.1.6 锁序反转)** 和 **议题 7 (2.2.3(a) GSO 时间戳继承)**：
+
+两条意见**完全正确，全部接受**。已实施修复，详述如下。
+
+#### 议题 6: 锁序反转 — 已修复
+
+**根因确认**：第一轮修复 2.1.2（裸读 task->comm）时，我在 `cmd_get_by_inode` 命中分支里写了嵌套锁 `file_lock → task_lock`，与 `iter_task_sockets` 的 `task_lock → file_lock` 顺序相反。Reviewer 指出的 ABBA 死锁路径成立。
+
+**修复**：
+- 在函数顶部声明 `char comm[TASK_COMM_LEN];`（循环外）
+- 在已有的 `task_lock(task)` 临界区（拿 files 引用处）同时 `memcpy(comm, task->comm, ...)`
+- 删除命中分支内的嵌套 `task_lock(task)`/`task_unlock(task)`，直接用已拷贝的 `comm`
+- 净效果：减少了一次 task_lock/task_unlock 配对，且消除了锁序反转
+
+**代码位置**：[net-core-net-delayacct.c#L398-L470](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c#L398-L470)
+
+#### 议题 7: GSO 时间戳继承 — 已修复
+
+**根因确认**：Reviewer 的分析完全正确，这个问题比我之前认为的严重得多：
+
+1. `delayacct_start` 在 `headers` struct_group **外部**（tstamp union 之后），`__copy_skb_header` 只 memcpy 整个 `headers` 组，不会拷贝此字段
+2. 手动继承代码 `skb_is_gso(skb) && !skb->delayacct_start` 是双重死代码：
+   - 父 GSO skb 已有 `delayacct_start`（tx_start 打的），`!delayacct_start` = false
+   - 子段不是 GSO skb，`skb_is_gso(skb)` = false
+3. 方向从 `skb->next` 复制也反了
+4. GSO 在 `validate_xmit_skb()` 中完成，父 skb 被 `consume_skb` 释放后才进 `dev_hard_start_xmit`
+
+**修复**（采纳方案 A 思路——让 `__copy_skb_header` 自动拷贝）：
+
+1. **skbuff_h-modification.patch**：将 `delayacct_start` 从 L867（tstamp 之后，headers 组外）移到 L1044（headers 组内，`kcov_handle` 之后，`); /* end headers group */` 之前）。这样 `__copy_skb_header` 的 `memcpy(&n->headers, &o->headers, ...)` 自动拷贝此字段到所有 GSO 子段。
+
+2. **tx-instrumentation.patch**：删除 `dev_hard_start_xmit` 中的 7 行手动继承代码（注释 + if 块），仅保留 `net_delayacct_tx_end(skb->sk, skb);`
+
+3. **net-core-net-delayacct.c**：更新 `tx_start()` 注释，说明 `delayacct_start` 位于 headers 组内，`__copy_skb_header` 自动拷贝
+
+**为什么不用方案 B/C**：
+- 方案 B（在 GSO 分割点手动传播）：需要在 `validate_xmit_skb` 中新增插桩点，改动面更大
+- 方案 C（接受 1 GSO = 1 样本）：会遗漏软件 GSO 场景（TCG/低速 veth），统计失真
+- 将字段移入 headers 组是最干净的方案：零额外代码、零运行时开销、覆盖所有 GSO 路径（软件+硬件）
+
+#### 编译验证
+
+- 所有 10 个 patch apply 成功（clean kernel tree 测试）
+- 内核 bzImage + 用户态工具编译通过
+- 本地 QEMU 测试因 sandbox 禁用 KVM 超时，依赖 CI KVM 环境验证
+
+详细工作日志：[TASK-06_review-v2.0.0-round2-fixes.md](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-07-27/TASK-06_review-v2.0.0-round2-fixes.md)
+
 

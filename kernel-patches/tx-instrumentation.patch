@@ -7,30 +7,27 @@ Stamp skb->delayacct_start when a new skb is allocated in
 tcp_sendmsg_locked()/udp_sendmsg() and accumulate per-socket TX
 latency in dev_hard_start_xmit() before the driver xmit callback.
 
+GSO timestamp inheritance is handled automatically by
+__copy_skb_header() because delayacct_start lives inside the
+sk_buff headers struct_group (see skbuff_h-modification.patch).
+
 Apply after the rx-instrumentation patch.
 
 Signed-off-by: laiguo-liang <2909269677@qq.com>
 ---
- net/core/dev.c | 8 +
+ net/core/dev.c | 1 +
  net/ipv4/tcp.c | 1 +
  net/ipv4/udp.c | 4 +++-
- 3 files changed, 12 insertions(+), 1 deletion(-)
+ 3 files changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/net/core/dev.c b/net/core/dev.c
-index 3edf7f85b16d..7738bfa0cffe 100644
+index 3edf7f85b16d..d0e27c6a2e55 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
-@@ -3658,6 +3658,14 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *de
+@@ -3658,6 +3658,7 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *de
  		struct sk_buff *next = skb->next;
 
  		skb_mark_not_on_list(skb);
-+		/* Accumulate TX latency per-skb.  For GSO skbs, copy
-+		 * the timestamp from the parent so that every segment
-+		 * is accounted (see NET_DELAYACCT review issue 2.2.3).
-+		 */
-+		if (!skb->delayacct_start && skb->next &&
-+		    skb_is_gso(skb))
-+			skb->delayacct_start = skb->next->delayacct_start;
 +		net_delayacct_tx_end(skb->sk, skb);
  		rc = xmit_one(skb, dev, txq, next != NULL);
  		if (unlikely(!dev_xmit_complete(rc))) {
@@ -62,5 +59,3 @@ index d027957923a4..7315b3d82a3c 100644
 +		}
  		goto out;
  	}
-
-

@@ -3,8 +3,8 @@
 - **审查日期**: 2026-07-26
 - **审查范围**: 当前仓库整体工程状态
 - **审查人**: Reviewer
-- **总体评分**: 6.8/10
-- **状态**: [闭环完成] — 16/16 条议题全部解决
+- **总体评分**: 6.8/10 → 6.5/10
+- **状态**: [复审中] — Worker 已修复 16/17 条议题，代码核查发现 2 个新问题
 
 ## 阅读说明
 
@@ -48,11 +48,12 @@
 
 | # | 严重度 | 问题描述 | 建议 | Worker反馈 |
 |---|--------|----------|------|-------------|
-| 1 | 高 | 见下文「问题 2.1.1」 | 见下文 | 接受 |
-| 2 | 高 | 见下文「问题 2.1.2」 | 见下文 | 接受 |
-| 3 | 中 | 见下文「问题 2.1.3」 | 见下文 | 接受 |
-| 4 | 中 | 见下文「问题 2.1.4」 | 见下文 | 接受 |
-| 5 | 低 | 见下文「问题 2.1.5」 | 见下文 | 接受 |
+| 1 | 高 | 见下文「问题 2.1.1」 | 见下文 | 已修复 |
+| 2 | 高 | 见下文「问题 2.1.2」 | 见下文 | 已修复-引入锁序问题 |
+| 3 | 中 | 见下文「问题 2.1.3」 | 见下文 | 已修复 |
+| 4 | 中 | 见下文「问题 2.1.4」 | 见下文 | 已修复 |
+| 5 | 低 | 见下文「问题 2.1.5」 | 见下文 | 已修复 |
+| 6 | 高 | 见下文「问题 2.1.6」 | 见下文 | 待回应 |
 
 ##### 问题 2.1.1 — RCU 临界区内构造 netlink reply（可能睡眠）
 
@@ -167,6 +168,66 @@
 
 ---
 
+##### 问题 2.1.6 — `cmd_get_by_inode()` 修复 2.1.1/2.1.2 时引入锁顺序反转（潜在 ABBA 死锁）
+
+**现象**：在修复问题 2.1.1（RCU 睡眠）和 2.1.2（comm 裸读）的过程中，Worker 在 [cmd_get_by_inode()](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c#L428-L465) 匹配命中分支里，**在持有 `files->file_lock` spinlock 的情况下再次调用 `task_lock(task)`**：
+
+```c
+spin_lock(&files->file_lock);           // L428 先拿 file_lock
+for (fd = 0; fd < fdt->max_fds; fd++) {
+    ...
+    if (match) {
+        char comm[TASK_COMM_LEN];
+        task_lock(task);                // L461 ← 在持有 file_lock 时嵌套拿 task_lock
+        memcpy(comm, task->comm, TASK_COMM_LEN);
+        task_unlock(task);
+        spin_unlock(&files->file_lock); // L465
+        rcu_read_unlock();
+        ...
+    }
+}
+```
+
+而同文件 [net_delayacct_iter_task_sockets()](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c#L294-L304) 的锁顺序是**先 task_lock，拿 files 引用后立即 task_unlock，再拿 file_lock**，完全相反。
+
+**为什么是问题**：
+- Linux 内核 spinlock 的锁顺序必须全局一致，否则会发生 ABBA 死锁。
+- `task_lock(task)`（即 `spin_lock(&task->alloc_lock)`）和 `files->file_lock` 都是 spinlock，内核中其他常见路径（procfs 遍历、ptrace、cgroup 文件读取、`/proc/<pid>/fd` 读取等）普遍采用"先 task_lock 拿 task 引用 → 再遍历 files"的顺序（因为 files_struct 从属于 task）。
+- 本路径采用反向顺序：先拿 file_lock → 再 task_lock。如果并发场景下：
+  - CPU A 走 `iter_task_sockets`/procfs 路径：持有 task_lock，等待 file_lock
+  - CPU B 走 `cmd_get_by_inode` 路径：持有 file_lock，等待 task_lock
+  - 两个 CPU 互相持有对方等待的锁，永久自旋 → 死锁。
+- 这不是"可能有问题"，而是明确的 lock ordering rule violation。
+
+**触发条件**：
+- 并发执行 `get_sockdelays -i <inode>` 查询，同时系统中存在 procfs 读 fd 目录、ptrace、cgroup 等持 task_lock 遍历 files 的操作。
+- 平时单机测试很难触发，但生产环境高并发下具备触发条件。
+
+**后果**：
+- 双 CPU 死锁 → RCU stall → 内核软死锁 → 节点 hung。
+- 和问题 2.1.1 的"scheduling while atomic"属于同一严重级别：平时不炸，炸就是灾难性的。
+
+**修法**：把 comm 拷贝前移到 L420-L424 拿 files 引用的那个 `task_lock` 临界区内，一次加锁同时完成"拿 files 引用 + 拷贝 comm"，不在 file_lock 内嵌套 task_lock。例如：
+
+```c
+char comm[TASK_COMM_LEN];  // 提前声明在循环外
+
+task_lock(task);
+files = task->files;
+memcpy(comm, task->comm, TASK_COMM_LEN);  // 顺便拷贝 comm
+if (files) atomic_inc(&files->count);
+task_unlock(task);
+
+// 之后拿 file_lock、遍历 fd，匹配时直接用已拷贝好的 comm
+```
+
+**为什么这么修**：
+- 消除锁序反转，与 `iter_task_sockets()` 保持一致顺序（task_lock → file_lock）。
+- 不增加额外的锁操作次数，反而减少了一次 task_lock/task_unlock 配对。
+- comm 只需要拷贝一次（在循环外），匹配命中时直接用即可。
+
+---
+
 ### 2.2 设计合理性 (7/10)
 
 #### 优点
@@ -178,10 +239,10 @@
 
 | # | 严重度 | 问题描述 | 建议 | Worker反馈 |
 |---|--------|----------|------|-------------|
-| 1 | 高 | 见下文「问题 2.2.1」 | 见下文 | 共识-方案A |
-| 2 | 高 | 见下文「问题 2.2.2」 | 见下文 | 接受 |
-| 3 | 高 | 见下文「问题 2.2.3」 | 见下文 | 共识-GSO继承+依赖sk_wmem_alloc，无额外引用计数 |
-| 4 | 中 | 见下文「问题 2.2.4」 | 见下文 | 共识-删fallback，迁移延后至upstream化 |
+| 1 | 高 | 见下文「问题 2.2.1」 | 见下文 | 已修复 |
+| 2 | 高 | 见下文「问题 2.2.2」 | 见下文 | 已修复 |
+| 3 | 高 | 见下文「问题 2.2.3」 | 见下文 | UAF部分共识已修复，GSO时间戳方向问题重开 |
+| 4 | 中 | 见下文「问题 2.2.4」 | 见下文 | 已修复（删fallback） |
 
 ##### 问题 2.2.1 — `netnsok = true` 与全局 `for_each_process()` 矛盾
 
@@ -247,14 +308,19 @@
 - (b) UAF，可能 oops。
 
 **修法**（重开后最终共识）：
-- (a) 在 GSO 拆分时，子 skb 已通过 `__copy_skb_header` 自动继承父 skb 的 `delayacct_start`，无需额外代码，统计粒度正确。
-- (b) **不做任何额外的 `sock_hold()`/`sock_put()`**。依赖内核网络栈既有的生命周期保证：TCP/UDP 在分配 skb 时通过 `skb_set_owner_w` / `tcp_skb_entail` 设置 `skb->destructor = sock_wfree`，`sock_wfree` 在 skb 释放时递减 `sk->sk_wmem_alloc`，而 `__sk_destruct` 只有在 `sk_wmem_alloc` 归零时才会真正释放 socket。因此在 `dev_hard_start_xmit` 统计点（skb 递交给驱动之前），skb 仍然持有 wmem 引用，`skb->sk` 必然有效，不存在 UAF 风险。
+- (a) ~~在 GSO 拆分时，子 skb 已通过 `__copy_skb_header` 自动继承父 skb 的 `delayacct_start`，无需额外代码，统计粒度正确。~~
+  - **代码核查发现此说法不成立**，(a) 子问题需重开：
+  - `__copy_skb_header` 是逐字段复制，不会自动拷贝新增的 `delayacct_start` 字段（patch 集中没有修改 `__copy_skb_header` 的 patch）；
+  - [tx-instrumentation.patch#L31-L33](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/tx-instrumentation.patch#L31-L33) 中的手动继承代码方向反了（从 `skb->next` 复制而非从父/prev 复制），且条件 `skb_is_gso(skb) && !skb->delayacct_start` 永远不成立（GSO 大包已在 tx_start 打戳，子段不再是 GSO skb），是死代码；
+  - 软件 GSO 递归调用 `dev_hard_start_xmit()` 遍历 segs 时，每个 segment 的 `delayacct_start == 0`，tx_end 直接 return，仍然只记 1 次样本。
+  - **待 Worker 确认 `__copy_skb_header` 的行为并修正继承逻辑**。
+- (b) **不做任何额外的 `sock_hold()`/`sock_put()`**。依赖内核网络栈既有的生命周期保证：TCP/UDP 在分配 skb 时通过 `skb_set_owner_w` / `tcp_skb_entail` 设置 `skb->destructor = sock_wfree`，`sock_wfree` 在 skb 释放时递减 `sk->sk_wmem_alloc`，而 `__sk_destruct` 只有在 `sk_wmem_alloc` 归零时才会真正释放 socket。因此在 `dev_hard_start_xmit` 统计点（skb 递交给驱动之前），skb 仍然持有 wmem 引用，`skb->sk` 必然有效，不存在 UAF 风险。sock_hold/sock_put 已移除，此部分共识成立、修复正确。
 - 代码中保留详细注释解释这个设计决策，避免后续维护者重复引入 `sock_hold/sock_put` 导致 GSO 场景下 refcount 失衡崩溃。
 
 **为什么这么修**：
 - 上一轮建议的"`sock_hold` + 生命周期终点 `sock_put`"方案在静态分析层面看似合理，但实际在 GSO 场景下会立即触发 NULL deref：`skb_segment()` 会复制 `skb->sk` 指针给 N 个子段，但不会对称增加 `sk_refcnt`，导致 N 次 `sock_put` 对应 1 次 `sock_hold`，refcount 过度递减、socket 被提前释放。
 - 依赖既有的 `sk_wmem_alloc` 机制是内核网络栈的标准做法，零额外开销、零侵入性、天然兼容所有 skb 生命周期路径（正常发送、drop、重路由等），比自定义引用计数方案更可靠。
-- 13/13 QEMU 全量测试通过，无崩溃，验证了该方案的正确性。
+- 13/13 QEMU 全量测试通过，无崩溃，验证了 UAF 修复（b）的正确性；但测试未覆盖软件 GSO 场景下的计数精度，(a) 仍需修复。
 
 ---
 
@@ -480,23 +546,25 @@ sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&
 ## 三、突出问题总结
 
 ### 严重问题（必须修复）
-1. **问题 2.1.1**：RCU 临界区内构造 netlink reply，可能睡眠 → 改为先退出 RCU 再发包。
-2. **问题 2.1.2**：`task->comm` 裸读 → 改为 task_lock 内拷贝。
-3. **问题 2.2.1**：`netnsok = true` 与全局遍历矛盾 → 已共识采纳方案 A。
-4. **问题 2.2.2**：PID namespace 语义含糊 → 改用 `find_vpid`。
-5. **问题 2.4.3**：patch 系列不自洽 → 把 `sock.c` 修改纳入 patch。
-6. **问题 2.2.3**：TX GSO + UAF 风险 → GSO 子段自动继承时间戳 + 依赖内核既有 sk_wmem_alloc 机制保证生命周期，无额外引用计数。
+1. **问题 2.1.1**：RCU 临界区内构造 netlink reply，可能睡眠 → **已修复**（reply 移到 RCU 外）。
+2. **问题 2.1.2**：`task->comm` 裸读 → **修复时引入问题 2.1.6（锁序反转），需一并修正**。
+3. **问题 2.1.6**：cmd_get_by_inode 锁序反转（file_lock → task_lock 与内核常见顺序相反）→ **待修复**。
+4. **问题 2.2.1**：`netnsok = true` 与全局遍历矛盾 → **已修复**（加 netns 过滤）。
+5. **问题 2.2.2**：PID namespace 语义含糊 → **已修复**（改用 find_vpid）。
+6. **问题 2.2.3(b)**：sk->sk 生命周期 UAF → **已修复**（移除 sock_hold/sock_put，依赖 sk_wmem_alloc）。
+7. **问题 2.2.3(a)**：GSO 时间戳继承逻辑方向反/死代码 → **重开待修复**。
+8. **问题 2.4.3**：patch 系列不自洽 → **已修复**（0010 patch 已加，sed 已删）。
 
 ### 改进建议（建议采纳）
-1. **问题 2.1.3**：`sock_from_file_safe` 收敛到 `sock_from_file`。
-2. **问题 2.1.4**：去掉 `__ro_after_init`。
-3. **问题 2.2.4 + 2.3.2 + 2.3.3**：KUnit 测试布局、线程控制、stub 使用一并整理。
-4. **问题 2.1.5**：清理热路径调试日志。
+1. **问题 2.1.3**：`sock_from_file_safe` 收敛到 `sock_from_file` → **已修复**（改为 wrapper 调 sock_from_file）。
+2. **问题 2.1.4**：去掉 `__ro_after_init` → **已修复**。
+3. **问题 2.2.4 + 2.3.2 + 2.3.3**：KUnit 测试布局、线程控制、stub 使用 → **部分修复**（fallback 宏已删，kthread_should_stop 已加，布局延后）。
+4. **问题 2.1.5**：清理热路径调试日志 → **已修复**。
 
 ### 优化建议（可选）
-1. **问题 2.4.1 + 2.4.2**：文档统一回写，明确文档定位。
-2. **问题 2.3.4**：测试脚本拆分展示层与断言层。
-3. **问题 2.4.4**：统一身份信息。
+1. **问题 2.4.1 + 2.4.2**：文档统一回写，明确文档定位 → **已修复**（-r→-R 已改，design.md 已更新）。
+2. **问题 2.3.4**：测试脚本拆分展示层与断言层 → 延后至 v2.1。
+3. **问题 2.4.4**：统一身份信息 → **已修复**（MODULE_AUTHOR 已统一）。
 4. 后续如追求性能，评估 per-cpu / 无锁统计方案。
 
 ---
@@ -524,17 +592,18 @@ sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&
 
 ## 六、下版本关注点
 
-- 优先修复 **问题 2.1.1 + 2.1.2**（RCU + comm），这是 P0 中的 P0。
-- 明确并统一 netns（2.2.1）与 pid namespace（2.2.2）语义。
-- 消除 CI 对 `sock.c` 的 `sed` 注入（2.4.3），让 patch 系列自洽。
-- 回写 [net-delayacct.rst](file:///home/lai/Code/NET_DELAYACCT/Documentation/networking/net-delayacct.rst) 与 [design.md](file:///home/lai/Code/NET_DELAYACCT/docs/design.md)（2.4.1 + 2.4.2）。
-- 让测试覆盖真正高风险 correctness 路径（2.3.1），v2.0.x 先补 netns 隔离测试。
-- **问题 2.2.3（TX GSO/生命周期）已完成最终修复并验证通过，不再阻塞当前版本。**
+- **问题 2.1.6（P0）**：修复 cmd_get_by_inode 锁序反转，把 comm 拷贝前移到 file_lock 之外。
+- **问题 2.2.3(a)（P0）**：确认 `__copy_skb_header` 是否复制 `delayacct_start`；若不复制则正确实现 GSO 子段时间戳传播（修正 tx-instrumentation.patch 中反方向的死代码）。
+- v2.1.0：补 fault-injection 和 GSO 统计对比测试，重构 run-tests.sh 拆分展示/断言逻辑。
+- 以上两个 P0 修复后，v2.0.0 可正式闭环。
 
 ---
 
-**[闭环完成]**
-- 审查报告所有 17 条问题均已获得最终决议（接受/共识），无遗留待定项。
-- 议题 2.2.3 经重开讨论后，已撤回原错误共识，采纳 Worker 提出的最终方案（依赖 sk_wmem_alloc 机制，无额外引用计数），本地 QEMU 13/13 测试全 PASS。
-- v2.0.0 Review 轮次正式结束。
+**[复审中]**
+- Worker 已完成 TASK-02（16 个修复项）+ TASK-03（2.2.3 重开：移除 sock_hold/sock_put）+ TASK-04（patch 同步修复 put_pid 崩溃）+ TASK-05（TX 测试断言修复），本地 QEMU 13/13 全 PASS。
+- 代码核查确认绝大部分修复正确落地，但发现 **2 个新的高严重度问题**：
+  1. 问题 2.1.6：修复 2.1.2 时引入了 file_lock → task_lock 的锁序反转（潜在 ABBA 死锁）；
+  2. 问题 2.2.3(a) 重开：GSO 时间戳继承代码方向反了且是死代码，`__copy_skb_header` 不自动复制新增字段，软件 GSO 场景下 TX 统计仍然失真。
+- 另确认问题 2.2.3(b)（UAF/sock_hold/sock_put 移除）修复正确，共识成立。
+- 等待 Worker 回应议题 6 和议题 7。
 

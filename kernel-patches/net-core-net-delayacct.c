@@ -395,6 +395,7 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 {
 	u64 target_inode;
 	struct task_struct *task;
+	char comm[TASK_COMM_LEN];
 	int sock_count = 0;
 	int match_count = 0;
 
@@ -419,6 +420,7 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 
 		task_lock(task);
 		files = task->files;
+		memcpy(comm, task->comm, TASK_COMM_LEN);
 		if (files)
 			atomic_inc(&files->count);
 		task_unlock(task);
@@ -445,35 +447,27 @@ static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 				continue;
 			match_count++;
 
-			/* Grab references and copy comm under
-			 * task_lock; then exit RCU before the
+			/* Grab references and exit RCU before the
 			 * netlink reply which may sleep (GFP_KERNEL
 			 * allocation inside genlmsg_new — see issues
-			 * 2.1.1 and 2.1.2).
+			 * 2.1.1 and 2.1.2).  comm was already copied
+			 * under task_lock above (see issue 2.1.6).
 			 */
 			get_file(file);
 			sock_hold(sk);
 			get_task_struct(task);
 
-			{
-				char comm[TASK_COMM_LEN];
+			spin_unlock(&files->file_lock);
+			rcu_read_unlock();
 
-				task_lock(task);
-				memcpy(comm, task->comm, TASK_COMM_LEN);
-				task_unlock(task);
-
-				spin_unlock(&files->file_lock);
-				rcu_read_unlock();
-
-				ret = net_delayacct_one_reply(info, 0, sk,
-							      task_pid_nr(task),
-							      comm, ino);
-				sock_put(sk);
-				fput(file);
-				put_task_struct(task);
-				put_files_struct(files);
-				return ret;
-			}
+			ret = net_delayacct_one_reply(info, 0, sk,
+						      task_pid_nr(task),
+						      comm, ino);
+			sock_put(sk);
+			fput(file);
+			put_task_struct(task);
+			put_files_struct(files);
+			return ret;
 		}
 		spin_unlock(&files->file_lock);
 		put_files_struct(files);
@@ -591,11 +585,15 @@ void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb)
 	 * from being freed while the skb is in flight.  Adding an
 	 * extra sock_hold() here would break refcount accounting
 	 * under GSO: skb_segment() splits the parent skb into N
-	 * segments, each inheriting skb->sk and delayacct_start,
-	 * but only the parent ever called sock_hold().  The N
-	 * sock_put() calls in tx_end would then over-decrement
-	 * sk_refcnt and trigger premature socket free + NULL
-	 * deref in __sk_destruct (see issue 2.2.3 dialogue).
+	 * segments via __alloc_skb + __copy_skb_header().  Because
+	 * delayacct_start lives inside the sk_buff headers group
+	 * (see skbuff_h-modification.patch), __copy_skb_header
+	 * automatically copies it to every child segment.  skb->sk
+	 * is also inherited, but only the parent ever called
+	 * sock_hold().  The N sock_put() calls in tx_end would
+	 * then over-decrement sk_refcnt and trigger premature
+	 * socket free + NULL deref in __sk_destruct
+	 * (see issue 2.2.3 dialogue).
 	 */
 }
 
