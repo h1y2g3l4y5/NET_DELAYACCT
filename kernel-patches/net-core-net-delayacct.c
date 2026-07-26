@@ -258,14 +258,17 @@ static bool is_inet_tcp_udp(struct sock *sk)
 	       sk->sk_protocol == IPPROTO_UDP;
 }
 
-/**
+/*
  * Resolve a &struct file to a &struct sock via sock_from_file().
  *
- * sock_from_file() is available since 5.15+ and is the canonical helper.
+ * sock_from_file() is available since 5.15+ and is the canonical
+ * helper.  It returns a &struct socket, so we extract ->sk.
  */
 static struct sock *sock_from_file_safe(struct file *file)
 {
-	return sock_from_file(file);
+	struct socket *sock = sock_from_file(file);
+
+	return sock ? sock->sk : NULL;
 }
 
 /* Iterate every socket fd of @task and emit a reply for each
