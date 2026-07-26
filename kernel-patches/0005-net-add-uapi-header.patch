@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: h1y2g3l4y5 <h1y2g3l4y5@example.com>
+From: laiguo-liang <2909269677@qq.com>
 Date: Mon, 20 Jul 2026 00:00:00 +0800
 Subject: [PATCH] net-delayacct: add UAPI header
 
 Define the user-space ABI for the per-socket network delay accounting
 framework: the stats structure, genl command IDs, and attribute enums.
 
-Signed-off-by: h1y2g3l4y5 <h1y2g3l4y5@example.com>
+Signed-off-by: laiguo-liang <2909269677@qq.com>
 ---
  include/uapi/linux/net-delayacct.h | 64 ++++++++++++++++++++++++++++++
  1 file changed, 64 insertions(+)

@@ -82,15 +82,16 @@ void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb);
  * Called at tcp_sendmsg / udp_sendmsg entry, on each newly allocated
  * skb, before it enters the IP layer.
  *
- * sock_hold(sk) prevents UAF of skb->sk between here and
- * dev_hard_start_xmit (see issue 2.2.3).  The matching sock_put()
- * is in net_delayacct_tx_end().
+ * Timestamps skb->delayacct_start and takes a sock_hold(sk) to
+ * prevent UAF of skb->sk between here and dev_hard_start_xmit
+ * (see issue 2.2.3).  The matching sock_put() is in tx_end().
+ *
+ * Defined out-of-line in net/core/net-delayacct.c because it
+ * calls sock_hold() which touches sk->sk_refcnt and thus
+ * requires the full definition of struct sock, which is not
+ * available when this header is included from include/net/sock.h.
  */
-static inline void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb)
-{
-	skb->delayacct_start = ktime_get_ns();
-	sock_hold(sk);
-}
+void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb);
 
 /**
  * net_delayacct_tx_end - accumulate TX latency on a socket

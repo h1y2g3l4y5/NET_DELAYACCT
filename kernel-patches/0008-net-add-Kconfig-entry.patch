@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: h1y2g3l4y5 <h1y2g3l4y5@example.com>
+From: laiguo-liang <2909269677@qq.com>
 Date: Mon, 20 Jul 2026 00:00:00 +0800
 Subject: [PATCH] net-delayacct: add Kconfig option
 
@@ -7,7 +7,7 @@ Add CONFIG_NET_DELAYACCT to net/Kconfig, depending on CONFIG_NET.
 When enabled, per-socket RX/TX latency statistics are accumulated
 and exposed via the "net_delayacct" generic netlink family.
 
-Signed-off-by: h1y2g3l4y5 <h1y2g3l4y5@example.com>
+Signed-off-by: laiguo-liang <2909269677@qq.com>
 ---
  net/Kconfig | 17 +++++++++++++++++
  1 file changed, 17 insertions(+)

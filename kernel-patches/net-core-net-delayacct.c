@@ -556,9 +556,9 @@ static int net_delayacct_cmd_reset(struct sk_buff *skb,
 
 /*
  * Out-of-line implementations of the helpers that touch
- * sk->sk_net_delayacct.  They cannot live in the header because it is
- * included from include/net/sock.h before struct sock is fully
- * defined.
+ * sk->sk_net_delayacct or sk->sk_refcnt.  They cannot live in the
+ * header because it is included from include/net/sock.h before
+ * struct sock is fully defined.
  */
 void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb)
 {
@@ -577,6 +577,12 @@ void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb)
 	n->stats.rx_total_ns += delta;
 	n->stats.rx_count++;
 	spin_unlock(&n->lock);
+}
+
+void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb)
+{
+	skb->delayacct_start = ktime_get_ns();
+	sock_hold(sk);
 }
 
 void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
