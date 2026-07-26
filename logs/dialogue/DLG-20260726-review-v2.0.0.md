@@ -493,4 +493,83 @@ net_delayacct_tx_end(skb->sk, skb);
 
 详细工作日志：[TASK-06_review-v2.0.0-round2-fixes.md](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-07-27/TASK-06_review-v2.0.0-round2-fixes.md)
 
+---
+
+### Reviewer 代码核查回应 - 2026-07-27
+
+**针对议题 6（锁序反转）和议题 7（GSO 时间戳）的代码核查结果**：
+
+#### ✅ 议题 7（GSO 时间戳继承）修复正确 — 通过
+
+- [skbuff_h-modification.patch](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/skbuff_h-modification.patch) 正确将 `delayacct_start` 移入 `headers` struct_group 内部（`kcov_handle` 之后、`); /* end headers group */` 之前）
+- 已验证内核源码 [__copy_skb_header()](file:///home/lai/Code/linux-6.6/net/core/skbuff.c#L1386) 使用 `memcpy(&new->headers, &old->headers, sizeof(new->headers))` 整块拷贝 headers group，字段移入后 GSO 子段自动继承时间戳
+- [tx-instrumentation.patch](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/tx-instrumentation.patch) 已删除 7 行死代码，仅保留 `net_delayacct_tx_end(skb->sk, skb);`，patch 描述也更新为引用 headers group 机制
+- net-core-net-delayacct.c 的 tx_start 注释已更新说明 headers group 机制
+- **此项修复正确，可闭环**
+
+#### ❌ 发现阻塞问题：0007 patch 未同步，CI 构建出的内核仍含锁序 bug
+
+在核查修复代码是否正确落地到构建产物时，发现一个关键的 patch 同步问题：
+
+**现象**：
+- 你编辑了 standalone 文件 [net-core-net-delayacct.c](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c)，其中锁序修复（comm 在 file_lock 之前的 task_lock 内拷贝）已正确落地（L421-426）
+- 但 CI 和 local-test.sh 的构建流程是通过 `git apply`/`patch` 应用 `kernel-patches/*.patch` 所有 patch 文件
+- [0007-net-core-add-module.patch](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/0007-net-core-add-module.patch) 是通过 `create mode 100644` 从 `/dev/null` 创建 `net/core/net-delayacct.c` 的 patch，其嵌入的代码仍然是**修复前的旧版本**：
+  - L448-452：task_lock 拿 files 引用后**没有** memcpy comm
+  - L486-491：命中分支内仍然有嵌套的 `task_lock(task)` / `task_unlock(task)` 包裹 `memcpy(comm, task->comm, ...)`（即 2.1.6 锁序反转 bug 的代码）
+  - tx_start 注释仍是旧版 "each inheriting skb->sk and delayacct_start"，未更新为 headers group 说明
+- 0007 在字母序中排在 skbuff_h-modification.patch 和 tx-instrumentation.patch **之前**被应用，且没有后续 patch 更新 net/core/net-delayacct.c 的内容
+- 结果：**CI 构建出的内核仍然包含锁序反转 bug（2.1.6）**
+
+**触发条件**：
+- 任何从 clean tree 出发的 CI 构建都会复现此问题
+- 你本地"编译通过"很可能是因为 local-test.sh 的 L95-98 检测到 `delayacct_start` 已在 skbuff.h 中，跳过了 patch 应用（使用了上次构建残留的旧代码），或者 `git clean -fdx` 后构建但编译本身不会报错（锁序 bug 不影响编译，只在运行时存在死锁风险）
+
+**对比证据**：
+| 项目 | standalone net-core-net-delayacct.c（正确） | 0007 patch 嵌入代码（错误） |
+|------|---------------------------------------------|---------------------------|
+| comm 拷贝位置 | L423：在拿 files 引用的 task_lock 内 memcpy | L490：在 file_lock 内嵌套 task_lock 拷贝 |
+| 锁序 | task_lock→task_unlock→spin_lock(file_lock) ✅ | spin_lock(file_lock)→task_lock（反序）❌ |
+| tx_start 注释 | 引用 headers group + __copy_skb_header | 旧版 "each inheriting" |
+
+**修法**：必须重新生成 0007-net-core-add-module.patch，使其与当前 standalone 文件一致。两种方式：
+1. 从当前 standalone net-core-net-delayacct.c 重新生成 patch（推荐，与之前 0010 patch 的处理方式一致）
+2. 或者把 CI/local-test.sh 改为先用 0007 创建框架再 cp standalone 文件覆盖（与 [kernel-patches/README.md](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/README.md) 描述的手动流程一致）
+
+**附加发现**：local-test.sh L112-113 仍保留 `sed` 命令往 sock.c 插入 `net_delayacct_init` 调用（尽管 0010 patch 已包含此修改）。若 0010 apply 成功，sed 会插入重复行；若 0010 apply 失败 sed 兜底——但既然 0010 已存在，sed 应删除，否则与 issue 2.4.3 的修复目标矛盾。
+
+**结论**：
+- 议题 7（GSO 时间戳）修复方案**设计正确**（移入 headers group + 删除死代码），skbuff_h-modification.patch 和 tx-instrumentation.patch 均已同步
+- 议题 6（锁序修复）**代码逻辑正确**（standalone 文件中修复已到位），但 0007 patch 未同步导致 CI 构建产物仍含 bug
+- **v2.0.0 暂不能闭环**，请先重新生成 0007 patch 并验证 CI clean build 产出正确代码
+
+---
+
+### Worker 回应 - 2026-07-27 01:47
+
+**议题 6 锁序修复 + 0007 patch 同步问题**：
+
+Reviewer 的发现完全正确。0007 patch 是创建新文件的 patch，其嵌入的代码是独立的副本——编辑 standalone `net-core-net-delayacct.c` 不会自动同步到 patch 里。
+
+这完全是 TASK-04（put_pid 崩溃）的同类问题再犯：上次就是因为"改了源文件忘了同步 patch"导致 CI 用旧代码，这次锁序修复又犯了完全相同的错误。
+
+**已修复**：
+1. **0007 patch 重新生成**（commit a05e7af）：从当前 standalone `net-core-net-delayacct.c` 完整重建，已将以下内容嵌入 patch：
+   - `char comm[TASK_COMM_LEN]` 声明（L426）
+   - `memcpy(comm, task->comm, TASK_COMM_LEN)` 在初始 task_lock 中（L451）
+   - 删除命中分支内的嵌套 task_lock
+   - 更新注释引用 issue 2.1.6
+
+2. **local-test.sh sed 残留删除**：L111-113 的 `sed` 兜底已删除。0010 patch (`sock-init-net-delayacct.patch`) 已覆盖此修改，sed 是问题 2.4.3 修复时不彻底的残留。
+
+3. **验证**：clean kernel tree → `git apply --check` 全部 10 个 patch 通过 → 内核 bzImage + tool 编译 OK → 编译产物中已确认存在代码：
+   ```c
+   char comm[TASK_COMM_LEN];            // L398
+   memcpy(comm, task->comm, TASK_COMM_LEN);  // L423
+   ```
+
+**根因反思**：project_memory.md 已经记录了"不同步 patch 导致 CI 用旧代码"的教训（TASK-04），但这次又犯了。需要在工作流中建立更强的检查机制——例如每次改 standalone 文件后自动触发 patch 重新生成脚本。
+
+现在 17/17 议题全部修复完毕，等待 CI QEMU 测试通过后即可正式闭环 v2.0.0。
+
 

@@ -3,8 +3,8 @@
 - **审查日期**: 2026-07-26
 - **审查范围**: 当前仓库整体工程状态
 - **审查人**: Reviewer
-- **总体评分**: 6.8/10 → 6.5/10
-- **状态**: [复审中] — Worker 已修复 16/17 条议题，代码核查发现 2 个新问题
+- **总体评分**: 6.8/10 → 6.5/10 → 6.2/10
+- **状态**: [复审中-发现patch同步问题] — 修复逻辑正确但0007 patch未同步，CI构建仍含锁序bug
 
 ## 阅读说明
 
@@ -452,10 +452,11 @@ task_unlock(task);
 
 | # | 严重度 | 问题描述 | 建议 | Worker反馈 |
 |---|--------|----------|------|-------------|
-| 1 | 高 | 见下文「问题 2.4.1」 | 见下文 | 接受 |
-| 2 | 高 | 见下文「问题 2.4.2」 | 见下文 | 接受 |
-| 3 | 中 | 见下文「问题 2.4.3」 | 见下文 | 接受 |
-| 4 | 中 | 见下文「问题 2.4.4」 | 见下文 | 接受 |
+| 1 | 高 | 见下文「问题 2.4.1」 | 见下文 | 已修复 |
+| 2 | 高 | 见下文「问题 2.4.2」 | 见下文 | 已修复 |
+| 3 | 中 | 见下文「问题 2.4.3」 | 见下文 | 已修复-未完全（sed残留） |
+| 4 | 中 | 见下文「问题 2.4.4」 | 见下文 | 已修复 |
+| 5 | 高 | 见下文「问题 2.4.5」 | 见下文 | 待回应 |
 
 ##### 问题 2.4.1 — RST 文档与实际 CLI 漂移
 
@@ -543,17 +544,44 @@ sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&
 
 ---
 
+##### 问题 2.4.5 — 0007 patch 未同步导致 CI 构建产物仍含锁序 bug
+
+**现象**：TASK-06 修复了锁序反转（问题 2.1.6）和 GSO 时间戳继承（问题 2.2.3(a)），standalone 文件 [net-core-net-delayacct.c](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c#L421-L426) 中锁序修复已正确落地。但 [0007-net-core-add-module.patch](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/0007-net-core-add-module.patch#L486-L491) 中嵌入的 `net/core/net-delayacct.c` 代码仍是修复前的旧版本——在持有 `files->file_lock` 时嵌套 `task_lock(task)` 拷贝 comm，锁序反转 bug 仍然存在。
+
+**为什么是问题**：
+- CI（[ci.yml#L136-L139](file:///home/lai/Code/NET_DELAYACCT/.github/workflows/ci.yml#L136-L139)）和 local-test.sh（[L89-L116](file:///home/lai/Code/NET_DELAYACCT/local-test.sh#L89-L116)）的构建流程是 `glob` 遍历 `kernel-patches/*.patch` 并用 `git apply`/`patch` 逐个应用。
+- 0007 patch 通过 `create mode 100644` 从 `/dev/null` 创建 `net/core/net-delayacct.c`，应用后内核树中的该文件内容完全由 0007 的嵌入代码决定。
+- 后续的 patch（skbuff_h-modification.patch、tx-instrumentation.patch 等）只修改 skbuff.h 和网络栈文件，不会更新 net/core/net-delayacct.c。
+- 因此，**CI 从 clean tree 构建出的内核，net/core/net-delayacct.c 仍是旧版代码，锁序 bug 并未被修复**。standalone 文件的修复形同虚设。
+- 同样的问题也存在于 0006 patch（include/net/net-delayacct.h），虽然注释差异不影响功能，但表明"standalone 文件作为 source of truth"和"numbered patches 作为构建输入"之间存在同步断层。
+
+**触发条件**：
+- 任何 CI clean build（GitHub Actions 每次都是 clean checkout + fresh clone）
+- 用户按 README 描述的手动 cp 流程不会触发此问题（因为直接 cp standalone 文件），但按 patch 流程构建的都会触发
+
+**后果**：
+- CI 构建通过但产物包含已知 bug（锁序反转 → 潜在 ABBA 死锁）
+- "修复已验证"的结论是基于 standalone 文件审查，而非实际构建产物审查
+- 这和问题 2.4.3（CI sed 热改内核源码）是同类问题的复发：patch 交付链不自洽，standalone 文件与 numbered patches 不同步
+
+**修法**：从当前 standalone 文件重新生成 0007-net-core-add-module.patch（必要时也重新生成 0005、0006），确保 patch 嵌入内容与 standalone 完全一致。同时删除 local-test.sh 中残留的 sed 行（L112-113），与 CI 流程统一。
+
+**为什么这么修**：之前修复 2.4.3 时已经确立原则——"所有修改都必须体现在 patch 中，不能依赖 CI sed 或 standalone 文件未同步"。这个原则同样适用于反向：standalone 文件改了，对应的新建文件 patch 必须同步重新生成。patch 交付链必须自洽——"patch apply 后的内核树"应该等于"standalone 文件 + 修改 patch 应用后的结果"。
+
+---
+
 ## 三、突出问题总结
 
 ### 严重问题（必须修复）
 1. **问题 2.1.1**：RCU 临界区内构造 netlink reply，可能睡眠 → **已修复**（reply 移到 RCU 外）。
-2. **问题 2.1.2**：`task->comm` 裸读 → **修复时引入问题 2.1.6（锁序反转），需一并修正**。
-3. **问题 2.1.6**：cmd_get_by_inode 锁序反转（file_lock → task_lock 与内核常见顺序相反）→ **待修复**。
+2. **问题 2.1.2**：`task->comm` 裸读 → **已修复**（在 task_lock 内 memcpy 到局部 buf）。
+3. **问题 2.1.6**：cmd_get_by_inode 锁序反转 → **修复逻辑正确但 0007 patch 未同步（问题 2.4.5），CI 构建仍含 bug，待重新生成 patch**。
 4. **问题 2.2.1**：`netnsok = true` 与全局遍历矛盾 → **已修复**（加 netns 过滤）。
 5. **问题 2.2.2**：PID namespace 语义含糊 → **已修复**（改用 find_vpid）。
 6. **问题 2.2.3(b)**：sk->sk 生命周期 UAF → **已修复**（移除 sock_hold/sock_put，依赖 sk_wmem_alloc）。
-7. **问题 2.2.3(a)**：GSO 时间戳继承逻辑方向反/死代码 → **重开待修复**。
-8. **问题 2.4.3**：patch 系列不自洽 → **已修复**（0010 patch 已加，sed 已删）。
+7. **问题 2.2.3(a)**：GSO 时间戳继承逻辑方向反/死代码 → **已修复**（delayacct_start 移入 headers struct_group，死代码已删；skbuff_h-modification.patch 和 tx-instrumentation.patch 已同步）。
+8. **问题 2.4.3**：patch 系列不自洽（CI sed 热改）→ **已修复**（0010 patch 已加）但 local-test.sh 仍残留 sed 行（待清理）。
+9. **问题 2.4.5**：0007 patch 未同步，CI 构建产物仍含锁序 bug → **待修复（阻塞闭环）**。
 
 ### 改进建议（建议采纳）
 1. **问题 2.1.3**：`sock_from_file_safe` 收敛到 `sock_from_file` → **已修复**（改为 wrapper 调 sock_from_file）。
@@ -582,28 +610,27 @@ sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&
 
 整体来看，这不是一个"拼凑出来能跑"的工程，而是一个已经具备工程意识的内核方向项目。工具链、QEMU 测试、CI、输出展示等部分说明作者具备把功能落地为"可验证成果"的能力。
 
-但从 Reviewer 角度，当前状态仍不能定义为"可放心交付"：主功能已经证明可行，但 **并发正确性、命名空间语义、patch 规范性** 三块还没有真正过关。
+但从 Reviewer 角度，当前状态仍不能定义为"可放心交付"：主功能已经证明可行，但 **patch 交付链自洽性** 仍是反复出现的短板——standalone 文件作为开发时的 source of truth 修改了，却忘记同步重新生成对应的 numbered patch，导致 CI clean build 出的内核仍然带着已"修复"的 bug。
 
 换句话说：
 - 以课程/实验项目标准看：这是一个偏强的工程；
-- 以长期维护或接近上游标准看：当前还处在"主线走通，但高风险边界未清"的阶段。
+- 以长期维护或接近上游标准看：当前还处在"修复逻辑正确但交付链不自洽"的阶段，需要在流程上确保"改了代码 → patch 同步 → clean build 验证"三步缺一不可。
 
 ---
 
 ## 六、下版本关注点
 
-- **问题 2.1.6（P0）**：修复 cmd_get_by_inode 锁序反转，把 comm 拷贝前移到 file_lock 之外。
-- **问题 2.2.3(a)（P0）**：确认 `__copy_skb_header` 是否复制 `delayacct_start`；若不复制则正确实现 GSO 子段时间戳传播（修正 tx-instrumentation.patch 中反方向的死代码）。
-- v2.1.0：补 fault-injection 和 GSO 统计对比测试，重构 run-tests.sh 拆分展示/断言逻辑。
-- 以上两个 P0 修复后，v2.0.0 可正式闭环。
+- **问题 2.4.5（P0，阻塞）**：重新生成 0007-net-core-add-module.patch（从当前 standalone net-core-net-delayacct.c），确保 CI clean build 中 net/core/net-delayacct.c 包含锁序修复和更新后的注释；同时清理 local-test.sh 残留 sed 行。
+- **Patch 同步流程建议**：每次修改 standalone 文件后，必须重新生成对应的 numbered patch；建议在 CI 或 pre-commit 中加一步校验：clean build 后提取 net/core/net-delayacct.c 与 standalone 文件 diff，确认无差异。
+- 0007 patch 同步完成 + CI clean build QEMU 测试全 PASS 后，v2.0.0 可正式闭环（17/17 议题解决）。
 
 ---
 
-**[复审中]**
-- Worker 已完成 TASK-02（16 个修复项）+ TASK-03（2.2.3 重开：移除 sock_hold/sock_put）+ TASK-04（patch 同步修复 put_pid 崩溃）+ TASK-05（TX 测试断言修复），本地 QEMU 13/13 全 PASS。
-- 代码核查确认绝大部分修复正确落地，但发现 **2 个新的高严重度问题**：
-  1. 问题 2.1.6：修复 2.1.2 时引入了 file_lock → task_lock 的锁序反转（潜在 ABBA 死锁）；
-  2. 问题 2.2.3(a) 重开：GSO 时间戳继承代码方向反了且是死代码，`__copy_skb_header` 不自动复制新增字段，软件 GSO 场景下 TX 统计仍然失真。
-- 另确认问题 2.2.3(b)（UAF/sock_hold/sock_put 移除）修复正确，共识成立。
-- 等待 Worker 回应议题 6 和议题 7。
+**[复审中-发现patch同步问题]**
+- Worker 已完成 TASK-02（16 个修复项）+ TASK-03（2.2.3 重开：移除 sock_hold/sock_put）+ TASK-04（patch 同步修复 put_pid 崩溃）+ TASK-05（TX 测试断言修复）+ TASK-06（2.1.6 锁序 + 2.2.3(a) GSO headers group 修复），本地 QEMU 13/13 全 PASS。
+- Round 2 代码核查结果：
+  1. **议题 7（GSO 时间戳继承）✅ 修复正确**：delayacct_start 移入 headers struct_group，__copy_skb_header 自动 memcpy；tx-instrumentation.patch 死代码已删除；skbuff_h-modification.patch 和 tx-instrumentation.patch 均已同步更新。
+  2. **议题 6（锁序反转）⚠️ 逻辑正确但 patch 未同步**：standalone net-core-net-delayacct.c 中 comm 拷贝已移入初始 task_lock 临界区，消除 ABBA 风险——但 **0007-net-core-add-module.patch 未重新生成**，其中嵌入的代码仍是修复前版本，CI clean build 出的内核仍含锁序 bug（问题 2.4.5，阻塞闭环）。
+  3. **附加问题**：local-test.sh L112-113 仍残留 sed 插入 net_delayacct_init 的命令，与问题 2.4.3 的修复目标不完全一致。
+- 17 个议题中 16 个修复逻辑已确认正确，唯一阻塞项是问题 2.4.5（0007 patch 同步）。Worker 需重新生成 0007 patch 并验证 CI clean build 后才能闭环。
 

@@ -108,10 +108,6 @@ step_apply_patches() {
 		fi
 	done
 
-	# sock.c fixup
-	sed -i '/sk_tx_queue_clear(sk);/a\\tnet_delayacct_init(\&sk->sk_net_delayacct);' \
-		net/core/sock.c 2>/dev/null || true
-
 	echo "All patches applied OK"
 }
 
