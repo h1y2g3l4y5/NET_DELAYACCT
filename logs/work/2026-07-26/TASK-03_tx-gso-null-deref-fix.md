@@ -18,7 +18,7 @@ CI QEMU 测试报告 `BUG: kernel NULL pointer dereference, address: 0x0`，发�
 | `kernel-patches/include-net-net-delayacct.h` | `tx_start` 文档注释重写 |
 | `kernel-patches/0006-net-add-internal-header.patch` | 同步上述头文件注释，行数 145→147 |
 | `kernel-patches/0007-net-core-add-module.patch` | 从源文件完整重新生成 |
-| `logs/dialogue/DLG-20260727-010000.md` | 重开议题 2.2.3，记录新根因和新建议 |
+| `logs/dialogue/DLG-20260726-134700.md` | 重开议题 2.2.3，记录新根因和新建议 |
 
 ### 2.2 核心代码变更
 

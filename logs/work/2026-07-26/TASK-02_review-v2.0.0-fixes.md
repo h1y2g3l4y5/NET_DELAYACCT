@@ -95,7 +95,7 @@
 - 同时更新 .c, .h, 和所有 patch 文件中的 Signoff/From
 
 ## 3. 变更原因
-所有修改均来自 Review v2.0.0 的共识决议。详情见 `logs/dialogue/DLG-20260727-010000.md`。
+所有修改均来自 Review v2.0.0 的共识决议。详情见 `logs/dialogue/DLG-20260726-134700.md`。
 
 ## 4. 踩坑记录
 

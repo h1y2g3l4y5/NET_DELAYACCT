@@ -68,7 +68,7 @@ logs/
 - `HHMMSS`：对话开始的大致时间
 - **禁止**在文件名中使用 `-review-`、`-vX.Y.Z` 等后缀，版本信息写入文件内容的 `关联 Review` 字段
 
-示例: `logs/dialogue/DLG-20260727-010000.md`
+示例: `logs/dialogue/DLG-20260726-134700.md`
 
 ### 读取对方文件时
 
