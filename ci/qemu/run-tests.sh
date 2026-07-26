@@ -95,6 +95,24 @@ _show_output() {
 	echo "    └──────────────────────────────────────────"
 }
 
+# 测试说明
+_desc() {
+	echo "  原理: $1"
+	echo "  实现: $2"
+	echo "  断言: $3"
+}
+
+# 打印 get_sockdelays 工具输出
+_output() {
+	local label="${1:-get_sockdelays output}"
+	local data="${2:-}"
+	if [ -n "$data" ]; then
+		echo "  ┌── $label ──────────────────────────────"
+		echo "$data" | sed 's/^/  │ /'
+		echo "  └──────────────────────────────────────────"
+	fi
+}
+
 # ============================================================
 # 测试开始
 # ============================================================
@@ -118,6 +136,10 @@ echo "└───────────────────────�
 # ---- Test 01: PID 查询 ----
 _test_header "PID 查询 (iperf3 客户端)"
 if _require iperf3; then
+	_desc \
+		"get_sockdelays -p <PID> 通过 Generic Netlink 内核接口查询指定进程持有的所有 socket 统计" \
+		"启动 iperf3 TCP server+client，客户端后台运行 &，在传输进行中 (sleep 2) 查询客户端 PID" \
+		"proto=tcp 数据行 >= 1"
 	IPERF_PORT=21401
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -128,6 +150,7 @@ if _require iperf3; then
 		sleep 2
 		if kill -0 "$_CLI" 2>/dev/null; then
 			OUT=$("$GET_SOCKDELAYS" -p "$_CLI" 2>&1 || true)
+			_output "get_sockdelays -p $_CLI" "$OUT"
 			DATA_LINES=$(echo "$OUT" | grep -c '^proto=' || true)
 			HAS_TCP=$(echo "$OUT" | grep -c 'proto=tcp' || true)
 			if [ "$DATA_LINES" -ge 1 ] && [ "$HAS_TCP" -ge 1 ]; then
@@ -149,6 +172,10 @@ fi
 # ---- Test 02: Inode 查询 ----
 _test_header "Inode 查询 (nc 监听端)"
 if _require nc readlink; then
+	_desc \
+		"每个 socket 在内核中有唯一 inode 号，通过 /proc/<PID>/fd/<N> 的 socket:[inode] 符号链接可提取" \
+		"nc -l 创建监听 socket → 遍历 /proc/$PID/fd/* 提取 inode → get_sockdelays -i <inode> 查询" \
+		"输出中 inode=$INODE 匹配"
 	NC_PORT=21402
 	nc -l -p "$NC_PORT" >/dev/null 2>&1 &
 	_NC=$!
@@ -166,6 +193,7 @@ if _require nc readlink; then
 		done
 		if [ -n "$INODE" ]; then
 			OUT=$("$GET_SOCKDELAYS" -i "$INODE" 2>&1 || true)
+			_output "get_sockdelays -i $INODE" "$OUT"
 			if echo "$OUT" | grep -q "inode=$INODE"; then
 				_pass "inode=$INODE matched"
 			else
@@ -184,6 +212,10 @@ fi
 # ---- Test 03: 重置计数器 ----
 _test_header "重置计数器 (-R)"
 if _require iperf3; then
+	_desc \
+		"get_sockdelays -R 向内核发送 RESET 命令，将所有 socket 的 RX/TX 计数器清零" \
+		"iperf3 产生流量 → 查询确认有数据 → -R 重置 → 再次查询 → 检查 count=0" \
+		"重置后所有 socket 的 count > 0 的行数 = 0"
 	IPERF_PORT=21403
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -194,6 +226,7 @@ if _require iperf3; then
 
 		# 重置前确认有数据
 		PRE=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+		_output "重置前 (get_sockdelays -p $_SRV)" "$PRE"
 		PRE_DATA=$(echo "$PRE" | grep -c '^proto=' || true)
 
 		# 执行重置
@@ -202,6 +235,7 @@ if _require iperf3; then
 
 		# 重置后检查
 		POST=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+		_output "重置后 (get_sockdelays -p $_SRV)" "$POST"
 		NONZERO=$(echo "$POST" | grep 'count=' | sed 's/.*count=\([0-9]*\).*/\1/' | awk '$1>0' | wc -l)
 
 		if [ "$NONZERO" -eq 0 ]; then
@@ -219,6 +253,10 @@ fi
 # ---- Test 04: TCP 路径 ----
 _test_header "TCP 路径 (iperf3)"
 if _require iperf3; then
+	_desc \
+		"验证 kernel per-socket 延迟统计框架对 TCP socket 的追踪能力" \
+		"iperf3 TCP 传输完成后查询 server PID，检查 proto=tcp 行存在 + RX 计数 > 0" \
+		"proto=tcp 行 >= 1，且有 RX 数据（timing 边缘 case 放宽到只要有 TCP socket 即可）"
 	IPERF_PORT=21404
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -227,6 +265,7 @@ if _require iperf3; then
 		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 5 >/dev/null 2>&1 || true
 		sleep 1
 		OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+		_output "get_sockdelays -p $_SRV (server)" "$OUT"
 
 		# 检查 proto=tcp 行存在 + 有 RX/TX统计数据
 		TCP_LINES=$(echo "$OUT" | grep -c 'proto=tcp' || true)
@@ -252,6 +291,10 @@ fi
 # ---- Test 05: UDP 路径 ----
 _test_header "UDP 路径 (iperf3 -u)"
 if _require iperf3; then
+	_desc \
+		"验证 kernel per-socket 延迟统计框架对 UDP socket 的追踪能力。UDP 无连接状态，统计行为与 TCP 不同" \
+		"iperf3 UDP 客户端 & 后台运行 (-u -b 10M)，传输进行中同时查 client 和 server 两端的 proto=udp" \
+		"两端 proto=udp 总数 >= 1"
 	IPERF_PORT=21405
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -265,6 +308,8 @@ if _require iperf3; then
 			# 同时查客户端和服务端，UDP 可能只在其中一侧可见
 			SRV_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 			CLI_OUT=$("$GET_SOCKDELAYS" -p "$_CLI" 2>&1 || true)
+			_output "get_sockdelays -p $_SRV (server)" "$SRV_OUT"
+			_output "get_sockdelays -p $_CLI (client)" "$CLI_OUT"
 			SRV_UDP=$(echo "$SRV_OUT" | grep -c 'proto=udp' || true)
 			CLI_UDP=$(echo "$CLI_OUT" | grep -c 'proto=udp' || true)
 			TOTAL_UDP=$((SRV_UDP + CLI_UDP))
@@ -288,6 +333,10 @@ fi
 # ---- Test 06: 多 Socket 进程 ----
 _test_header "多 Socket 枚举 (iperf3 -P 4 并行流)"
 if _require iperf3; then
+	_desc \
+		"验证一个进程持有多个 socket 时 get_sockdelays 能否全量枚举，不遗漏" \
+		"iperf3 -P 4 产生 4 条并行 TCP 流 → 查询 server PID。iperf3 会 fork 子进程，客户端只查父进程 PID" \
+		"客户端父进程 >= 1 socket (control)，服务端 >= 6 socket (1 listen + 1 control + 4 data)"
 	IPERF_PORT=21406
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -308,6 +357,9 @@ if _require iperf3; then
 			# 服务端: 1 listen + 1 control + 4 data = >=6
 			SRV_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 			SRV_LINES=$(echo "$SRV_OUT" | grep -c 'proto=tcp' || true)
+
+			_output "get_sockdelays -p $_SRV (server, expect >=6)" "$SRV_OUT"
+			_output "get_sockdelays -p $_CLI (client parent, expect >=1)" "$CLI_OUT"
 
 			if [ "$CLI_LINES" -ge 1 ] && [ "$SRV_LINES" -ge 6 ]; then
 				_pass "client(parent)=$CLI_LINES, server=$SRV_LINES sockets"
@@ -337,6 +389,10 @@ echo "└───────────────────────�
 # ---- Test 07: JSON 输出 ----
 _test_header "JSON 格式输出 (-j)"
 if _require iperf3; then
+	_desc \
+		"get_sockdelays -j 将 socket 统计以 JSON 格式输出，便于程序解析" \
+		"iperf3 TCP 传输中查询 -j -p SERVER_PID → 检查输出是否包含 \"proto\" 和 \"rx\" 字段" \
+		"\"proto\" 出现 >= 1 次且 \"rx\" 出现 >= 1 次"
 	IPERF_PORT=21407
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -346,6 +402,7 @@ if _require iperf3; then
 		_CLI=$!
 		sleep 1
 		OUT=$("$GET_SOCKDELAYS" -j -p "$_SRV" 2>&1 || true)
+		_output "get_sockdelays -j -p $_SRV" "$OUT"
 
 		# JSON 应包含 "proto" 字段
 		HAS_PROTO=$(echo "$OUT" | grep -c '"proto"' || true)
@@ -367,6 +424,10 @@ fi
 # ---- Test 08: Debug 模式 ----
 _test_header "Debug 诊断模式 (-d)"
 if _require nc; then
+	_desc \
+		"get_sockdelays -d 在 stderr 输出 netlink 收发诊断信息 (diag)，用于排查内核通信问题" \
+		"nc -l 创建 socket → get_sockdelays -d -p PID 2>&1 合并捕获 stderr+stdout" \
+		"输出非空（至少包含 diag 或 socket 数据行）"
 	NC_PORT=21408
 	nc -l -p "$NC_PORT" >/dev/null 2>&1 &
 	_NC=$!
@@ -374,6 +435,7 @@ if _require nc; then
 	if kill -0 "$_NC" 2>/dev/null; then
 		# -d 模式输出到 stderr，我们合并捕获
 		OUT=$("$GET_SOCKDELAYS" -d -p "$_NC" 2>&1 || true)
+		_output "get_sockdelays -d -p $_NC" "$OUT"
 		# Debug 输出应包含 netlink 收发信息或正常 socket 数据
 		if [ -n "$OUT" ]; then
 			_pass "debug output produced ($(echo "$OUT" | wc -l) lines)"
@@ -399,6 +461,10 @@ echo "└───────────────────────�
 # ---- Test 09: 高并发多连接 ----
 _test_header "高并发多连接 (iperf3 -P 8)"
 if _require iperf3; then
+	_desc \
+		"大量并行连接测试工具在高负载下的 socket 枚举能力和计数正确性" \
+		"iperf3 -P 8 (8 条并行流) → 查询 server PID → 统计 proto=tcp 行数 + RX/TX 总量" \
+		"socket 数 >= 9 (1 listen + 8 data)，RX > 0，TX > 0"
 	IPERF_PORT=21409
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -410,6 +476,7 @@ if _require iperf3; then
 		sleep 2
 		if kill -0 "$_CLI" 2>/dev/null; then
 			OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+			_output "get_sockdelays -p $_SRV" "$OUT"
 			SOCK_COUNT=$(echo "$OUT" | grep -c 'proto=tcp' || true)
 			RX_SUM=$(echo "$OUT" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
 			TX_SUM=$(echo "$OUT" | awk '/TX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
@@ -455,6 +522,10 @@ fi
 # ---- Test 10: 大流量高计数 ----
 _test_header "大流量高计数 (iperf3 -P 4, 不限速)"
 if _require iperf3; then
+	_desc \
+		"不限速大流量传输，验证 RX/TX 计数不会溢出或截断。按传输方向分端验证" \
+		"iperf3 -P 4 -t 5 不限速 → 分别查 server(RX) 和 client(TX) 的对端方向" \
+		"server RX >= 100 且 client TX >= 100"
 	IPERF_PORT=21410
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -468,6 +539,8 @@ if _require iperf3; then
 			# 只查一侧必然有一方计数极低（server TX=ACK，client RX=ACK）
 			SRV_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 			CLI_OUT=$("$GET_SOCKDELAYS" -p "$_CLI" 2>&1 || true)
+			_output "get_sockdelays -p $_SRV (server, expect RX>=100)" "$SRV_OUT"
+			_output "get_sockdelays -p $_CLI (client, expect TX>=100)" "$CLI_OUT"
 			MAX_SRV_RX=$(echo "$SRV_OUT" | awk '/RX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
 			MAX_CLI_TX=$(echo "$CLI_OUT" | awk '/TX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
 
@@ -491,6 +564,10 @@ fi
 # ---- Test 11: TCP+UDP 混合 ----
 _test_header "混合协议隔离 (TCP + UDP 同时运行)"
 if _require iperf3; then
+	_desc \
+		"TCP 和 UDP 同时传输，验证内核统计按协议正确隔离，不会交叉污染" \
+		"启动 TCP server + UDP server → 同时运行 TCP 和 UDP client → 分别查两个 server PID" \
+		"TCP server: tcp>=5, udp=0; UDP server: tcp>=1(control), udp>=1(data)"
 	TCP_PORT=21411
 	UDP_PORT=21412
 	iperf3 -s -p "$TCP_PORT" >/dev/null 2>&1 &
@@ -508,11 +585,13 @@ if _require iperf3; then
 
 		# TCP 服务端：应该只有 proto=tcp，没有 proto=udp
 		TCP_OUT=$("$GET_SOCKDELAYS" -p "$_TCP_SRV" 2>&1 || true)
+		_output "TCP server (get_sockdelays -p $_TCP_SRV)" "$TCP_OUT"
 		TCP_TCP=$(echo "$TCP_OUT" | grep -c 'proto=tcp' || true)
 		TCP_UDP=$(echo "$TCP_OUT" | grep -c 'proto=udp' || true)
 
 		# UDP 服务端：iperf3 用 TCP 做控制连接，所以有 TCP+UDP 各 1
 		UDP_OUT=$("$GET_SOCKDELAYS" -p "$_UDP_SRV" 2>&1 || true)
+		_output "UDP server (get_sockdelays -p $_UDP_SRV)" "$UDP_OUT"
 		UDP_TCP=$(echo "$UDP_OUT" | grep -c 'proto=tcp' || true)
 		UDP_UDP=$(echo "$UDP_OUT" | grep -c 'proto=udp' || true)
 
@@ -557,11 +636,16 @@ echo "└───────────────────────�
 
 # ---- Test 12: 边界条件 ----
 _test_header "边界条件 (PID 1 / 不存在PID / -h / -V)"
+_desc \
+	"验证 get_sockdelays 在极端输入下不崩溃、合理报错" \
+	"(a)PID 1 正常退出不崩溃 (b)不存在 PID 应报非零错误 (c)-h 显示帮助 (d)-V 显示版本" \
+	"4 项子检查全部通过，使用本地计数器避免测试计数膨胀"
 BOUNDARY_OK=0
 BOUNDARY_NG=0
 
 # (a) PID 1 (init): 不应崩溃
 if OUT=$("$GET_SOCKDELAYS" -p 1 2>&1); then
+	_output "get_sockdelays -p 1" "$OUT"
 	BOUNDARY_OK=$((BOUNDARY_OK + 1))
 	echo "    (a) PID 1: exit OK ($(echo "$OUT" | grep -c 'proto=' || echo 0) sockets)"
 elif echo "$OUT" | grep -q 'no matching'; then
@@ -615,6 +699,10 @@ echo "└───────────────────────�
 
 # ---- Test 13: 并发查询压力 ----
 _test_header "并发查询压力 (16 workers × 20 queries)"
+_desc \
+	"多个 worker 同时对内核发起 Netlink 查询，验证内核并发安全——无死锁、无竞态、无 Oops" \
+	"16 个后台进程(&)，每个连续查 PID 1 × 20 次，共 320 次查询 → 汇总 worker 结果 + dmesg 检查" \
+	"无 worker 崩溃（输出文件完整）+ dmesg 无 kernel panic/Oops/BUG"
 # 使用后台 job 并行查询 PID 1，验证内核稳定性
 WORKERS=16
 QUERIES=20
@@ -661,6 +749,14 @@ for _f in "$TMPDIR"/worker-*.out; do
 	_TOTAL_OK=$((_TOTAL_OK + _ok))
 	_TOTAL_FAIL=$((_TOTAL_FAIL + _ng))
 done
+
+# 展示 worker 摘要 + 一份 sample 输出
+echo "  ┌── worker summary ($((_TOTAL_OK + _TOTAL_FAIL)) queries total) ──"
+echo "  │ ok=$_TOTAL_OK fail=$_TOTAL_FAIL crashed=$_CRASH workers"
+for _f in "$TMPDIR"/worker-*.out; do
+	[ -f "$_f" ] && echo "  │ sample: $(cat "$_f")" && break
+done
+echo "  └────────────────────────────────────────────────────────────"
 
 rm -rf "$TMPDIR"
 
