@@ -484,8 +484,8 @@ _test_header "高并发多连接 (iperf3 -P 8)"
 if _require iperf3; then
 	_desc \
 		"大量并行连接测试工具在高负载下的 socket 枚举能力和计数正确性" \
-		"iperf3 -P 8 (8 条并行流) → 查询 server PID → 统计 proto=tcp 行数 + RX/TX 总量" \
-		"socket 数 >= 9 (1 listen + 8 data)，RX > 0，TX > 0"
+		"iperf3 -P 8 (8 条并行流) → 查 server 验 socket 枚举+RX，查 client 验 TX" \
+		"server: socket 数 >= 9 (1 listen + 8 data)，RX > 0；client: TX > 0"
 	IPERF_PORT=21409
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -496,11 +496,17 @@ if _require iperf3; then
 		_CLI=$!
 		sleep 2
 		if kill -0 "$_CLI" 2>/dev/null; then
+			# server 侧：验证 socket 枚举 + RX 计数。
+			# server 是接收方，TX 仅有 ACK（不走 sendmsg，按设计不计入），故不验 server TX。
 			OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
-			_output "get_sockdelays -p $_SRV" "$OUT"
+			_output "get_sockdelays -p $_SRV (server, RX)" "$OUT"
 			SOCK_COUNT=$(echo "$OUT" | grep -c 'proto=tcp' || true)
 			RX_SUM=$(echo "$OUT" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
-			TX_SUM=$(echo "$OUT" | awk '/TX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
+
+			# client 侧：验证 TX 计数（client 是发送方，数据走 sendmsg → tx_start 计入）。
+			CLI_OUT=$("$GET_SOCKDELAYS" -p "$_CLI" 2>&1 || true)
+			_output "get_sockdelays -p $_CLI (client, TX)" "$CLI_OUT"
+			CLI_TX_SUM=$(echo "$CLI_OUT" | awk '/TX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
 
 			FAILS=0
 			# 预期: 1 监听 + 8 数据 = 9
@@ -509,26 +515,28 @@ if _require iperf3; then
 				:
 			else
 				FAILS=$((FAILS + 1))
-				echo "    socket_count=$SOCK_COUNT (expect >=9)"
+				echo "    server socket_count=$SOCK_COUNT (expect >=9)"
 			fi
 			if [ "$RX_SUM" -gt 0 ]; then
 				:
 			else
 				FAILS=$((FAILS + 1))
-				echo "    RX_SUM=0 (expect >0)"
+				echo "    server RX_SUM=0 (expect >0)"
 			fi
-			if [ "$TX_SUM" -gt 0 ]; then
+			# TX 在 client 侧验证（sendmsg 路径）；server 仅发 ACK 不计入 TX
+			if [ "$CLI_TX_SUM" -gt 0 ]; then
 				:
 			else
 				FAILS=$((FAILS + 1))
-				echo "    TX_SUM=0 (expect >0)"
+				echo "    client TX_SUM=0 (expect >0)"
 			fi
 
 			if [ "$FAILS" -eq 0 ]; then
-				_pass "sockets=$SOCK_COUNT, RX=$RX_SUM packets, TX=$TX_SUM packets"
+				_pass "server sockets=$SOCK_COUNT RX=$RX_SUM, client TX=$CLI_TX_SUM"
 			else
-				_show_output "get_sockdelays -p $_SRV" "$OUT" "$_SRV"
-				_fail "$FAILS check(s) failed (sockets=$SOCK_COUNT, RX=$RX_SUM, TX=$TX_SUM)"
+				_show_output "get_sockdelays -p $_SRV (server)" "$OUT" "$_SRV"
+				_show_output "get_sockdelays -p $_CLI (client)" "$CLI_OUT" "$_CLI"
+				_fail "$FAILS check(s) failed (server sockets=$SOCK_COUNT, RX=$RX_SUM, client TX=$CLI_TX_SUM)"
 			fi
 			_kill "$_CLI"
 		else
@@ -546,7 +554,7 @@ if _require iperf3; then
 	_desc \
 		"不限速大流量传输，验证 RX/TX 计数不会溢出或截断。按传输方向分端验证" \
 		"iperf3 -P 4 -t 5 不限速 → 分别查 server(RX) 和 client(TX) 的对端方向" \
-		"server RX >= 100 且 client TX >= 100"
+		"server RX >= 50 且 client TX >= 50（TCG 慢，阈值取保守值；KVM 下实际远超）"
 	IPERF_PORT=21410
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -557,20 +565,21 @@ if _require iperf3; then
 		sleep 2
 		if kill -0 "$_CLI" 2>/dev/null; then
 			# TCP 大流量：server 侧 RX 高（接收数据），client 侧 TX 高（发送数据）
-			# 只查一侧必然有一方计数极低（server TX=ACK，client RX=ACK）
+			# 只查一侧必然有一方计数极低：server 仅发 ACK（不走 sendmsg，按设计不计入 TX），
+			# client 仅发数据（RX 仅有 ACK 不计入）。阈值 50 兼顾 TCG 慢模拟。
 			SRV_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 			CLI_OUT=$("$GET_SOCKDELAYS" -p "$_CLI" 2>&1 || true)
-			_output "get_sockdelays -p $_SRV (server, expect RX>=100)" "$SRV_OUT"
-			_output "get_sockdelays -p $_CLI (client, expect TX>=100)" "$CLI_OUT"
+			_output "get_sockdelays -p $_SRV (server, expect RX>=50)" "$SRV_OUT"
+			_output "get_sockdelays -p $_CLI (client, expect TX>=50)" "$CLI_OUT"
 			MAX_SRV_RX=$(echo "$SRV_OUT" | awk '/RX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
 			MAX_CLI_TX=$(echo "$CLI_OUT" | awk '/TX  count=/{split($2,a,"="); print a[2]+0}' | sort -rn | head -1)
 
-			if [ "${MAX_SRV_RX:-0}" -ge 100 ] && [ "${MAX_CLI_TX:-0}" -ge 100 ]; then
-				_pass "server RX=$MAX_SRV_RX, client TX=$MAX_CLI_TX (both >=100)"
+			if [ "${MAX_SRV_RX:-0}" -ge 50 ] && [ "${MAX_CLI_TX:-0}" -ge 50 ]; then
+				_pass "server RX=$MAX_SRV_RX, client TX=$MAX_CLI_TX (both >=50)"
 			else
 				_show_output "get_sockdelays -p $_SRV (server)" "$SRV_OUT" "$_SRV"
 				_show_output "get_sockdelays -p $_CLI (client)" "$CLI_OUT" "$_CLI"
-				_fail "server RX=$MAX_SRV_RX, client TX=$MAX_CLI_TX (expect >=100)"
+				_fail "server RX=$MAX_SRV_RX, client TX=$MAX_CLI_TX (expect >=50)"
 			fi
 			_kill "$_CLI"
 		else

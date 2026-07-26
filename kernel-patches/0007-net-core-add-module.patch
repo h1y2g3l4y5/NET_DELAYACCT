@@ -25,7 +25,7 @@ diff --git a/net/core/net-delayacct.c b/net/core/net-delayacct.c
 new file mode 100644
 --- /dev/null
 +++ b/net/core/net-delayacct.c
-@@ -0,0 +1,673 @@
+@@ -0,0 +1,671 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* Copyright (c) 2026 laiguo-liang <2909269677@qq.com> */
 +/*
@@ -395,7 +395,7 @@ new file mode 100644
 +	}
 +	task = pid_task(pidp, PIDTYPE_PID);
 +	if (!task) {
-+		put_pid(pidp);
++		/* find_vpid() does NOT elevate pid->count; do NOT put_pid(). */
 +		rcu_read_unlock();
 +		return -ESRCH;
 +	}
@@ -406,7 +406,6 @@ new file mode 100644
 +	if (task->nsproxy &&
 +	    task->nsproxy->net_ns != current->nsproxy->net_ns) {
 +		rcu_read_unlock();
-+		put_pid(pidp);
 +		return -ESRCH;
 +	}
 +
@@ -416,7 +415,6 @@ new file mode 100644
 +	ret = net_delayacct_iter_task_sockets(task, info, true);
 +
 +	put_task_struct(task);
-+	put_pid(pidp);
 +	return ret;
 +}
 +

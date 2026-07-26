@@ -15,10 +15,10 @@ Signed-off-by: laiguo-liang <2909269677@qq.com>
 diff --git a/net/Kconfig b/net/Kconfig
 --- a/net/Kconfig
 +++ b/net/Kconfig
-@@ -xxx,6 +xxx,23 @@
- 	  recommended to enable this feature for faster loadable module
- 	  support.
-
+@@ -327,6 +327,23 @@
+ 	  Cgroup subsystem for use as general purpose socket classid marker that is
+ 	  being used in cls_cgroup and for netfilter matching.
+ 
 +config NET_DELAYACCT
 +	bool "Per-socket network delay accounting"
 +	depends on NET
@@ -38,4 +38,4 @@ diff --git a/net/Kconfig b/net/Kconfig
 +
  config NET_RX_BUSY_POLL
  	bool
- 	default y
+ 	default y if !PREEMPT_RT || (PREEMPT_RT && !NETCONSOLE)

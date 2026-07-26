@@ -367,7 +367,7 @@ static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
 	}
 	task = pid_task(pidp, PIDTYPE_PID);
 	if (!task) {
-		put_pid(pidp);
+		/* find_vpid() does NOT elevate pid->count; do NOT put_pid(). */
 		rcu_read_unlock();
 		return -ESRCH;
 	}
@@ -378,7 +378,6 @@ static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
 	if (task->nsproxy &&
 	    task->nsproxy->net_ns != current->nsproxy->net_ns) {
 		rcu_read_unlock();
-		put_pid(pidp);
 		return -ESRCH;
 	}
 
@@ -388,7 +387,6 @@ static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
 	ret = net_delayacct_iter_task_sockets(task, info, true);
 
 	put_task_struct(task);
-	put_pid(pidp);
 	return ret;
 }
 

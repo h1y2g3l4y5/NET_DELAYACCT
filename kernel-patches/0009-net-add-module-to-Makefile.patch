@@ -14,11 +14,11 @@ Signed-off-by: laiguo-liang <2909269677@qq.com>
 diff --git a/net/core/Makefile b/net/core/Makefile
 --- a/net/core/Makefile
 +++ b/net/core/Makefile
-@@ -xxx,6 +xxx,7 @@
-
- obj-$(CONFIG_DST_CACHE) += dst_cache.o
+@@ -36,6 +36,7 @@
+ obj-$(CONFIG_HWBM) += hwbm.o
  obj-$(CONFIG_GRO_CELLS) += gro_cells.o
-+obj-$(CONFIG_NET_DELAYACCT) += net-delayacct.o
  obj-$(CONFIG_FAILOVER) += failover.o
- obj-$(CONFIG_NETDEV_ADDR_LIST_TEST) += dev_addr_lists_test.o
- obj-$(CONFIG_NET_TEST) += net_test.o
++obj-$(CONFIG_NET_DELAYACCT) += net-delayacct.o
+ obj-$(CONFIG_NET_SOCK_MSG) += skmsg.o
+ obj-$(CONFIG_BPF_SYSCALL) += sock_map.o
+ obj-$(CONFIG_BPF_SYSCALL) += bpf_sk_storage.o
