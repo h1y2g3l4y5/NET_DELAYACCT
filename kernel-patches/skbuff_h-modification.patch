@@ -28,6 +28,6 @@ index 1a91645fa249..3ab9b676fe51 100644
 +	/* start time for net-delayacct, in ns; 0 = not stamped */
 +	__u64			delayacct_start;
 +#endif
- 
+
  	); /* end headers group */
- 
+
