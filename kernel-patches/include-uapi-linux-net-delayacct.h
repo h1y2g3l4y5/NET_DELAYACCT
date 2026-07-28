@@ -9,8 +9,12 @@
  * struct net_delayacct_stats - per-socket delay accounting statistics
  * @rx_total_ns: cumulative receive latency in nanoseconds
  * @rx_count:    number of received packets accounted
+ * @rx_min_ns:   minimum receive latency observed (U64_MAX if no packets)
+ * @rx_max_ns:   maximum receive latency observed
  * @tx_total_ns: cumulative send latency in nanoseconds
  * @tx_count:    number of sent packets accounted
+ * @tx_min_ns:   minimum send latency observed (U64_MAX if no packets)
+ * @tx_max_ns:   maximum send latency observed
  *
  * RX latency is measured from the time a packet enters the network stack
  * (typically at __netif_receive_skb_core) until a process reads it into
@@ -21,41 +25,87 @@
  * network device driver (via dev_hard_start_xmit).
  *
  * Average latency for a socket is computed as total_ns / count.
+ * min/max enable tail-latency analysis without storing individual samples.
  */
 struct net_delayacct_stats {
 	__u64 rx_total_ns;
 	__u64 rx_count;
+	__u64 rx_min_ns;
+	__u64 rx_max_ns;
 	__u64 tx_total_ns;
 	__u64 tx_count;
+	__u64 tx_min_ns;
+	__u64 tx_max_ns;
 };
 
-/* Generic Netlink commands */
+/*
+ * Generic Netlink commands.
+ *
+ * Attribute usage per command:
+ *   GET_BY_PID:   request  = A_PID + optional filter attrs (A_TYPE,
+ *                 A_FAMILY, A_LPORT, A_RPORT, A_LADDR, A_RADDR)
+ *                 response = A_TYPE, A_FAMILY, A_LADDR, A_LPORT, A_RADDR,
+ *                 A_RPORT, A_COMM, A_PID, A_INODE, A_RX_*, A_TX_*
+ *   GET_BY_INODE: request  = A_INODE
+ *                 response = same as GET_BY_PID
+ *   RESET:        request  = (none)
+ *                 response = (empty ack)
+ *
+ * All filter attributes are optional.  When omitted, the kernel treats
+ * them as wildcards (match all).  This follows the inet_diag convention
+ * of reusing the same attribute IDs for both request filtering and
+ * response output, avoiding ABI extension.
+ */
 enum {
 	NET_DELAYACCT_CMD_UNSPEC,
-	NET_DELAYACCT_CMD_GET_BY_PID,	/* attr: NET_DELAYACCT_A_PID (u32) */
-	NET_DELAYACCT_CMD_GET_BY_INODE,	/* attr: NET_DELAYACCT_A_INODE (u64) */
-	NET_DELAYACCT_CMD_RESET,
+	NET_DELAYACCT_CMD_GET_BY_PID,	/* attr: A_PID (u32) + optional filters */
+	NET_DELAYACCT_CMD_GET_BY_INODE,	/* attr: A_INODE (u64) */
+	NET_DELAYACCT_CMD_RESET,	/*
+					 * Atomically zero stats per socket under its
+					 * own spinlock, but does NOT guarantee a global
+					 * atomic snapshot across all sockets. Non-zero
+					 * values observed immediately after RESET are
+					 * newly arrived packets during the traversal,
+					 * which is expected behavior for "reset then
+					 * observe" performance testing workflows.
+					 */
 
 	__NET_DELAYACCT_CMD_MAX,
 };
 #define NET_DELAYACCT_CMD_MAX		(__NET_DELAYACCT_CMD_MAX - 1)
 
-/* Generic Netlink attributes */
+/*
+ * Generic Netlink attributes.
+ *
+ * Each attribute is annotated with its role:
+ *   [REQ]  - may appear in a request message (as a filter or lookup key)
+ *   [REPLY]- appears in a response message (socket statistics)
+ *   [KEY]  - required request attribute (PID or inode, not a filter)
+ *
+ * Filter attributes ([REQ] but not [KEY]) are optional; when absent the
+ * kernel matches all sockets.  Address attributes carry raw bytes in
+ * network byte order: sizeof(__be32) for AF_INET, sizeof(struct in6_addr)
+ * for AF_INET6.  Port attributes are in host byte order.
+ */
 enum {
 	NET_DELAYACCT_A_UNSPEC,
-	NET_DELAYACCT_A_TYPE,		/* u8: IPPROTO_TCP / IPPROTO_UDP */
-	NET_DELAYACCT_A_LADDR,		/* binary: in_addr or in6_addr */
-	NET_DELAYACCT_A_LPORT,		/* u16, host byte order */
-	NET_DELAYACCT_A_RADDR,		/* binary: in_addr or in6_addr */
-	NET_DELAYACCT_A_RPORT,		/* u16, host byte order */
-	NET_DELAYACCT_A_COMM,		/* string: task comm */
-	NET_DELAYACCT_A_PID,		/* u32: owning PID */
-	NET_DELAYACCT_A_RX_TOTAL_NS,	/* u64 */
-	NET_DELAYACCT_A_RX_COUNT,	/* u64 */
-	NET_DELAYACCT_A_TX_TOTAL_NS,	/* u64 */
-	NET_DELAYACCT_A_TX_COUNT,	/* u64 */
-	NET_DELAYACCT_A_INODE,		/* u64: socket inode */
-	NET_DELAYACCT_A_FAMILY,		/* u8: AF_INET / AF_INET6 */
+	NET_DELAYACCT_A_TYPE,		/* u8: IPPROTO_TCP/UDP; [REQ filter] [REPLY] */
+	NET_DELAYACCT_A_LADDR,		/* binary: in_addr or in6_addr; [REQ filter] [REPLY] */
+	NET_DELAYACCT_A_LPORT,		/* u16, host byte order; [REQ filter] [REPLY] */
+	NET_DELAYACCT_A_RADDR,		/* binary: in_addr or in6_addr; [REQ filter] [REPLY] */
+	NET_DELAYACCT_A_RPORT,		/* u16, host byte order; [REQ filter] [REPLY] */
+	NET_DELAYACCT_A_COMM,		/* string: task comm; [REPLY] */
+	NET_DELAYACCT_A_PID,		/* u32: owning PID; [KEY for GET_BY_PID] [REPLY] */
+	NET_DELAYACCT_A_RX_TOTAL_NS,	/* u64; [REPLY] */
+	NET_DELAYACCT_A_RX_COUNT,	/* u64; [REPLY] */
+	NET_DELAYACCT_A_RX_MIN_NS,	/* u64; [REPLY] */
+	NET_DELAYACCT_A_RX_MAX_NS,	/* u64; [REPLY] */
+	NET_DELAYACCT_A_TX_TOTAL_NS,	/* u64; [REPLY] */
+	NET_DELAYACCT_A_TX_COUNT,	/* u64; [REPLY] */
+	NET_DELAYACCT_A_TX_MIN_NS,	/* u64; [REPLY] */
+	NET_DELAYACCT_A_TX_MAX_NS,	/* u64; [REPLY] */
+	NET_DELAYACCT_A_INODE,		/* u64: socket inode; [KEY for GET_BY_INODE] [REPLY] */
+	NET_DELAYACCT_A_FAMILY,		/* u8: AF_INET/AF_INET6; [REQ filter] [REPLY] */
 
 	__NET_DELAYACCT_A_MAX,
 };

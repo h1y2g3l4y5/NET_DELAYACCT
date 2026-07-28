@@ -9,6 +9,7 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -std=gnu11
 CFLAGS  += -D_GNU_SOURCE
+CFLAGS  += -I.
 LDFLAGS ?=
 LDLIBS  ?= -lmnl
 

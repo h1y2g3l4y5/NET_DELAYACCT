@@ -806,8 +806,208 @@ else
 fi
 
 # ================================================================
-# 测试小结
+# 第六部分：过滤功能测试 (Test 14 - 16)
 # ================================================================
+echo ""
+echo "+--------------------------------------------------------------+"
+echo "|  第六部分：过滤功能 (--proto/--lport/--family)              |"
+echo "+--------------------------------------------------------------+"
+
+# ---- Test 14: --proto 过滤 ----
+_test_header "协议过滤 (--proto tcp / --proto udp)"
+if _require iperf3; then
+	_desc \
+		"验证 --proto 过滤在内核侧正确筛选 socket，只返回指定协议的统计" \
+		"启动 TCP+UDP server → 用 --proto tcp 和 --proto udp 分别查询 → 验证只返回对应协议" \
+		"--proto tcp 只返回 TCP socket; --proto udp 只返回 UDP socket"
+	TCP_PORT=21414
+	UDP_PORT=21415
+	iperf3 -s -p "$TCP_PORT" >/dev/null 2>&1 &
+	_TCP_SRV=$!
+	iperf3 -s -p "$UDP_PORT" >/dev/null 2>&1 &
+	_UDP_SRV=$!
+	sleep 1
+
+	if kill -0 "$_TCP_SRV" 2>/dev/null && kill -0 "$_UDP_SRV" 2>/dev/null; then
+		# 启动客户端产生流量。UDP client 用 -t 8 确保三次查询期间
+		# server 的 UDP 数据 socket 不会被关闭（iperf3 server 在 client
+		# 断开后会关闭与该 client 关联的 UDP 数据 socket）。
+		iperf3 -c 127.0.0.1 -p "$TCP_PORT" -P 2 -t 8 >/dev/null 2>&1 &
+		iperf3 -c 127.0.0.1 -p "$UDP_PORT" -u -t 8 -b 10M >/dev/null 2>&1 &
+		sleep 2
+
+		# UDP server 同时有 TCP(控制) 和 UDP(数据) socket
+		# --proto tcp 应只返回 TCP, --proto udp 应只返回 UDP
+		UDP_ALL=$("$GET_SOCKDELAYS" -p "$_UDP_SRV" 2>&1 || true)
+		UDP_TCP_ONLY=$("$GET_SOCKDELAYS" -p "$_UDP_SRV" --proto tcp 2>&1 || true)
+		UDP_UDP_ONLY=$("$GET_SOCKDELAYS" -p "$_UDP_SRV" --proto udp 2>&1 || true)
+
+		_output "UDP server all" "$UDP_ALL"
+		_output "UDP server --proto tcp" "$UDP_TCP_ONLY"
+		_output "UDP server --proto udp" "$UDP_UDP_ONLY"
+
+		ALL_TCP=$(echo "$UDP_ALL" | grep -c 'proto=tcp' || true)
+		ALL_UDP=$(echo "$UDP_ALL" | grep -c 'proto=udp' || true)
+		F_TCP_ONLY_TCP=$(echo "$UDP_TCP_ONLY" | grep -c 'proto=tcp' || true)
+		F_TCP_ONLY_UDP=$(echo "$UDP_TCP_ONLY" | grep -c 'proto=udp' || true)
+		F_UDP_ONLY_TCP=$(echo "$UDP_UDP_ONLY" | grep -c 'proto=tcp' || true)
+		F_UDP_ONLY_UDP=$(echo "$UDP_UDP_ONLY" | grep -c 'proto=udp' || true)
+
+		FAILS=0
+		# 无过滤时应有 TCP 和 UDP
+		if [ "${ALL_TCP:-0}" -lt 1 ] || [ "${ALL_UDP:-0}" -lt 1 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    no filter: tcp=$ALL_TCP udp=$ALL_UDP (both should be >=1)"
+		fi
+		# --proto tcp 应只有 TCP，无 UDP
+		if [ "${F_TCP_ONLY_TCP:-0}" -lt 1 ] || [ "${F_TCP_ONLY_UDP:-0}" -ne 0 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    --proto tcp: tcp=$F_TCP_ONLY_TCP udp=$F_TCP_ONLY_UDP (expect tcp>=1, udp=0)"
+		fi
+		# --proto udp 应只有 UDP，无 TCP
+		if [ "${F_UDP_ONLY_UDP:-0}" -lt 1 ] || [ "${F_UDP_ONLY_TCP:-0}" -ne 0 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    --proto udp: tcp=$F_UDP_ONLY_TCP udp=$F_UDP_ONLY_UDP (expect tcp=0, udp>=1)"
+		fi
+
+		if [ "$FAILS" -eq 0 ]; then
+			_pass "filter: all(tcp=$ALL_TCP,udp=$ALL_UDP) tcp_only(tcp=$F_TCP_ONLY_TCP,udp=$F_TCP_ONLY_UDP) udp_only(tcp=$F_UDP_ONLY_TCP,udp=$F_UDP_ONLY_UDP)"
+		else
+			_fail "$FAILS proto filter check(s) failed"
+		fi
+	else
+		_fail "iperf3 server(s) failed to start"
+	fi
+	_kill "$_TCP_SRV"; _kill "$_UDP_SRV"
+fi
+
+# ---- Test 15: --lport 过滤 ----
+_test_header "端口过滤 (--lport)"
+if _require iperf3; then
+	_desc \
+		"验证 --lport 过滤在内核侧正确筛选 socket，只返回指定本地端口的统计" \
+		"启动 server 在端口 21416 → 用 --lport 21416 查询 → 验证只返回该端口的 socket" \
+		"--lport <port> 只返回匹配本地端口的 socket"
+	FILT_PORT=21416
+	iperf3 -s -p "$FILT_PORT" >/dev/null 2>&1 &
+	_SRV=$!
+	sleep 1
+
+	if kill -0 "$_SRV" 2>/dev/null; then
+		iperf3 -c 127.0.0.1 -p "$FILT_PORT" -P 2 -t 3 >/dev/null 2>&1 &
+		sleep 2
+
+		ALL_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+		FILT_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" --lport "$FILT_PORT" 2>&1 || true)
+		NOFILT_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" --lport 99999 2>&1 || true)
+
+		_output "all sockets" "$ALL_OUT"
+		_output "--lport $FILT_PORT" "$FILT_OUT"
+		_output "--lport 99999 (no match)" "$NOFILT_OUT"
+
+		ALL_COUNT=$(echo "$ALL_OUT" | grep -c 'proto=' || true)
+		# Output format is "local=<addr>:<port> remote=<addr>:<port>".
+		# Match the port only in the local= field: [^ ]* stops at the first
+		# space (before "remote="), so the regex never matches the remote
+		# port.  Works for both IPv4 (127.0.0.1:port) and IPv6
+		# ([::ffff:127.0.0.1]:port) formats.
+		FILT_COUNT=$(echo "$FILT_OUT" | grep -cE "local=[^ ]*:$FILT_PORT( |$)" || true)
+		FILT_OTHER=$(echo "$FILT_OUT" | grep 'proto=' | grep -cvE "local=[^ ]*:$FILT_PORT( |$)" || true)
+		NOFILT_COUNT=$(echo "$NOFILT_OUT" | grep -c 'proto=' || true)
+
+		FAILS=0
+		if [ "${ALL_COUNT:-0}" -lt 1 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    no filter: count=$ALL_COUNT (expect >=1)"
+		fi
+		if [ "${FILT_COUNT:-0}" -lt 1 ] || [ "${FILT_OTHER:-0}" -ne 0 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    --lport $FILT_PORT: matched=$FILT_COUNT other=$FILT_OTHER (expect matched>=1, other=0)"
+		fi
+		if [ "${NOFILT_COUNT:-0}" -ne 0 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    --lport 99999: count=$NOFILT_COUNT (expect 0)"
+		fi
+
+		if [ "$FAILS" -eq 0 ]; then
+			_pass "lport filter: all=$ALL_COUNT, matched=$FILT_COUNT, nomatch=$NOFILT_COUNT"
+		else
+			_fail "$FAILS lport filter check(s) failed"
+		fi
+	else
+		_fail "iperf3 server failed to start"
+	fi
+	_kill "$_SRV"
+fi
+
+# ---- Test 16: 组合过滤 ----
+_test_header "组合过滤 (--proto tcp --lport)"
+if _require iperf3; then
+	_desc \
+		"验证 --proto + --lport 组合过滤，两个条件同时生效（AND 语义）" \
+		"启动 iperf3 server (端口 21417) → 发起 UDP 流量（UDP client 会先建 TCP 控制连接）→ 用 --proto tcp --lport 21417 查询" \
+		"组合过滤只返回 TCP 且端口匹配的 socket；UDP socket 被 proto 过滤排除"
+	COMB_PORT=21417
+	# iperf3 server 默认同时监听 TCP 和 UDP，只需一个 server 实例
+	iperf3 -s -p "$COMB_PORT" >/dev/null 2>&1 &
+	_SRV=$!
+	sleep 1
+
+	if kill -0 "$_SRV" 2>/dev/null; then
+		# 只启动 UDP client：iperf3 UDP client 会先与 server 建立 TCP 控制连接
+		# （lport=COMB_PORT），再发送 UDP 数据（server 侧创建 UDP 数据 socket）。
+		# 这样 baseline 同时含 TCP(控制) 和 UDP(数据)，验证组合过滤的 AND 语义。
+		# 不并行启动 TCP client：iperf3 server 单线程处理，TCP client(-P 2) 会
+		# 占用 server 导致 UDP client 无法建立控制连接，server 侧无 UDP socket。
+		# -t 8 确保查询期间 UDP 数据 socket 存活（client 断开后 server 关闭它）。
+		iperf3 -c 127.0.0.1 -p "$COMB_PORT" -u -t 8 -b 10M >/dev/null 2>&1 &
+		# sleep 3 让 client 完成连接建立（TCP 控制连接 + UDP 关联）
+		sleep 3
+
+		# 无过滤基线：应同时有 TCP 和 UDP
+		ALL_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+		# 组合过滤：--proto tcp --lport
+		COMB_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" --proto tcp --lport "$COMB_PORT" 2>&1 || true)
+		_output "all sockets (baseline)" "$ALL_OUT"
+		_output "combined --proto tcp --lport $COMB_PORT" "$COMB_OUT"
+
+		ALL_TCP=$(echo "$ALL_OUT" | grep -c 'proto=tcp' || true)
+		ALL_UDP=$(echo "$ALL_OUT" | grep -c 'proto=udp' || true)
+		COMB_TCP=$(echo "$COMB_OUT" | grep -c 'proto=tcp' || true)
+		COMB_UDP=$(echo "$COMB_OUT" | grep -c 'proto=udp' || true)
+		COMB_PORT_MATCH=$(echo "$COMB_OUT" | grep -cE "local=[^ ]*:$COMB_PORT( |$)" || true)
+		COMB_PORT_OTHER=$(echo "$COMB_OUT" | grep 'proto=tcp' | grep -cvE "local=[^ ]*:$COMB_PORT( |$)" || true)
+
+		FAILS=0
+		# 基线：无过滤时应同时有 TCP 和 UDP
+		if [ "${ALL_TCP:-0}" -lt 1 ] || [ "${ALL_UDP:-0}" -lt 1 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    baseline: tcp=$ALL_TCP udp=$ALL_UDP (both should be >=1)"
+		fi
+		# 组合过滤：应只有 TCP，无 UDP
+		if [ "${COMB_TCP:-0}" -lt 1 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    combined: tcp=$COMB_TCP (expect >=1)"
+		fi
+		if [ "${COMB_UDP:-0}" -ne 0 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    combined: udp=$COMB_UDP (expect 0, proto filter should exclude UDP)"
+		fi
+		if [ "${COMB_PORT_OTHER:-0}" -ne 0 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    combined: port_other=$COMB_PORT_OTHER (expect 0, lport filter should exclude)"
+		fi
+
+		if [ "$FAILS" -eq 0 ]; then
+			_pass "combined filter: baseline(tcp=$ALL_TCP,udp=$ALL_UDP) filtered(tcp=$COMB_TCP,udp=$COMB_UDP,port_match=$COMB_PORT_MATCH)"
+		else
+			_fail "$FAILS combined filter check(s) failed"
+		fi
+	else
+		_fail "iperf3 server failed to start"
+	fi
+	_kill "$_SRV"
+fi
 _TOTAL=$((_PASSED + _FAILED + _SKIPPED))
 
 echo ""

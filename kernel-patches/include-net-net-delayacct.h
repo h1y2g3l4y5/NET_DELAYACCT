@@ -37,20 +37,32 @@ struct net_delayacct {
 /**
  * net_delayacct_init - initialize per-socket delay accounting state
  * @n: the &struct net_delayacct to initialize
+ *
+ * min_ns is set to U64_MAX so that the first sample is always smaller;
+ * max_ns starts at 0 so the first sample is always larger.
  */
 static inline void net_delayacct_init(struct net_delayacct *n)
 {
 	spin_lock_init(&n->lock);
 	memset(&n->stats, 0, sizeof(n->stats));
+	n->stats.rx_min_ns = U64_MAX;
+	n->stats.tx_min_ns = U64_MAX;
 }
 
 /**
  * net_delayacct_rx_start - stamp RX start time on an skb
  * @skb: the incoming &sk_buff
  *
- * Called at the protocol stack entry (e.g. __netif_receive_skb_core).
+ * Called at the protocol stack entry (__netif_receive_skb_core), which
+ * sits after GRO merge and NAPI poll, inside the RCU read-side section.
  * The timestamp is carried in skb->delayacct_start and consumed by
- * net_delayacct_rx_end() when the packet is read to user space.
+ * net_delayacct_rx_end() when the payload is delivered to user space.
+ *
+ * Granularity note: when GRO merges multiple fragments into one skb,
+ * rx_start is stamped on the merged skb and therefore captures the
+ * arrival time of the last fragment, not the first.  This is a design
+ * trade-off: we measure intra-stack processing latency, not driver
+ * poll latency.
  */
 static inline void net_delayacct_rx_start(struct sk_buff *skb)
 {
@@ -67,6 +79,18 @@ static inline void net_delayacct_rx_start(struct sk_buff *skb)
  * start point was not hit, e.g. for locally generated loopback
  * traffic), the call is a no-op.
  *
+ * Call-site semantics (deliberate asymmetry between TCP and UDP):
+ *  - TCP: rx_end is recorded at skb dequeue time (found_ok_skb in
+ *    tcp_recvmsg_locked, tcp_read_sock splice path, tcp_zerocopy
+ *    receive path).  Checksum was already validated on the RX input
+ *    path before the skb was enqueued, so dequeue time == delivery
+ *    time.  Guarded by !MSG_PEEK in tcp_recvmsg_locked.
+ *  - UDP: rx_end is recorded after checksum validation AND successful
+ *    copy to user space, so corrupted packets are not counted.  This
+ *    is required because UDP software checksum verification may happen
+ *    during copy (skb_copy_and_csum_datagram_msg).  Guarded by
+ *    !peeking in udp_recvmsg/udpv6_recvmsg.
+ *
  * Defined out-of-line in net/core/net-delayacct.c because it touches
  * sk->sk_net_delayacct and thus requires the full definition of
  * struct sock, which is not available when this header is included
@@ -79,8 +103,20 @@ void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb);
  * @sk:  the originating socket (guaranteed alive by skb->destructor)
  * @skb: the outgoing &sk_buff
  *
- * Called at tcp_sendmsg / udp_sendmsg entry, on each newly allocated
- * skb, before it enters the IP layer.
+ * Stamp the skb just before it enters the IP layer.  Call sites:
+ *  - TCP: __tcp_transmit_skb() clone block (covers all clone_it=1
+ *    paths: first transmission, normal retransmit, SYN/SYNACK, Fast
+ *    Open, SYN-cookie ACK, repair mode, MTU probe) and the
+ *    __tcp_retransmit_skb() pskb_copy path (clone_it=0 retransmit
+ *    when skb data is unaligned or headroom is too large).
+ *  - UDP: udp_sendmsg()/udpv6_sendmsg() fast path (after ip_make_skb/
+ *    ip6_make_skb) and udp_push_pending_frames()/udp_v6_push_pending
+ *    _frames() (covers all corked flush paths: do_append_data,
+ *    splice_eof, setsockopt(UDP_CORK=0)).
+ *
+ * Control packets (pure ACK, RST, zero-window probe) are allocated
+ * via alloc_skb which zero-initializes delayacct_start; tx_end guards
+ * against start==0 so they are not counted.
  *
  * Only timestamps skb->delayacct_start.  We do NOT call sock_hold():
  * skb->sk lifetime is already managed by skb->destructor (sock_wfree
@@ -103,6 +139,12 @@ void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb);
  * Computes the delta from skb->delayacct_start to "now" and adds it
  * to the per-socket TX total.  Called from dev_hard_start_xmit.
  *
+ * Granularity note: when a GSO super-packet is segmented in
+ * dev_hard_start_xmit, each segment calls tx_end once, so tx_count is
+ * inflated by the number of segments.  The delayacct_start is
+ * propagated to each segment via __copy_skb_header, so per-segment
+ * latency values remain accurate.
+ *
  * Defined out-of-line in net/core/net-delayacct.c (see
  * net_delayacct_rx_end for the reason).
  */
@@ -123,6 +165,17 @@ void net_delayacct_get_stats(struct sock *sk,
 /**
  * net_delayacct_reset - zero the per-socket statistics
  * @sk: target socket
+ *
+ * Zeroes rx/tx totals, counts and min/max under the per-socket spinlock,
+ * so per-socket reset is atomic with respect to concurrent rx_end/tx_end.
+ * RESET (which iterates all sockets across all tasks) does NOT guarantee a
+ * global atomic snapshot across sockets; packets arriving at already-cleared
+ * sockets while the traversal is still in progress will accumulate new
+ * values, and those non-zero values are expected — they represent traffic
+ * that arrived "after" this socket was reset but "before" the full RESET
+ * traversal completed.  This matches the behavior of /proc/net/snmp and
+ * ss/netstat bulk statistics, and is sufficient for the standard
+ * "reset then observe for an interval" performance-testing workflow.
  *
  * Defined out-of-line in net/core/net-delayacct.c.
  */

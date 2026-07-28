@@ -61,6 +61,15 @@ static void usage(FILE *out)
 		"Output options:\n"
 		"  -j, --json            Emit machine-readable JSON.\n"
 		"\n"
+		"Filter options (only with --pid; all optional, may be combined):\n"
+		"      --proto <p>       Filter by protocol: tcp, udp, or numeric\n"
+		"                        IPPROTO value (e.g. 6=tcp, 17=udp).\n"
+		"      --family <4|6>    Filter by address family: 4 (inet) or 6 (inet6).\n"
+		"      --lport <port>    Filter by local port.\n"
+		"      --rport <port>    Filter by remote port.\n"
+		"      --laddr <addr>    Filter by local address (IPv4 or IPv6).\n"
+		"      --raddr <addr>    Filter by remote address (IPv4 or IPv6).\n"
+		"\n"
 		"Miscellaneous:\n"
 		"  -h, --help            Show this help and exit.\n"
 		"  -V, --version         Print version and exit.\n"
@@ -154,6 +163,40 @@ struct dump_ctx {
 	int rec_count;
 };
 
+/*
+ * Optional request-side filters.  Each field has a "has_*" flag; when
+ * the flag is 0 the attribute is omitted from the request and the
+ * kernel treats it as a wildcard.  Address fields carry raw bytes in
+ * network byte order (4 bytes for IPv4, 16 for IPv6); addr_len
+ * distinguishes the two.
+ */
+struct net_delayacct_filter {
+	int has_proto;
+	__u8 proto;
+	int has_family;
+	__u8 family;
+	int has_lport;
+	__u16 lport;
+	int has_rport;
+	__u16 rport;
+	int has_laddr;
+	__u8 laddr[16];
+	int laddr_len;
+	int has_raddr;
+	__u8 raddr[16];
+	int raddr_len;
+};
+
+/* long-only option values for getopt_long (avoid clashing with chars) */
+enum {
+	OPT_PROTO = 1001,
+	OPT_FAMILY,
+	OPT_LPORT,
+	OPT_RPORT,
+	OPT_LADDR,
+	OPT_RADDR,
+};
+
 static const char *proto_str(__u8 proto)
 {
 	switch (proto) {
@@ -214,6 +257,7 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 	__u16 lport = 0, rport = 0;
 	__u32 pid = 0;
 	uint64_t inode = 0, rx_total = 0, rx_count = 0, tx_total = 0, tx_count = 0;
+	uint64_t rx_min = 0, rx_max = 0, tx_min = 0, tx_max = 0;
 	const void *laddr = NULL, *raddr = NULL;
 
 	if (nlh->nlmsg_type == NLMSG_ERROR) {
@@ -269,10 +313,18 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 			rx_total = mnl_attr_get_u64(attr); break;
 		case NET_DELAYACCT_A_RX_COUNT:
 			rx_count = mnl_attr_get_u64(attr); break;
+		case NET_DELAYACCT_A_RX_MIN_NS:
+			rx_min = mnl_attr_get_u64(attr); break;
+		case NET_DELAYACCT_A_RX_MAX_NS:
+			rx_max = mnl_attr_get_u64(attr); break;
 		case NET_DELAYACCT_A_TX_TOTAL_NS:
 			tx_total = mnl_attr_get_u64(attr); break;
 		case NET_DELAYACCT_A_TX_COUNT:
 			tx_count = mnl_attr_get_u64(attr); break;
+		case NET_DELAYACCT_A_TX_MIN_NS:
+			tx_min = mnl_attr_get_u64(attr); break;
+		case NET_DELAYACCT_A_TX_MAX_NS:
+			tx_max = mnl_attr_get_u64(attr); break;
 		case NET_DELAYACCT_A_INODE:
 			inode = mnl_attr_get_u64(attr); break;
 		}
@@ -282,6 +334,12 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 	format_addr(raddr_str, sizeof(raddr_str), family, raddr, rport);
 
 	if (ctx->json) {
+		/* When count==0, kernel reports min=U64_MAX/max=0; normalize to 0. */
+		uint64_t rx_min_ns = rx_count ? rx_min : 0;
+		uint64_t rx_max_ns = rx_count ? rx_max : 0;
+		uint64_t tx_min_ns = tx_count ? tx_min : 0;
+		uint64_t tx_max_ns = tx_count ? tx_max : 0;
+
 		if (ctx->rec_count > 0)
 			printf(",\n");
 		printf("  {");
@@ -290,19 +348,29 @@ static int parse_msg_cb(const struct nlmsghdr *nlh, void *data)
 		printf("\"owner_task\":\"%s\",", comm ? comm : "");
 		printf("\"local\":\"%s\",\"remote\":\"%s\",",
 		       laddr_str, raddr_str);
-		printf("\"rx\":{\"total_ns\":%" PRIu64 ",\"count\":%" PRIu64 ",\"avg_ns\":%" PRIu64 "},",
-		       rx_total, rx_count, rx_count ? rx_total / rx_count : 0);
-		printf("\"tx\":{\"total_ns\":%" PRIu64 ",\"count\":%" PRIu64 ",\"avg_ns\":%" PRIu64 "}",
-		       tx_total, tx_count, tx_count ? tx_total / tx_count : 0);
+		printf("\"rx\":{\"total_ns\":%" PRIu64 ",\"count\":%" PRIu64 ",\"avg_ns\":%" PRIu64 ",\"min_ns\":%" PRIu64 ",\"max_ns\":%" PRIu64 "},",
+		       rx_total, rx_count, rx_count ? rx_total / rx_count : 0,
+		       rx_min_ns, rx_max_ns);
+		printf("\"tx\":{\"total_ns\":%" PRIu64 ",\"count\":%" PRIu64 ",\"avg_ns\":%" PRIu64 ",\"min_ns\":%" PRIu64 ",\"max_ns\":%" PRIu64 "}",
+		       tx_total, tx_count, tx_count ? tx_total / tx_count : 0,
+		       tx_min_ns, tx_max_ns);
 		printf("}");
 	} else {
+		/* When count==0, kernel reports min=U64_MAX/max=0; show as 0. */
+		double rx_min_ms = rx_count ? ns_to_ms(rx_min) : 0.0;
+		double rx_max_ms = rx_count ? ns_to_ms(rx_max) : 0.0;
+		double tx_min_ms = tx_count ? ns_to_ms(tx_min) : 0.0;
+		double tx_max_ms = tx_count ? ns_to_ms(tx_max) : 0.0;
+
 		printf("proto=%-3s pid=%-7u inode=%-10" PRIu64 " owner_task=%-12s ",
 		       proto_str(proto), pid, inode, comm ? comm : "");
 		printf("local=%-26s remote=%-26s\n", laddr_str, raddr_str);
-		printf("  RX  count=%-8" PRIu64 " total=%12.3fms  average=%10.3fms\n",
-		       rx_count, ns_to_ms(rx_total), avg_ms(rx_total, rx_count));
-		printf("  TX  count=%-8" PRIu64 " total=%12.3fms  average=%10.3fms\n",
-		       tx_count, ns_to_ms(tx_total), avg_ms(tx_total, tx_count));
+		printf("  RX  count=%-8" PRIu64 " total=%12.3fms  average=%10.3fms  min=%10.3fms  max=%10.3fms\n",
+		       rx_count, ns_to_ms(rx_total), avg_ms(rx_total, rx_count),
+		       rx_min_ms, rx_max_ms);
+		printf("  TX  count=%-8" PRIu64 " total=%12.3fms  average=%10.3fms  min=%10.3fms  max=%10.3fms\n",
+		       tx_count, ns_to_ms(tx_total), avg_ms(tx_total, tx_count),
+		       tx_min_ms, tx_max_ms);
 	}
 	ctx->rec_count++;
 	return MNL_CB_OK;
@@ -396,7 +464,7 @@ static int send_and_recv(struct mnl_socket *nl, struct nlmsghdr *nlh,
 
 static int do_query(struct mnl_socket *nl, int family_id,
 		    __u8 cmd, __u32 pid_attr_type, __u64 key,
-		    int json)
+		    int json, const struct net_delayacct_filter *filter)
 {
 	char buf[NL_BUF_SIZE];
 	struct nlmsghdr *nlh;
@@ -405,6 +473,8 @@ static int do_query(struct mnl_socket *nl, int family_id,
 	nlh = mnl_nlmsg_put_header(buf);
 	nlh->nlmsg_type = family_id;
 	nlh->nlmsg_flags = NLM_F_REQUEST;
+	if (cmd == NET_DELAYACCT_CMD_GET_BY_PID)
+		nlh->nlmsg_flags |= NLM_F_DUMP;
 	nlh->nlmsg_seq = ++seq_counter;
 
 	struct genlmsghdr *genl = mnl_nlmsg_put_extra_header(nlh, sizeof(*genl));
@@ -416,6 +486,28 @@ static int do_query(struct mnl_socket *nl, int family_id,
 		mnl_attr_put_u32(nlh, NET_DELAYACCT_A_PID, (__u32)key);
 	else if (pid_attr_type == NET_DELAYACCT_A_INODE)
 		mnl_attr_put_u64(nlh, NET_DELAYACCT_A_INODE, key);
+
+	/* Append optional filter attributes (GET_BY_PID only). */
+	if (filter && cmd == NET_DELAYACCT_CMD_GET_BY_PID) {
+		if (filter->has_proto)
+			mnl_attr_put_u8(nlh, NET_DELAYACCT_A_TYPE,
+					filter->proto);
+		if (filter->has_family)
+			mnl_attr_put_u8(nlh, NET_DELAYACCT_A_FAMILY,
+					filter->family);
+		if (filter->has_lport)
+			mnl_attr_put_u16(nlh, NET_DELAYACCT_A_LPORT,
+					 filter->lport);
+		if (filter->has_rport)
+			mnl_attr_put_u16(nlh, NET_DELAYACCT_A_RPORT,
+					 filter->rport);
+		if (filter->has_laddr)
+			mnl_attr_put(nlh, NET_DELAYACCT_A_LADDR,
+				     filter->laddr_len, filter->laddr);
+		if (filter->has_raddr)
+			mnl_attr_put(nlh, NET_DELAYACCT_A_RADDR,
+				     filter->raddr_len, filter->raddr);
+	}
 
 	if (json)
 		printf("[\n");
@@ -479,8 +571,17 @@ int main(int argc, char **argv)
 		{ "json",    no_argument,       NULL, 'j' },
 		{ "version", no_argument,       NULL, 'V' },
 		{ "debug",   no_argument,       NULL, 'd' },
+		/* filter options (long-only, no short alias) */
+		{ "proto",   required_argument, NULL, OPT_PROTO },
+		{ "family",  required_argument, NULL, OPT_FAMILY },
+		{ "lport",   required_argument, NULL, OPT_LPORT },
+		{ "rport",   required_argument, NULL, OPT_RPORT },
+		{ "laddr",   required_argument, NULL, OPT_LADDR },
+		{ "raddr",   required_argument, NULL, OPT_RADDR },
 		{ NULL, 0, NULL, 0 },
 	};
+
+	struct net_delayacct_filter filter = {};
 
 	while ((opt = getopt_long(argc, argv, short_opts, long_opts, NULL)) != -1) {
 		switch (opt) {
@@ -507,6 +608,83 @@ int main(int argc, char **argv)
 		case 'd':
 			debug = 1;
 			break;
+		case OPT_PROTO: {
+			if (strcasecmp(optarg, "tcp") == 0)
+				filter.proto = IPPROTO_TCP;
+			else if (strcasecmp(optarg, "udp") == 0)
+				filter.proto = IPPROTO_UDP;
+			else {
+				/* Accept a numeric IPPROTO value but reject garbage
+				 * (strtoul("foo") returns 0 without error, which
+				 * would silently filter to "no match"). */
+				char *end;
+				unsigned long v = strtoul(optarg, &end, 10);
+				if (*optarg == '\0' || *end != '\0' || v > 255) {
+					fprintf(stderr,
+						"%s: invalid --proto '%s' (use tcp/udp or 0-255)\n",
+						prog_name, optarg);
+					return 2;
+				}
+				filter.proto = (__u8)v;
+			}
+			filter.has_proto = 1;
+			break;
+		}
+		case OPT_FAMILY: {
+			if (strcasecmp(optarg, "inet") == 0 ||
+			    strcmp(optarg, "4") == 0)
+				filter.family = AF_INET;
+			else if (strcasecmp(optarg, "inet6") == 0 ||
+				 strcmp(optarg, "6") == 0)
+				filter.family = AF_INET6;
+			else {
+				fprintf(stderr,
+					"%s: invalid --family '%s' (use 4/6/inet/inet6)\n",
+					prog_name, optarg);
+				return 2;
+			}
+			filter.has_family = 1;
+			break;
+		}
+		case OPT_LPORT:
+			filter.lport = (__u16)strtoul(optarg, NULL, 10);
+			filter.has_lport = 1;
+			break;
+		case OPT_RPORT:
+			filter.rport = (__u16)strtoul(optarg, NULL, 10);
+			filter.has_rport = 1;
+			break;
+		case OPT_LADDR: {
+			/* Try IPv4 first, then IPv6. */
+			if (inet_pton(AF_INET, optarg, filter.laddr) == 1) {
+				filter.laddr_len = 4;
+			} else if (inet_pton(AF_INET6, optarg,
+					     filter.laddr) == 1) {
+				filter.laddr_len = 16;
+			} else {
+				fprintf(stderr,
+					"%s: invalid --laddr '%s'\n",
+					prog_name, optarg);
+				return 2;
+			}
+			filter.has_laddr = 1;
+			break;
+		}
+		case OPT_RADDR: {
+			if (inet_pton(AF_INET, optarg, filter.raddr) == 1) {
+				filter.raddr_len = 4;
+			} else if (inet_pton(AF_INET6, optarg,
+					     filter.raddr) == 1) {
+				filter.raddr_len = 16;
+			} else {
+				fprintf(stderr,
+					"%s: invalid --raddr '%s'\n",
+					prog_name, optarg);
+				return 2;
+			}
+			filter.has_raddr = 1;
+			break;
+		}
 		default:
 			usage(stderr);
 			return 2;
@@ -517,6 +695,19 @@ int main(int argc, char **argv)
 		fprintf(stderr, "%s: no action specified\n", prog_name);
 		usage(stderr);
 		return 2;
+	}
+
+	/* Filter options only take effect with --pid (GET_BY_PID dump).
+	 * Warn — but do not abort — when they are combined with --inode
+	 * or --reset, so existing scripts with fallback logic keep working.
+	 */
+	if (action != OPT_PID &&
+	    (filter.has_proto || filter.has_family ||
+	     filter.has_lport || filter.has_rport ||
+	     filter.has_laddr || filter.has_raddr)) {
+		fprintf(stderr,
+			"%s: warning: filter options are only valid with --pid; ignoring\n",
+			prog_name);
 	}
 
 	nl = mnl_socket_open(NETLINK_GENERIC);
@@ -543,11 +734,11 @@ int main(int argc, char **argv)
 	switch (action) {
 	case OPT_PID:
 		rc = do_query(nl, family_id, NET_DELAYACCT_CMD_GET_BY_PID,
-			      NET_DELAYACCT_A_PID, pid, json);
+			      NET_DELAYACCT_A_PID, pid, json, &filter);
 		break;
 	case OPT_INODE:
 		rc = do_query(nl, family_id, NET_DELAYACCT_CMD_GET_BY_INODE,
-			      NET_DELAYACCT_A_INODE, inode, json);
+			      NET_DELAYACCT_A_INODE, inode, json, NULL);
 		break;
 	case OPT_RESET:
 		rc = do_reset(nl, family_id);

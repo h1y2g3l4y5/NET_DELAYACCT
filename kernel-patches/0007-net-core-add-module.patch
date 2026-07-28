@@ -9,23 +9,44 @@ Register the "net_delayacct" generic netlink family with three commands:
   NET_DELAYACCT_CMD_GET_BY_INODE - show stats for a single socket inode
   NET_DELAYACCT_CMD_RESET        - zero all per-socket statistics
 
-Multi-socket replies use NLM_F_MULTI followed by NLMSG_DONE, matching
-the dump style of taskstats and sock_diag.
+GET_BY_PID uses the standard Generic Netlink dumpit protocol
+(.start/.dumpit/.done callbacks with iteration state stored in the
+netlink_callback ctx[] inline buffer).  This delegates NLM_F_MULTI
+fragmentation and NLMSG_DONE emission to the framework, matching the
+convention used by taskstats and sock_diag.  GET_BY_INODE keeps a
+doit handler because it returns at most one reply.
+
+GET_BY_PID supports optional kernel-side filtering by protocol, address
+family, local/remote port, and local/remote address.  Filter attributes
+reuse the existing reply attribute IDs (inet_diag convention), so there
+is zero ABI extension risk.  Filtering happens in .dumpit before
+filling the skb, reducing Netlink message volume for large socket sets.
+Unspecified filter attributes act as wildcards (match all).
 
 Also provides the out-of-line implementations of the rx_end/tx_start/
 tx_end/get_stats/reset helpers declared in include/net/net-delayacct.h.
 
+The stats structure tracks min/max latency in addition to total/count,
+enabling tail-latency analysis without storing individual samples.
+min_ns is initialized to U64_MAX so the first sample is always smaller.
+Overflow of rx_total_ns/tx_total_ns is detected and warned via
+pr_warn_once to prevent silent counter wraparound.
+
+Locking order: rcu_read_lock -> task_lock -> files->file_lock ->
+lock_sock(sk) / net_delayacct.lock.  All lookups are bounded and never
+block on user memory.
+
 Signed-off-by: laiguo-liang <2909269677@qq.com>
 ---
- net/core/net-delayacct.c | 669 ++++++++++++++++++++++++++++++++++++
- 1 file changed, 669 insertions(+)
+ net/core/net-delayacct.c | 887 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 887 insertions(+)
  create mode 100644 net/core/net-delayacct.c
+
 diff --git a/net/core/net-delayacct.c b/net/core/net-delayacct.c
 new file mode 100644
-index 000000000000..000000000000
 --- /dev/null
 +++ b/net/core/net-delayacct.c
-@@ -0,0 +1,669 @@
+@@ -0,0 +1,887 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* Copyright (c) 2026 laiguo-liang <2909269677@qq.com> */
 +/*
@@ -83,11 +104,19 @@ index 000000000000..000000000000
 +net_delayacct_policy[NET_DELAYACCT_A_MAX + 1] = {
 +	[NET_DELAYACCT_A_PID]		= { .type = NLA_U32 },
 +	[NET_DELAYACCT_A_INODE]		= { .type = NLA_U64 },
++	[NET_DELAYACCT_A_TYPE]		= { .type = NLA_U8 },
++	[NET_DELAYACCT_A_FAMILY]	= { .type = NLA_U8 },
++	[NET_DELAYACCT_A_LPORT]		= { .type = NLA_U16 },
++	[NET_DELAYACCT_A_RPORT]		= { .type = NLA_U16 },
++	[NET_DELAYACCT_A_LADDR]		= NLA_POLICY_MIN_LEN(sizeof(__be32)),
++	[NET_DELAYACCT_A_RADDR]		= NLA_POLICY_MIN_LEN(sizeof(__be32)),
 +};
 +
 +/* Forward declarations */
-+static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
-+					struct genl_info *info);
++static int net_delayacct_dump_start(struct netlink_callback *cb);
++static int net_delayacct_dump_by_pid(struct sk_buff *skb,
++				     struct netlink_callback *cb);
++static int net_delayacct_dump_done(struct netlink_callback *cb);
 +static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
 +					  struct genl_info *info);
 +static int net_delayacct_cmd_reset(struct sk_buff *skb,
@@ -96,7 +125,9 @@ index 000000000000..000000000000
 +static const struct genl_ops net_delayacct_ops[] = {
 +	{
 +		.cmd	= NET_DELAYACCT_CMD_GET_BY_PID,
-+		.doit	= net_delayacct_cmd_get_by_pid,
++		.start	= net_delayacct_dump_start,
++		.dumpit	= net_delayacct_dump_by_pid,
++		.done	= net_delayacct_dump_done,
 +		.flags	= GENL_ADMIN_PERM,
 +		.validate = GENL_DONT_VALIDATE_STRICT,
 +	},
@@ -150,7 +181,10 @@ index 000000000000..000000000000
 +
 +	family = sk->sk_family;
 +	proto  = sk->sk_protocol;
-+	lport  = ntohs(sk->sk_num);
++	/* sk->sk_num is already in host byte order (__u16); sk->sk_dport
++	 * is in network byte order (__be16) and needs ntohs().
++	 */
++	lport  = sk->sk_num;
 +	rport  = ntohs(sk->sk_dport);
 +
 +	if (family == AF_INET) {
@@ -177,10 +211,18 @@ index 000000000000..000000000000
 +			      stats.rx_total_ns, 0) ||
 +	    nla_put_u64_64bit(skb, NET_DELAYACCT_A_RX_COUNT,
 +			      stats.rx_count, 0) ||
++	    nla_put_u64_64bit(skb, NET_DELAYACCT_A_RX_MIN_NS,
++			      stats.rx_min_ns, 0) ||
++	    nla_put_u64_64bit(skb, NET_DELAYACCT_A_RX_MAX_NS,
++			      stats.rx_max_ns, 0) ||
 +	    nla_put_u64_64bit(skb, NET_DELAYACCT_A_TX_TOTAL_NS,
 +			      stats.tx_total_ns, 0) ||
 +	    nla_put_u64_64bit(skb, NET_DELAYACCT_A_TX_COUNT,
 +			      stats.tx_count, 0) ||
++	    nla_put_u64_64bit(skb, NET_DELAYACCT_A_TX_MIN_NS,
++			      stats.tx_min_ns, 0) ||
++	    nla_put_u64_64bit(skb, NET_DELAYACCT_A_TX_MAX_NS,
++			      stats.tx_max_ns, 0) ||
 +	    nla_put_u64_64bit(skb, NET_DELAYACCT_A_INODE, inode, 0) ||
 +	    nla_put_u32(skb, NET_DELAYACCT_A_PID, pid))
 +		return -EMSGSIZE;
@@ -188,65 +230,6 @@ index 000000000000..000000000000
 +	if (comm)
 +		return nla_put_string(skb, NET_DELAYACCT_A_COMM, comm);
 +	return 0;
-+}
-+
-+/**
-+ * net_delayacct_one_reply - emit one netlink reply for a single socket
-+ * @info:   genl_info from the request
-+ * @flags:  NLM_F_MULTI for multipart, 0 for the last
-+ * @sk:     target socket
-+ * @pid:    owning PID
-+ * @comm:   owning comm
-+ * @inode:  socket inode
-+ *
-+ * Returns 0 on success, negative error otherwise.
-+ */
-+static int net_delayacct_one_reply(struct genl_info *info, int flags,
-+				   struct sock *sk, u32 pid,
-+				   const char *comm, u64 inode)
-+{
-+	struct sk_buff *msg;
-+	void *hdr;
-+	int ret;
-+
-+	msg = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
-+	if (!msg)
-+		return -ENOMEM;
-+
-+	hdr = genlmsg_put_reply(msg, info, &net_delayacct_genl_family,
-+				flags, info->genlhdr->cmd);
-+	if (!hdr) {
-+		nlmsg_free(msg);
-+		return -EMSGSIZE;
-+	}
-+
-+	ret = net_delayacct_fill_sock(msg, sk, pid, comm, inode);
-+	if (ret) {
-+		genlmsg_cancel(msg, hdr);
-+		nlmsg_free(msg);
-+		return ret;
-+	}
-+	genlmsg_end(msg, hdr);
-+
-+	ret = genlmsg_reply(msg, info);
-+	return ret;
-+}
-+
-+/**
-+ * net_delayacct_emit_done - send the NLMSG_DONE terminator for a dump
-+ * @info: genl_info from the request
-+ */
-+static int net_delayacct_emit_done(struct genl_info *info)
-+{
-+	struct sk_buff *msg;
-+
-+	msg = nlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
-+	if (!msg)
-+		return -ENOMEM;
-+
-+	nlmsg_put(msg, info->snd_portid, info->snd_seq, NLMSG_DONE,
-+		  0, NLM_F_MULTI);
-+	return genlmsg_reply(msg, info);
 +}
 +
 +/**
@@ -286,6 +269,106 @@ index 000000000000..000000000000
 +	       sk->sk_protocol == IPPROTO_UDP;
 +}
 +
++/**
++ * net_delayacct_match_filter - check if a socket matches the request filter
++ * @sk:   target socket (caller holds a reference)
++ * @info: genl_info from the request (contains optional filter attributes)
++ *
++ * Returns true if the socket matches all specified filter criteria.
++ * Unspecified (absent) attributes are treated as wildcards — match all.
++ *
++ * Filter attributes (all optional, reused from reply attributes per
++ * the inet_diag convention):
++ *   NET_DELAYACCT_A_TYPE   - u8 protocol (IPPROTO_TCP/IPPROTO_UDP)
++ *   NET_DELAYACCT_A_FAMILY - u8 address family (AF_INET/AF_INET6)
++ *   NET_DELAYACCT_A_LPORT  - u16 local port (host byte order)
++ *   NET_DELAYACCT_A_RPORT  - u16 remote port (host byte order)
++ *   NET_DELAYACCT_A_LADDR  - binary local address (network byte order)
++ *   NET_DELAYACCT_A_RADDR  - binary remote address (network byte order)
++ *
++ * For address attributes, the length determines the comparison width:
++ * sizeof(__be32) for IPv4, sizeof(struct in6_addr) for IPv6.  A mismatch
++ * between the filter address length and the socket family causes a
++ * non-match (the socket is skipped).
++ */
++static bool net_delayacct_match_filter(struct sock *sk,
++				       const struct genl_info *info)
++{
++	if (info->attrs[NET_DELAYACCT_A_TYPE]) {
++		u8 proto = nla_get_u8(info->attrs[NET_DELAYACCT_A_TYPE]);
++		if (sk->sk_protocol != proto)
++			return false;
++	}
++
++	if (info->attrs[NET_DELAYACCT_A_FAMILY]) {
++		u8 family = nla_get_u8(info->attrs[NET_DELAYACCT_A_FAMILY]);
++		if (sk->sk_family != family)
++			return false;
++	}
++
++	if (info->attrs[NET_DELAYACCT_A_LPORT]) {
++		u16 lport = nla_get_u16(info->attrs[NET_DELAYACCT_A_LPORT]);
++		/* sk->sk_num is already in host byte order (__u16). */
++		if (sk->sk_num != lport)
++			return false;
++	}
++
++	if (info->attrs[NET_DELAYACCT_A_RPORT]) {
++		u16 rport = nla_get_u16(info->attrs[NET_DELAYACCT_A_RPORT]);
++		/* sk->sk_dport is in network byte order (__be16). */
++		if (ntohs(sk->sk_dport) != rport)
++			return false;
++	}
++
++	if (info->attrs[NET_DELAYACCT_A_LADDR]) {
++		int attr_len = nla_len(info->attrs[NET_DELAYACCT_A_LADDR]);
++
++		if (sk->sk_family == AF_INET) {
++			struct inet_sock *inet = inet_sk(sk);
++
++			if (attr_len != sizeof(__be32))
++				return false;
++			if (inet->inet_rcv_saddr !=
++			    nla_get_be32(info->attrs[NET_DELAYACCT_A_LADDR]))
++				return false;
++		} else if (sk->sk_family == AF_INET6) {
++			if (attr_len != sizeof(struct in6_addr))
++				return false;
++			if (memcmp(&sk->sk_v6_rcv_saddr,
++				   nla_data(info->attrs[NET_DELAYACCT_A_LADDR]),
++				   sizeof(struct in6_addr)) != 0)
++				return false;
++		} else {
++			return false;
++		}
++	}
++
++	if (info->attrs[NET_DELAYACCT_A_RADDR]) {
++		int attr_len = nla_len(info->attrs[NET_DELAYACCT_A_RADDR]);
++
++		if (sk->sk_family == AF_INET) {
++			struct inet_sock *inet = inet_sk(sk);
++
++			if (attr_len != sizeof(__be32))
++				return false;
++			if (inet->inet_daddr !=
++			    nla_get_be32(info->attrs[NET_DELAYACCT_A_RADDR]))
++				return false;
++		} else if (sk->sk_family == AF_INET6) {
++			if (attr_len != sizeof(struct in6_addr))
++				return false;
++			if (memcmp(&sk->sk_v6_daddr,
++				   nla_data(info->attrs[NET_DELAYACCT_A_RADDR]),
++				   sizeof(struct in6_addr)) != 0)
++				return false;
++		} else {
++			return false;
++		}
++	}
++
++	return true;
++}
++
 +/*
 + * Resolve a &struct file to a &struct sock via sock_from_file().
 + *
@@ -299,88 +382,97 @@ index 000000000000..000000000000
 +	return sock ? sock->sk : NULL;
 +}
 +
-+/* Iterate every socket fd of @task and emit a reply for each
-+ * TCP/UDP inet socket.  Returns 0 on success or a negative errno.
-+ * Caller must NOT hold task_lock or files_lock (this function takes
-+ * them internally).
++/**
++ * net_delayacct_one_reply - emit one netlink reply for a single socket
++ * @info:   genl_info from the request
++ * @flags:  NLM_F_MULTI for multipart, 0 for the last
++ * @sk:     target socket
++ * @pid:    owning PID
++ * @comm:   owning comm
++ * @inode:  socket inode
++ *
++ * Used by GET_BY_INODE (doit handler) to send a single reply.
++ * GET_BY_PID now uses the standard dumpit path instead.
++ *
++ * Returns 0 on success, negative error otherwise.
 + */
-+static int net_delayacct_iter_task_sockets(struct task_struct *task,
-+					   struct genl_info *info,
-+					   bool emit_done)
++static int net_delayacct_one_reply(struct genl_info *info, int flags,
++				   struct sock *sk, u32 pid,
++				   const char *comm, u64 inode)
 +{
-+	struct files_struct *files;
-+	struct fdtable *fdt;
-+	const char *comm;
-+	u32 pid;
-+	unsigned int fd;
-+	int ret = 0;
-+	int emitted = 0;
++	struct sk_buff *msg;
++	void *hdr;
++	int ret;
 +
-+	pid = task_pid_nr(task);
-+	comm = NULL;	/* task->comm is only safe under task_lock */
++	msg = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
 +
-+	task_lock(task);
-+	comm = task->comm;
-+	files = task->files;
-+	if (files)
-+		atomic_inc(&files->count);
-+	task_unlock(task);
-+
-+	if (!files)
-+		goto out;
-+
-+	spin_lock(&files->file_lock);
-+	fdt = files_fdtable(files);
-+	for (fd = 0; fd < fdt->max_fds; fd++) {
-+		struct file *file = fdt->fd[fd];
-+		struct sock *sk;
-+
-+		if (!file)
-+			continue;
-+		sk = sock_from_file_safe(file);
-+		if (!sk)
-+			continue;
-+		if (!is_inet_tcp_udp(sk))
-+			continue;
-+
-+		/* Hold a reference while we drop file_lock to send. */
-+		get_file(file);
-+		sock_hold(sk);
-+		spin_unlock(&files->file_lock);
-+
-+		ret = net_delayacct_one_reply(info, NLM_F_MULTI, sk,
-+					      pid, comm,
-+					      sock_inode_for(sk));
-+		sock_put(sk);
-+		fput(file);
-+		if (ret)
-+			goto out_files;
-+		emitted++;
-+
-+		spin_lock(&files->file_lock);
-+		fdt = files_fdtable(files);
++	hdr = genlmsg_put_reply(msg, info, &net_delayacct_genl_family,
++				flags, info->genlhdr->cmd);
++	if (!hdr) {
++		nlmsg_free(msg);
++		return -EMSGSIZE;
 +	}
-+	spin_unlock(&files->file_lock);
 +
-+out_files:
-+	put_files_struct(files);
-+out:
-+	/* For GET_BY_PID, always emit DONE to terminate the multipart
-+	 * dump even if zero sockets were found (the user-space tool
-+	 * waits for it).
-+	 */
-+	if (emit_done && ret == 0)
-+		ret = net_delayacct_emit_done(info);
-+	return ret;
++	ret = net_delayacct_fill_sock(msg, sk, pid, comm, inode);
++	if (ret) {
++		genlmsg_cancel(msg, hdr);
++		nlmsg_free(msg);
++		return ret;
++	}
++	genlmsg_end(msg, hdr);
++
++	return genlmsg_reply(msg, info);
 +}
 +
-+static int net_delayacct_cmd_get_by_pid(struct sk_buff *skb,
-+					struct genl_info *info)
++/**
++ * struct net_delayacct_dump_ctx - per-dump iteration state
++ *
++ * Stored inside the netlink_callback ctx[48] inline buffer (not a
++ * heap allocation).  Total size is 40 bytes, which fits within the
++ * 48-byte cb->ctx area.
++ *
++ * @task:  task_struct reference held via get_task_struct()
++ * @files: files_struct reference held via atomic_inc(&files->count)
++ * @fd:    next fd index to scan
++ * @pid:   PID of the target task (for the reply)
++ * @comm:  task comm snapshot (safe copy, no locking needed after start)
++ */
++struct net_delayacct_dump_ctx {
++	struct task_struct	*task;
++	struct files_struct	*files;
++	unsigned int		fd;
++	u32			pid;
++	char			comm[TASK_COMM_LEN];
++};
++
++/**
++ * net_delayacct_dump_start - .start callback for GET_BY_PID dump
++ * @cb: netlink callback
++ *
++ * Resolves the requested PID, performs netns isolation check, and
++ * captures task_struct/files_struct references for the duration of
++ * the dump.  The state is stored in cb->ctx (inline, not heap).
++ *
++ * Returns 0 on success or a negative errno.
++ */
++static int net_delayacct_dump_start(struct netlink_callback *cb)
 +{
++	const struct genl_info *info = genl_info_dump(cb);
++	struct net_delayacct_dump_ctx *ctx =
++		(struct net_delayacct_dump_ctx *)cb->ctx;
 +	struct pid *pidp;
 +	struct task_struct *task;
++	struct files_struct *files;
 +	u32 pid;
-+	int ret;
++
++	/* Defensive: __netlink_dump_start() currently zeroes cb, but we
++	 * must not depend on that — .done() checks ctx->files/task for
++	 * NULL to decide whether to release references.  Clear ctx up
++	 * front so every early error-return path is safe.
++	 */
++	memset(ctx, 0, sizeof(*ctx));
 +
 +	if (!info->attrs[NET_DELAYACCT_A_PID])
 +		return -EINVAL;
@@ -395,7 +487,6 @@ index 000000000000..000000000000
 +	}
 +	task = pid_task(pidp, PIDTYPE_PID);
 +	if (!task) {
-+		/* find_vpid() does NOT elevate pid->count; do NOT put_pid(). */
 +		rcu_read_unlock();
 +		return -ESRCH;
 +	}
@@ -412,10 +503,141 @@ index 000000000000..000000000000
 +	get_task_struct(task);
 +	rcu_read_unlock();
 +
-+	ret = net_delayacct_iter_task_sockets(task, info, true);
++	/* Acquire files_struct reference.  get_task_files() is not
++	 * exported in 6.6, so we use task_lock + atomic_inc.
++	 */
++	task_lock(task);
++	files = task->files;
++	if (files)
++		atomic_inc(&files->count);
++	task_unlock(task);
 +
-+	put_task_struct(task);
-+	return ret;
++	if (!files) {
++		put_task_struct(task);
++		return -ESRCH;
++	}
++
++	ctx->task = task;
++	ctx->files = files;
++	ctx->pid = pid;
++	get_task_comm(ctx->comm, task);
++	return 0;
++}
++
++/**
++ * net_delayacct_dump_by_pid - .dumpit callback for GET_BY_PID
++ * @skb: skb to fill with one socket's reply
++ * @cb:  netlink callback (cb->ctx holds iteration state)
++ *
++ * Each invocation fills at most one socket into @skb.  The Generic
++ * Netlink framework handles NLM_F_MULTI, message fragmentation, and
++ * NLMSG_DONE automatically.
++ *
++ * Returns skb->len (>0) if data was added, 0 when the dump is done.
++ */
++static int net_delayacct_dump_by_pid(struct sk_buff *skb,
++				     struct netlink_callback *cb)
++{
++	struct net_delayacct_dump_ctx *ctx =
++		(struct net_delayacct_dump_ctx *)cb->ctx;
++	struct files_struct *files = ctx->files;
++	unsigned int fd = ctx->fd;
++	const struct genl_info *info = genl_info_dump(cb);
++	struct fdtable *fdt;
++	void *hdr;
++	int ret;
++
++	if (!files)
++		return 0;
++
++	spin_lock(&files->file_lock);
++	fdt = files_fdtable(files);
++
++	while (fd < fdt->max_fds) {
++		struct file *file = fdt->fd[fd];
++		struct sock *sk;
++
++		if (!file) {
++			fd++;
++			continue;
++		}
++		sk = sock_from_file_safe(file);
++		if (!sk || !is_inet_tcp_udp(sk)) {
++			fd++;
++			continue;
++		}
++
++		/* Apply optional request filters (proto/family/port/addr).
++		 * Sockets that do not match are skipped silently.
++		 */
++		if (!net_delayacct_match_filter(sk, info)) {
++			fd++;
++			continue;
++		}
++
++		/* Hold references while we drop file_lock to fill skb.
++		 * lock_sock() inside net_delayacct_get_stats() may
++		 * sleep, so we cannot hold file_lock (spinlock).
++		 */
++		get_file(file);
++		sock_hold(sk);
++		spin_unlock(&files->file_lock);
++
++		hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid,
++				  cb->nlh->nlmsg_seq, &net_delayacct_genl_family,
++				  NLM_F_MULTI, NET_DELAYACCT_CMD_GET_BY_PID);
++		if (!hdr) {
++			sock_put(sk);
++			fput(file);
++			ctx->fd = fd;
++			return skb->len;
++		}
++
++		ret = net_delayacct_fill_sock(skb, sk, ctx->pid, ctx->comm,
++					      sock_inode_for(sk));
++		if (ret < 0) {
++			genlmsg_cancel(skb, hdr);
++			sock_put(sk);
++			fput(file);
++			ctx->fd = fd;
++			return skb->len;
++		}
++
++		genlmsg_end(skb, hdr);
++		sock_put(sk);
++		fput(file);
++
++		ctx->fd = fd + 1;
++		return skb->len;
++	}
++	spin_unlock(&files->file_lock);
++
++	/* No more sockets to dump.  Return 0 (not skb->len) to signal
++	 * dump completion immediately — the skb here is empty, so the
++	 * framework will not send it and will proceed to NLMSG_DONE.
++	 */
++	return 0;
++}
++
++/**
++ * net_delayacct_dump_done - .done callback for GET_BY_PID dump
++ * @cb: netlink callback
++ *
++ * Releases the task_struct and files_struct references acquired in
++ * .start.  Must handle ctx == NULL / zeroed (in case .start failed
++ * after partial initialization).
++ */
++static int net_delayacct_dump_done(struct netlink_callback *cb)
++{
++	struct net_delayacct_dump_ctx *ctx =
++		(struct net_delayacct_dump_ctx *)cb->ctx;
++
++	if (ctx->files)
++		put_files_struct(ctx->files);
++	if (ctx->task)
++		put_task_struct(ctx->task);
++	memset(ctx, 0, sizeof(*ctx));
++	return 0;
 +}
 +
 +static int net_delayacct_cmd_get_by_inode(struct sk_buff *skb,
@@ -597,8 +819,14 @@ index 000000000000..000000000000
 +
 +	n = &sk->sk_net_delayacct;
 +	spin_lock(&n->lock);
++	if (n->stats.rx_total_ns > U64_MAX - delta)
++		pr_warn_once("net_delayacct: RX total_ns overflow on socket %p\n", sk);
 +	n->stats.rx_total_ns += delta;
 +	n->stats.rx_count++;
++	if (delta < n->stats.rx_min_ns)
++		n->stats.rx_min_ns = delta;
++	if (delta > n->stats.rx_max_ns)
++		n->stats.rx_max_ns = delta;
 +	spin_unlock(&n->lock);
 +}
 +
@@ -639,8 +867,14 @@ index 000000000000..000000000000
 +
 +	n = &sk->sk_net_delayacct;
 +	spin_lock(&n->lock);
++	if (n->stats.tx_total_ns > U64_MAX - delta)
++		pr_warn_once("net_delayacct: TX total_ns overflow on socket %p\n", sk);
 +	n->stats.tx_total_ns += delta;
 +	n->stats.tx_count++;
++	if (delta < n->stats.tx_min_ns)
++		n->stats.tx_min_ns = delta;
++	if (delta > n->stats.tx_max_ns)
++		n->stats.tx_max_ns = delta;
 +	spin_unlock(&n->lock);
 +
 +	/* No sock_put() here: see the note in net_delayacct_tx_start().
@@ -665,6 +899,11 @@ index 000000000000..000000000000
 +
 +	spin_lock(&n->lock);
 +	memset(&n->stats, 0, sizeof(n->stats));
++	/* min_ns must be U64_MAX so that the first sample is always smaller;
++	 * max_ns starts at 0 so the first sample is always larger.
++	 */
++	n->stats.rx_min_ns = U64_MAX;
++	n->stats.tx_min_ns = U64_MAX;
 +	spin_unlock(&n->lock);
 +}
 +
