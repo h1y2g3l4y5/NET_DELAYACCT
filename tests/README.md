@@ -140,69 +140,177 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 #### Test 01: PID 查询
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | `get_sockdelays -p <PID>` 通过 Generic Netlink 内核接口（标准 dumpit 协议）查询指定进程持有的所有 socket 统计 |
-| **实现** | 启动 iperf3 TCP server（端口 21401）→ iperf3 client `&` 后台运行 → `sleep 2` 在传输进行中查询 client PID |
-| **断言** | 输出中 `proto=` 开头的数据行 ≥ 1，且至少包含 1 个 `proto=tcp` |
-| **时序关键** | client 必须 `&` 后台运行，否则 5s 传输结束后进程退出，查询时 socket 已被内核清理 |
-| **清理** | `kill` 掉 server 和 client，`wait` 回收 |
+##### 一、测试目标
+
+验证 `get_sockdelays -p <PID>` 通过 Generic Netlink 内核接口（标准 dumpit 协议）查询指定进程持有的所有 socket 统计的能力。这是最核心的功能，所有其他功能都建立在此基础之上。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:183-217](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L183-L217)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 TCP server 监听端口 21401 | 后台运行，拿到 server PID `_SRV` |
+| 2 | `sleep 1` 等待 server 启动 | 避免 client 连接失败 |
+| 3 | 启动 iperf3 client 连接 server，持续 5 秒 | **必须 `&` 后台运行**，拿到 client PID `_CLI` |
+| 4 | `sleep 2` 等待传输稳定 | 确保连接建立、数据正在传输 |
+| 5 | 执行 `get_sockdelays -p $_CLI` 查询 client PID | 捕获输出到 `OUT` |
+| 6 | 文本解析：统计 `proto=` 行数和 `proto=tcp` 行数 | 用 grep 做计数 |
+| 7 | 断言检查，清理进程 | kill server/client，wait 回收 |
+
+##### 三、核心断言与原理
+
+唯一核心断言：
+- **`proto=tcp` 数据行 ≥ 1**：证明 dumpit 遍历能够正确枚举到 client 进程持有的至少一个 TCP socket。
+
+**时序关键**：client 必须后台运行，否则 5s 传输结束后进程退出，查询时 socket 已被内核关闭清理，会误判为失败。
 
 ---
 
 #### Test 02: Inode 查询
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 每个 socket 在内核 sockfs 中有唯一 inode 号。`/proc/<PID>/fd/<N>` 的符号链接格式为 `socket:[inode]`，可提取 inode 后通过 `get_sockdelays -i <inode>` 查询单个 socket |
-| **实现** | `nc -l -p 21402 &` 创建 TCP 监听 socket → 遍历 `/proc/$PID/fd/*`，`readlink` 提取 `socket:\[数字\]` 中的 inode → `get_sockdelays -i $INODE` |
-| **断言** | 输出中包含 `inode=$INODE` |
-| **依赖** | `/proc` 文件系统已挂载（guest-init 中 `mount -t proc`） |
+##### 一、测试目标
+
+验证 `get_sockdelays -i <inode>` 按 socket inode 号精确查询单个 socket 的能力。每个 socket 在内核 sockfs 中有唯一 inode 号，这是除 PID 查询外的第二种定位方式。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:219-257](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L219-L257)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | `nc -l -p 21402` 创建 TCP 监听 socket | nc 轻量，不会产生额外连接 |
+| 2 | `sleep 1` 等待 nc 监听就绪 | |
+| 3 | 遍历 `/proc/$NC_PID/fd/*`，用 `readlink` 提取 inode | 符号链接格式为 `socket:[数字]`，用 sed 提取数字部分 |
+| 4 | 执行 `get_sockdelays -i $INODE` 查询 | 捕获输出 |
+| 5 | 断言：输出中包含 `inode=$INODE` | grep 匹配 |
+| 6 | 清理 nc 进程 | |
+
+##### 三、核心断言与原理
+
+唯一核心断言：
+- **输出中包含 `inode=$INODE`**：证明内核通过 inode 查找到了正确的 socket，没有用错 inode 映射。
+
+**依赖**：需要 `/proc` 文件系统已挂载（guest-init 中 `mount -t proc`），否则无法从 fd 符号链接提取 inode。
 
 ---
 
 #### Test 03: 重置计数器（基础功能）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | `get_sockdelays -R` 向内核发送 `NET_DELAYACCT_CMD_RESET` 命令，遍历所有 socket 调用 `net_delayacct_reset()` 清零 per-sock 统计 |
-| **实现** | iperf3 TCP 传输 3s（**同步运行，确保 -R 时流量已停止**）→ 查询 server PID 确认有数据（`PRE_DATA` 行 ≥ 1）→ 执行 `-R` → `sleep 1` 后再次查询 → 检查所有 `count=` 字段是否全为 0 |
-| **断言** | **停止流量后**执行 reset，`count > 0` 的行数 = 0（验证 reset 清零能力本身） |
-| **语义说明** | RESET 不是全局原子快照，遍历期间/之后新到达的包仍会被累加（与 `/proc/net/snmp` 等批量统计框架一致）。本测试在流量已停止时执行 reset，故非原子语义不影响断言；**活跃流量下的非原子行为由 Test 17 专项验证** |
+##### 一、测试目标
+
+验证 `get_sockdelays -R` 的基础清零能力：停止流量后执行 reset，所有 per-socket 统计应被清零。这是 RESET 功能最基本的正确性验证。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:259-300](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L259-L300)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 端口 21403，sleep 1 等待就绪 | |
+| 2 | **同步运行** iperf3 client，传输 3 秒 | 不加 `&`，阻塞等待传输完成后才继续。关键：确保 reset 时流量已完全停止 |
+| 3 | `sleep 1` 等待 skb 处理完成 | 避免 in-flight 包干扰 |
+| 4 | 执行 `get_sockdelays -p $_SRV`（重置前查询） | 确认有统计数据（`PRE_DATA ≥ 1`） |
+| 5 | 执行 `get_sockdelays -R` 重置 | 向内核发送 RESET 命令 |
+| 6 | `sleep 1` 等待 reset 完成并让 in-flight 包被清零 | |
+| 7 | 再次查询 `get_sockdelays -p $_SRV`（重置后查询） | 统计所有 `count=` 字段大于 0 的行数 |
+| 8 | 断言，清理进程 | |
+
+##### 三、核心断言与原理
+
+唯一核心断言：
+- **重置后所有 count 字段为 0**（`count>0` 的行数 = 0）：证明 reset 确实将所有 socket 的统计清零。
+
+**语义说明**：RESET 不是全局原子快照，遍历期间或遍历之后新到达的包仍会被累加（这是与 `/proc/net/snmp` 等批量统计框架一致的设计）。本测试在流量完全停止后执行 reset，因此非原子语义不影响断言；**活跃流量下的非原子行为由 Test 17 专项验证**，两者互补。
 
 ---
 
 #### Test 04: TCP 路径
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 验证内核 per-socket 延迟统计对 TCP socket 的追踪能力——RX 打点（`tcp_recvmsg_locked`/`tcp_read_sock`/`tcp_zerocopy_receive`）是否正常工作 |
-| **实现** | iperf3 TCP（端口 21404）传输 5s → 传输完成后查询 server PID |
-| **断言** | `proto=tcp` 行 ≥ 1；若有 `RX count≥1` 则标 PASS，否则因 timing 边缘情况也给 PASS 但标注 "(timing)" |
-| **容错** | 传输结束到查询之间可能有延迟，导致 skb 已被清空；只要能枚举到 TCP socket 即可通过 |
+##### 一、测试目标
+
+验证内核 per-socket 延迟统计对 TCP socket 的追踪能力：RX 打点（`tcp_recvmsg_locked`/`tcp_read_sock`/`tcp_zerocopy_receive`）能够正常工作，iperf3 这种常规 TCP 传输能统计到数据。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:302-338](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L302-L338)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 端口 21404 | |
+| 2 | 同步运行 iperf3 client 传输 5 秒 | 阻塞等待完成 |
+| 3 | `sleep 1` 等待队列清空 | |
+| 4 | 查询 server PID：`get_sockdelays -p $_SRV` | |
+| 5 | 统计 `proto=tcp` 行数，检查首行 RX count 是否 ≥ 1 | |
+| 6 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+断言采取容错设计：
+- **`proto=tcp` 行 ≥ 1**（必须满足）：证明 TCP socket 被枚举到。
+- **若 RX count ≥ 1 则 PASS，否则也给 PASS 但标注 "(timing)"**：传输结束到查询之间可能有延迟，skb 已被释放/计数已被清空属于 timing 边缘情况，只要能枚举到 TCP socket 即视为 TCP 路径打点框架工作正常。
+
+这是一个冒烟测试，不是精确计数验证——精确计数由后面的 Test 09/10 等负责。
 
 ---
 
 #### Test 05: UDP 路径
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 验证内核 per-socket 延迟统计对 UDP socket 的追踪能力。UDP 无连接，end 点在 `skb_copy_and_csum_datagram_msg()` 成功之后，统计行为与 TCP 不同 |
-| **实现** | iperf3 UDP（端口 21405，`-u -b 10M -t 5`）→ client `&` 后台运行 → `sleep 2` 同时查询 client 和 server 两端 |
-| **断言** | 两端 `proto=udp` 总数 ≥ 1（UDP socket 可能只在一侧可见） |
-| **关键设计** | client 必须 `&`，否则同步阻塞 5s 后 UDP 数据 socket 已被关闭；两端同时查避免单端 socket 已清理导致误判 |
+##### 一、测试目标
+
+验证内核 per-socket 延迟统计对 UDP socket 的追踪能力。UDP 是无连接协议，end 打点位于 `skb_copy_and_csum_datagram_msg()` 成功之后（checksum 验证通过后才计入），行为与 TCP 不同，需要单独验证。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:340-380](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L340-L380)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 端口 21405 | |
+| 2 | 启动 iperf3 UDP client（`-u -b 10M -t 5`），**后台运行 `&`** | 关键：UDP 无连接，同步阻塞 5s 结束后 UDP 数据 socket 会被立即关闭，查询时可能已消失 |
+| 3 | `sleep 2` 等待传输稳定 | |
+| 4 | **同时查询 client 和 server 两端**：`get_sockdelays -p $_SRV` 和 `get_sockdelays -p $_CLI` | UDP socket 可能只在一侧可见 |
+| 5 | 分别统计两端 `proto=udp` 行数，求和 | |
+| 6 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+唯一核心断言：
+- **两端 proto=udp 总数 ≥ 1**：UDP 无连接，server 侧或 client 侧可能在查询时 socket 已被关闭（UDP socket 生命周期比 TCP 短），两端同时查避免单端误判。
+
+**关键设计**：client 必须后台运行，否则同步阻塞结束后 socket 立即被内核清理，查询不到任何 UDP socket。
 
 ---
 
 #### Test 06: 多 Socket 枚举
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 验证一个进程持有多个 socket 时，`get_sockdelays` dumpit 遍历 `files_struct` 能否全量枚举，不遗漏 |
-| **实现** | iperf3（端口 21406）`-P 4` 产生 4 条并行 TCP 流 → `sleep 2` 后分别查询 client（父进程）和 server |
-| **断言** | client 父进程 ≥ 1 个 TCP socket（control 连接），server ≥ 6 个 TCP socket |
-| **socket 数量说明** | server 至少 1 listen + 1 control + 4 data = ≥6；实际数量可能因 TIME-WAIT 残留、iperf3 管理 socket 等状态**更高**，断言用 `>=6` 容忍上浮，不期望恰好等于 6 |
-| **关键设计** | iperf3 `-P N` 会 fork 子进程处理数据连接，client 父进程 fd 表中只有 control socket；server 不 fork，所有数据 socket 在主进程可见 |
+##### 一、测试目标
+
+验证一个进程持有多个 socket 时，`get_sockdelays` dumpit 遍历 `files_struct` 能否全量枚举出所有 socket，不遗漏任何一个 fd。这是后续多连接测试（Test 09）的基础。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:382-429](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L382-L429)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 端口 21406 | |
+| 2 | 启动 iperf3 client `-P 4`（4 条并行 TCP 流），后台运行 | iperf3 `-P N` 会 fork 子进程处理每条数据连接 |
+| 3 | `sleep 2` 等待所有连接建立 | |
+| 4 | 查询 client 父进程 PID：`get_sockdelays -p $_CLI` | 父进程只持有 control socket |
+| 5 | 查询 server PID：`get_sockdelays -p $_SRV` | server 不 fork，所有 socket 在主进程可见 |
+| 6 | 分别统计两端 `proto=tcp` 行数 | |
+| 7 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+两个断言：
+1. **client 父进程 ≥ 1 个 TCP socket**：父进程持有 control 连接 socket。
+2. **server ≥ 6 个 TCP socket**：至少 1 个 listen socket + 1 个 control 连接 + 4 条数据连接 = 6 个。
+
+**socket 数量说明**：实际数量可能因 TIME-WAIT 残留 socket、iperf3 内部管理 socket 等状态更高，断言用 `>=6` 容忍上浮，不期望恰好等于 6。
+
+**关键设计**：iperf3 `-P N` 会 fork 子进程处理数据连接，子进程的数据 socket 出现在子进程 fd 表中，父进程 fd 表只有 control socket；server 侧不 fork，所有数据 socket 在同一个进程中可见，因此 server 侧断言数量更高。
 
 ---
 
@@ -214,21 +322,55 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 #### Test 07: JSON 格式输出
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | `get_sockdelays -j` 将 socket 统计以 JSON 格式输出（包含 `proto`、`local`/`remote` 五元组、`rx`/`tx` 统计对象），便于程序解析 |
-| **实现** | iperf3 TCP（端口 21407）传输中查询 `-j -p $SERVER_PID` |
-| **断言** | 输出中 `"proto"` 字段出现 ≥ 1 次且 `"rx"` 字段出现 ≥ 1 次 |
+##### 一、测试目标
+
+验证 `get_sockdelays -j` 能够将 socket 统计以机器可读的 JSON 格式输出，便于脚本和自动化工具解析。JSON 输出是集成到监控系统的关键接口。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:439-472](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L439-L472)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 端口 21407 | |
+| 2 | 启动 iperf3 client 传输 3 秒，后台运行 | 保证查询时有活跃 socket |
+| 3 | `sleep 1` | |
+| 4 | 执行 `get_sockdelays -j -p $_SRV` 查询 | `-j` 启用 JSON 输出 |
+| 5 | 统计 `"proto"` 和 `"rx"` 字段出现次数 | grep 计数 |
+| 6 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+两个断言：
+- **`"proto"` 字段出现 ≥ 1 次**：JSON 中包含 socket 协议类型字段，证明不是空输出。
+- **`"rx"` 字段出现 ≥ 1 次**：JSON 中包含 RX 统计对象，证明数据结构正确序列化。
+
+本测试仅验证 JSON 输出"看起来像 JSON"，不做严格 JSON 语法校验（jq 等 JSON 工具不在 initramfs 中）；格式正确性通过日常使用和代码 review 保证。
 
 ---
 
 #### Test 08: Debug 诊断模式
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | `get_sockdelays -d` 在 stderr 输出 netlink 收发诊断信息（family 解析、send/recv 字节数、属性遍历），用于排查内核通信问题 |
-| **实现** | `nc -l -p 21408` 创建监听 socket → `get_sockdelays -d -p $PID 2>&1` 合并捕获 stderr+stdout |
-| **断言** | 输出非空（至少包含 diag 行或 socket 数据行） |
+##### 一、测试目标
+
+验证 `get_sockdelays -d` 能够在 stderr 输出 netlink 收发诊断信息（family 解析、send/recv 字节数、属性遍历详情），用于排查内核通信问题。这是调试 netlink 交互问题的重要工具。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:474-500](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L474-L500)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | `nc -l -p 21408` 创建 TCP 监听 socket | 轻量场景，避免 iperf3 产生过多输出干扰诊断信息 |
+| 2 | `sleep 1` 等待 nc 就绪 | |
+| 3 | 执行 `get_sockdelays -d -p $_NC 2>&1` | `-d` 输出到 stderr，用 `2>&1` 合并 stderr 和 stdout 统一捕获 |
+| 4 | 检查输出是否非空 | |
+| 5 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+唯一核心断言：
+- **输出非空**：debug 模式应该产生诊断输出或正常 socket 数据，不应该静默失败。
 
 ---
 
@@ -242,36 +384,120 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 #### Test 09: 高并发多连接
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 大量并行连接测试 socket 枚举能力（fdtable 遍历正确性）和计数正确性，同时验证 dumpit 协议在多 socket 场景下不漏消息 |
-| **实现** | iperf3（端口 21409）`-P 8`（8 条并行流）→ `sleep 2` 后分别查询 server 和 client |
-| **三重断言** | ① server TCP socket 数 ≥ 9（1 listen + 8 data）；② server RX 总量 > 0；③ client TX 总量 > 0 |
-| **反向约束** | server TX 总量 ≤ client TX/10（单向传输下 server 只发纯 ACK，纯 ACK 用 `alloc_skb` 零初始化 `delayacct_start`，`tx_end` 守卫跳过不计入 TX，故 server TX 应接近 0）。该反向约束守护「TX 只统计 sendmsg 路径」的设计语义，防止 ACK 被错误计入 TX |
-| **方向分离** | server 是接收方，TX 以纯 ACK 为主（不走 `sendmsg`，按设计不计入 TX），故正向验证 server RX；client 是发送方，验证 TX |
+##### 一、测试目标
+
+验证在高并发多连接场景下，框架的三个核心能力：
+
+1. **Socket 枚举能力**：一个进程持有大量 socket 时，`get_sockdelays` 能否通过 `files_struct` 遍历把所有 socket 都枚举出来，不遗漏
+2. **计数正确性**：RX/TX 计数不会因为并发而错乱、丢失、重复统计
+3. **方向分离语义验证**：验证TX/RX计数不对称的设计——纯接收方（server）的TX计数应该远小于发送方（client）（因为纯ACK不会被计入TX统计）
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:511-584](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L511-L584)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 监听端口 21409 | 后台运行，拿到 server PID `_SRV` |
+| 2 | 启动 iperf3 client，`-P 8` 参数 | **并行 8 条 TCP 流**同时向 server 发送数据，持续 5 秒，后台运行，拿到 client PID `_CLI` |
+| 3 | `sleep 2` | 等待连接全部建立、数据稳定传输 |
+| 4 | 查询 server PID：`get_sockdelays -p $_SRV` | 拿到 server 侧所有 socket 统计 |
+| 5 | 查询 client PID：`get_sockdelays -p $_CLI` | 拿到 client 侧所有 socket 统计 |
+| 6 | 从输出中解析：<br>- server 侧 proto=tcp 行数（socket数量）<br>- server 侧 RX 总计数<br>- server 侧 TX 总计数<br>- client 侧 TX 总计数<br>- client 侧 RX 总计数 | 用 grep/awk 做文本解析 |
+| 7 | 执行断言检查，清理进程 | 通过则 PASS，失败则打印诊断输出 |
+
+##### 三、核心断言与原理
+
+一共四个断言，层层递进验证：
+
+1. **`server socket_count >= 9`**
+   - iperf3 server 侧预期至少有 **9个TCP socket**：
+     - 1 个 listen socket（监听端口）
+     - 1 个 control 连接（iperf3 控制通道，传测试参数/结果）
+     - 8 个 data socket（`-P 8` 的8条并行数据连接）
+   - 这个断言验证**枚举完整性**：如果我们的 dumpit 遍历逻辑有bug（比如fd遍历遗漏、sock_from_file判断错误），socket数量会少于9，直接失败。
+   - 为什么是 `>=9` 而不是 `==9`？因为可能有 TIME-WAIT 残留 socket、临时管理 socket 等，断言用下限容忍上浮，不期望精确等于9。
+
+2. **`server RX_SUM > 0`**
+   - server 是接收方，8条流同时发数据，RX 总计数必须大于0。
+   - 验证 RX 打点工作正常：高并发下 `net_delayacct_rx_end()` 的 spinlock 累加没有丢计数。
+
+3. **`client TX_SUM > 0`**
+   - client 是发送方，8条流的发送数据必须走 `__tcp_transmit_skb` clone路径，TX 总计数必须大于0。
+   - 验证 TX 打点在多连接并发下工作正常，`net_delayacct_tx_end()` 累加正确。
+
+4. **`server TX_SUM <= client TX_SUM / 10`**（最关键的语义验证）
+   - **这是验证TX/RX计数不对称设计的核心断言**：
+     - 单向传输场景下，server 只收数据，发送的只有**纯ACK包**
+     - 纯ACK包走 `alloc_skb` 分配，`delayacct_start` 被零初始化为0
+     - `net_delayacct_tx_end()` 有 `if (!skb->delayacct_start) return;` 守卫，纯ACK完全不计入TX统计
+     - 只有少量重传包、 window probe 包等会走 sendmsg/clone 路径被计入TX
+   - 因此 server TX 应该远小于 client TX（我们取1/10阈值，TCG场景下也足够宽松）
+   - 这个断言同时验证了两个设计点：① 纯ACK确实不计入TX；② 高并发下方向统计不会串扰。
+
+> 注意：client RX > 0 是正常的，不做约束——因为client会收到server发的ACK，RX打点在`__netif_receive_skb_core`入口，**所有入包包括ACK都会计入RX**，这是设计上的不对称。
 
 ---
 
 #### Test 10: 大流量高计数
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 不限速大流量传输，验证 64 位计数器不会溢出或截断，同时验证 `pr_warn_once` 溢出告警不触发 |
-| **实现** | iperf3（端口 21410）`-P 4 -t 5` 不限速 → 分别查询 server（取最大 RX count）和 client（取最大 TX count） |
-| **断言** | server 最大 RX count ≥ 50 **且** client 最大 TX count ≥ 50 |
-| **阈值选择** | 阈值 50 是保守值，兼顾 TCG 软件模拟（速度慢）和 KVM 硬件加速（实际远超）；本意是验证不截断/不溢出，非验证吞吐 |
-| **关键修复** | 旧代码只查 server，server TX 只有 ACK≈2 永远不满足 ≥100；修复后按方向分端查询 |
+##### 一、测试目标
+
+验证不限速大流量传输场景下，64 位 RX/TX 计数器不会溢出、不会被截断，也不会触发 `pr_warn_once` 溢出告警。这是计数器正确性的压力测试。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:586-627](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L586-L627)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 端口 21410 | |
+| 2 | 启动 iperf3 client `-P 4 -t 5`（不限速），后台运行 | 4条流打满 loopback 带宽 |
+| 3 | `sleep 2` 等待流量稳定 | |
+| 4 | 查询 server PID：`get_sockdelays -p $_SRV` | 取所有 RX count 中的最大值 |
+| 5 | 查询 client PID：`get_sockdelays -p $_CLI` | 取所有 TX count 中的最大值 |
+| 6 | 比较两个最大值是否都 ≥ 50 | |
+| 7 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+两个断言：
+- **server 最大 RX count ≥ 50**：接收方 RX 计数有足够数据量。
+- **client 最大 TX count ≥ 50**：发送方 TX 计数有足够数据量。
+
+**阈值选择**：阈值 50 是保守值，兼顾 TCG 软件模拟（速度慢，计数低）和 KVM 硬件加速（实际计数远超 50）；本意是验证计数器不截断/不溢出，不是验证吞吐性能。
+
+**关键修复**：旧版本测试只查 server 侧 TX，server 仅发 ACK（TX≈0）永远无法满足阈值；修复后按方向分端查询，server 验 RX、client 验 TX，符合 TX/RX 计数不对称设计。
 
 ---
 
 #### Test 11: 混合协议隔离
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | TCP 和 UDP 同时传输，验证内核 per-socket 统计按 socket 隔离，不会出现跨协议污染（TCP socket 不统计 UDP 数据，反之亦然） |
-| **实现** | 两个 iperf3 server：TCP（端口 21411）+ UDP（端口 21412）→ TCP client `-P 4 -t 5` + UDP client `-u -t 5 -b 20M` 同时运行 → `sleep 2` 后分别查询两个 server PID |
-| **断言** | TCP server：`proto=tcp` ≥ 5（1 listen + 4 data）、`proto=udp` = 0；UDP server：`proto=tcp` ≥ 1（控制连接）、`proto=udp` ≥ 1（数据 socket） |
-| **关键设计** | iperf3 UDP 模式也用 TCP 做控制连接，所以 UDP server 必然有 1 个 tcp socket，这是正确行为而非 bug |
+##### 一、测试目标
+
+验证 TCP 和 UDP 同时传输时，内核 per-socket 统计按 socket 正确隔离，不会出现跨协议污染（TCP socket 不会统计到 UDP 数据，UDP socket 也不会统计到 TCP 数据）。这是 per-sock 统计正确性的基础。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:629-692](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L629-L692)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动两个独立的 iperf3 server：TCP 端口 21411，UDP 端口 21412 | 使用不同端口，进程隔离 |
+| 2 | `sleep 1` 等待两个 server 就绪 | |
+| 3 | 同时启动两个 client：TCP client `-P 4 -t 5`、UDP client `-u -t 5 -b 20M`，均后台运行 | 同时产生 TCP 和 UDP 流量 |
+| 4 | `sleep 2` 等待流量稳定 | |
+| 5 | 查询 TCP server PID：统计 proto=tcp 和 proto=udp 行数 | 应该只有 TCP，没有 UDP |
+| 6 | 查询 UDP server PID：统计 proto=tcp 和 proto=udp 行数 | 应该有 TCP(control) + UDP(data) |
+| 7 | 断言，清理 | kill 两个 client 和两个 server |
+
+##### 三、核心断言与原理
+
+两个方向的协议隔离断言：
+1. **TCP server**：`proto=tcp ≥ 5`（1 listen + 4 data），`proto=udp = 0`（TCP server 进程不应有 UDP socket）。
+2. **UDP server**：`proto=tcp ≥ 1`（iperf3 UDP 模式用 TCP 做控制连接，必然有一个 TCP socket），`proto=udp ≥ 1`（数据 socket）。
+
+**关键设计**：iperf3 UDP 模式也会建立一个 TCP 控制连接传输测试参数和结果，所以 UDP server 进程必然持有至少 1 个 TCP socket，这是正确行为不是 bug——我们断言的是"不应该有 UDP socket 出现在 TCP server 进程中"，而不是"UDP server 不能有 TCP socket"。
 
 ---
 
@@ -279,27 +505,79 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 验证工具在极端输入下不崩溃、不泄漏、合理报错。4 个子检查使用本地计数器合并为 1 个测试编号，避免测试计数膨胀。
 
-| 子检查 | 原理 | 断言 |
-|--------|------|------|
-| **(a) PID 1（init）** | 系统进程通常没有网络 socket，工具应正常退出不崩溃 | 正常退出（exit 0）或输出 "no matching" |
-| **(b) PID 99999** | 不存在的 PID，工具应明确报错 | 非零退出码 |
-| **(c) `-h` 帮助** | 用户友好使用说明 | 输出包含 "usage" 或 "用法"（大小写不敏感） |
-| **(d) `-V` 版本** | 版本号输出 | 正常退出（exit 0） |
+---
+
+#### Test 12: 边界条件（PID 1 / 不存在PID / -h / -V）
+
+##### 一、测试目标
+
+验证 `get_sockdelays` 在各种边界输入下行为正确：
+- 查询没有网络 socket 的系统进程（PID 1 init）不应崩溃
+- 查询不存在的 PID 应明确报错
+- `-h` 帮助和 `-V` 版本选项正常工作
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:702-755](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L702-L755)，4 个子检查顺序执行：
+
+| 子检查 | 操作 |
+|--------|------|
+| (a) PID 1 (init) | 执行 `get_sockdelays -p 1`，检查是否正常退出或输出 "no matching" |
+| (b) PID 99999 (不存在) | 执行 `get_sockdelays -p 99999`，检查是否返回非零退出码 |
+| (c) `-h` 帮助 | 执行 `get_sockdelays -h`，检查输出是否包含 "usage" 或 "用法" |
+| (d) `-V` 版本 | 执行 `get_sockdelays -V`，检查是否正常退出（exit 0） |
+
+使用本地计数器 `BOUNDARY_OK`/`BOUNDARY_NG` 汇总 4 个子检查结果，通过则统一 PASS。
+
+##### 三、核心断言与原理
+
+所有 4 项子检查全部通过才算 PASS：
+- **(a) PID 1**：init 进程通常没有网络 socket，工具应正常退出（exit 0）或输出 "no matching sockets"，绝不能崩溃或 Oops。
+- **(b) PID 99999**：不存在的 PID，工具应返回非零退出码表示错误，不能静默返回空结果假装成功。
+- **(c) `-h`**：帮助信息应输出包含 "usage" 或 "用法"（大小写不敏感）。
+- **(d) `-V`**：版本信息应正常输出，退出码为 0。
 
 ---
 
 ### 第五部分：稳定性（Test 13）
 
+---
+
 #### Test 13: 并发查询压力（空 PID + busy PID 混合）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 多个进程同时对内核发起 Netlink dump 查询，验证**内核并发安全**——per-sock spinlock 无死锁、`cb->ctx` 遍历无竞态、无 Kernel Oops/BUG/panic |
-| **实现** | 启动一个 iperf3 busy server（`-P 4 -t 30` 持有多条活跃 socket）→ 启动 **4 个 worker 查 PID 1**（空 fdtable 快速返回路径）+ **4 个 worker 查 busy server PID**（真正进入 `net_delayacct_fill_sock()`、获取 per-socket spinlock、遍历 `cb->ctx` 的慢路径），各 10 次查询，共 8 × 10 = **80 次查询**；wait 所有 worker 后检查 dmesg 尾部 100 行 |
-| **参数选择** | 4+4 workers × 10 queries = 80 次查询。兼顾 KVM（快速）和 TCG（软件模拟，较慢）两种场景：TCG 下 80 次查询约 60-80s，留足时间给 Test 14-22；KVM 下可轻松扩展到更多查询。混合空 PID + busy PID 的设计不变，仍覆盖空 fdtable 快路径和 per-socket 慢路径 |
-| **断言** | 无 worker 崩溃 + dmesg 无 `Kernel panic`/`Oops:`/`BUG:` + **busy worker 成功查询次数 > 0**（证明 per-socket 并发路径被实际覆盖） |
-| **为什么混合空 PID + busy PID？** | 仅查 PID 1（无 socket）只能覆盖 Netlink 控制路径和空 fdtable 遍历，不会触发 `net_delayacct_fill_sock()` / per-socket spinlock。加入 busy PID 才能真正暴露 dumpit 遍历 fdtable、读取 per-socket 统计、执行过滤时的并发风险 |
-| **检测崩溃** | 输出文件不存在视为 worker 崩溃（`_CRASH` 计数器） |
+##### 一、测试目标
+
+验证多个进程同时对内核发起 Netlink dump 查询时，**内核并发安全**——per-sock spinlock 无死锁、`cb->ctx` 遍历无竞态、不会触发 Kernel Oops/BUG/panic。这是内核代码并发安全性的压力测试。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:765-901](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L765-L901)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 busy server（端口 21413） | 持有活跃 socket，用于测试 per-socket 慢路径 |
+| 2 | 启动 iperf3 client `-P 4 -t 30`（持续 30 秒） | 让 server 持有多条活跃 socket，持续有流量 |
+| 3 | 启动 **4 个 worker 进程查 PID 1**（空 fdtable 快速返回路径） | 覆盖空 fdtable 快路径 |
+| 4 | 启动 **4 个 worker 进程查 busy server PID**（per-sock 遍历慢路径） | 真正触发 `net_delayacct_fill_sock()`、获取 per-sock spinlock |
+| 5 | 每个 worker 执行 **10 次查询**，记录成功/失败次数 | 总共 8 × 10 = 80 次查询 |
+| 6 | `wait` 所有 worker 进程，逐个收集退出码 | 检测 worker 崩溃 |
+| 7 | 汇总 worker 输出文件：统计 ok/fail/crashed 数量 | 输出文件不存在视为 worker 崩溃 |
+| 8 | 检查 `dmesg` 尾部 100 行：搜索 `Kernel panic`/`Oops:`/`BUG:` | 检测内核 Oops |
+| 9 | 清理 iperf3 server/client | |
+
+##### 三、核心断言与原理
+
+三个断言必须全部满足：
+1. **无 worker 崩溃**（`_CRASH == 0`）：所有 worker 都正常退出，没有 segfault 等异常。
+2. **dmesg 无内核错误**（`OOPS == 0`）：内核没有产生 panic、Oops 或 BUG 警告——这是并发安全的最终判据。
+3. **busy worker 成功查询次数 > 0**（`_BUSY_OK > 0`）：证明 per-socket 慢路径确实被走到，不是所有查询都走了空 PID 快路径，测试覆盖了真正的并发竞争点。
+
+**为什么混合空 PID + busy PID？**
+- 仅查 PID 1（无 socket）只能覆盖 Netlink 控制路径和空 fdtable 遍历，不会调用到 `net_delayacct_fill_sock()`，也不会获取 per-sock spinlock，无法暴露并发问题。
+- 加入 busy PID 才会真正触发 dumpit 遍历 fdtable、读取 per-sock 统计、执行过滤等逻辑，才能真正暴露 spinlock 并发、`cb->ctx` 遍历竞态等问题。
+- 混合两种场景可以同时覆盖快路径和慢路径。
+
+**参数选择**：4+4 workers × 10 queries = 80 次查询，兼顾 KVM（快速）和 TCG（软件模拟较慢）：TCG 下约 60-80 秒完成，留足时间给后续测试；KVM 下可轻松扩展。
 
 ---
 
@@ -311,37 +589,99 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 #### Test 14: 协议过滤（--proto）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | `--proto tcp`/`--proto udp` 通过 `NET_DELAYACCT_A_TYPE` 属性传递到内核，dumpit 回调中比较 `sk->sk_protocol` 决定是否返回该 socket |
-| **实现** | TCP server（21414）+ UDP server（21415）→ TCP client `-P 2 -t 8` + UDP client `-u -t 8 -b 10M` → `sleep 2` 后对 **UDP server PID**（同时持有 TCP 控制 socket 和 UDP 数据 socket）做三次查询：无过滤、`--proto tcp`、`--proto udp` |
-| **断言** | 无过滤：tcp ≥ 1 **且** udp ≥ 1；`--proto tcp`：tcp ≥ 1 **且** udp = 0；`--proto udp`：tcp = 0 **且** udp ≥ 1 |
-| **negative case** | 用 `nc -u -l` 创建**纯 UDP 进程**（无 TCP socket）→ `--proto tcp` 查询应返回空（0 行）。防止「过滤失败默认返回全部」一类实现缺陷 |
-| **client -t 8** | 确保三次查询期间 UDP 数据 socket 存活（iperf3 server 在 client 断开后关闭关联 UDP socket） |
+##### 一、测试目标
+
+验证 `--proto tcp` / `--proto udp` 协议过滤功能：过滤条件通过 netlink 属性正确传递到内核，dumpit 回调中比较 `sk->sk_protocol` 决定是否返回该 socket，不会错误返回其他协议的 socket。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:911-998](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L911-L998)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动两个 iperf3 server：TCP 端口 21414，UDP 端口 21415 | |
+| 2 | 启动两个 client：TCP client `-P 2 -t 8`、UDP client `-u -t 8 -b 10M`，均后台运行 | `-t 8` 保证三次查询期间 socket 存活 |
+| 3 | `sleep 2` 等待连接建立 | |
+| 4 | 三次查询 **UDP server PID**（它同时持有 TCP control socket 和 UDP data socket，天然具备两种协议）：<br>① 无过滤<br>② `--proto tcp`<br>③ `--proto udp` | UDP server 是最佳测试对象：同一个进程同时有 TCP 和 UDP socket，可以验证过滤是否生效 |
+| 5 | negative case：`nc -u -l` 创建纯 UDP 进程 → `--proto tcp` 查询 | 验证"过滤失败时不返回任何结果"，而不是默认返回全部 |
+| 6 | 统计每次查询的 tcp/udp 行数 | |
+| 7 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+四个断言层层验证：
+1. **无过滤基线**：tcp ≥ 1 且 udp ≥ 1，证明 UDP server 确实同时持有两种协议的 socket，测试前提成立。
+2. **`--proto tcp`**：tcp ≥ 1 且 udp = 0，证明只返回 TCP，UDP 被过滤掉。
+3. **`--proto udp`**：udp ≥ 1 且 tcp = 0，证明只返回 UDP，TCP 被过滤掉。
+4. **negative case**：纯 UDP 进程用 `--proto tcp` 查询应返回 0 行，防止"过滤条件无效时默认返回全部 socket"这类实现缺陷。
+
+**client -t 8**：iperf3 server 在 client 断开后会关闭与该 client 关联的 UDP 数据 socket，用较长的 `-t 8` 确保三次查询期间 UDP socket 存活。
 
 ---
 
 #### Test 15: 端口过滤（--lport）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | `--lport <port>` 通过 `NET_DELAYACCT_A_LPORT` 属性传递，内核比较 `sk->sk_num`（host byte order，**不是 ntohs**）匹配本地端口 |
-| **实现** | iperf3 server（端口 21416）→ client `-P 2 -t 3` → `sleep 2` 后三次查询：无过滤、`--lport 21416`、`--lport 99999`（不存在的端口） |
-| **断言** | 无过滤：socket ≥ 1；`--lport 21416`：匹配行 ≥ 1 **且** 非匹配行 = 0；`--lport 99999`：socket = 0 |
-| **端口匹配正则** | `local=[^ ]*:$PORT( |$)`：`[^ ]*` 在遇到空格（即 `remote=` 之前）停止，兼容 IPv4（`127.0.0.1:port`）和 IPv6（`[::]:port`）格式，不会误匹配 remote 端口 |
+##### 一、测试目标
+
+验证 `--lport <port>` 本地端口过滤功能：内核比较 `sk->sk_num`（host byte order，不是网络字节序，**不能用 ntohs**）匹配本地端口，只返回匹配指定本地端口的 socket。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:1000-1057](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L1000-L1057)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 端口 21416 | |
+| 2 | 启动 iperf3 client `-P 2 -t 3`，后台运行 | 产生多条连接，有多 socket |
+| 3 | `sleep 2` 等待连接建立 | |
+| 4 | 三次查询：<br>① 无过滤<br>② `--lport 21416`（匹配 server 监听端口）<br>③ `--lport 99999`（不存在的端口） | |
+| 5 | 统计每次查询的 socket 总数、匹配端口数、非匹配端口数 | |
+| 6 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+三个断言：
+1. **无过滤**：socket 总数 ≥ 1，测试前提成立。
+2. **`--lport 21416`**：匹配行 ≥ 1 且非匹配行 = 0，证明端口过滤生效，只返回本地端口为 21416 的 socket（listen socket + 对应端口的 established socket）。
+3. **`--lport 99999`**：返回 0 行，不存在的端口不应返回任何 socket。
+
+**端口匹配正则**：使用 `local=[^ ]*:$PORT( |$)` 匹配：
+- `[^ ]*` 在遇到第一个空格（即 `remote=` 字段之前）停止，确保只匹配 `local=` 字段的端口，不会误匹配 `remote=` 字段的远端端口
+- 兼容 IPv4（`127.0.0.1:21416`）和 IPv6（`[::1]:21416`）两种地址格式
 
 ---
 
 #### Test 16: 组合过滤（--proto + --lport）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 多个过滤条件同时传入时为 **AND 语义**——socket 必须满足所有条件才被返回 |
-| **实现** | 单个 iperf3 server（端口 21417，默认同时监听 TCP/UDP）→ **只启动 UDP client** `-u -t 8 -b 10M`（UDP client 自动建立 TCP 控制连接 + UDP 数据 socket，baseline 同时含 TCP 和 UDP）→ `sleep 3` 后查询：无过滤、`--proto tcp --lport 21417` |
-| **断言** | 无过滤：tcp ≥ 1 **且** udp ≥ 1；组合过滤：tcp ≥ 1、udp = 0（被 proto 排除）、端口不匹配 = 0（被 lport 排除） |
-| **negative case** | `--proto udp --lport 99999` 应返回空：server 有 UDP socket（监听 21417），但没有 UDP socket 使用端口 99999。`--proto udp` 匹配 UDP server socket（proto 条件满足），但 `--lport 99999` 不匹配任何 socket（lport 条件不满足），AND 语义下结果为空。验证 AND 过滤不会因一个条件满足就返回结果 |
-| **为什么只启动 UDP client？** | 并行 TCP client（`-P 2`）会因 iperf3 server 单线程处理导致 UDP client 无法建立 TCP 控制连接，server 侧无 UDP 数据 socket。只启动 UDP client 自带 TCP 控制连接，避免干扰 |
-| **sleep 3** | 给 UDP client 足够时间完成 TCP 控制连接建立和 UDP 关联 |
+##### 一、测试目标
+
+验证多个过滤条件同时传入时为 **AND 语义**——socket 必须同时满足所有过滤条件才会被返回，而不是满足任一条件就返回（OR 语义）。这是过滤功能正确性的关键。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:1059-1140](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L1059-L1140)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动单个 iperf3 server 端口 21417（默认同时监听 TCP 和 UDP） | 单 server 简化进程管理 |
+| 2 | **只启动 UDP client** `-u -t 8 -b 10M`，后台运行 | UDP client 会自动建立 TCP 控制连接，这样 server 同时持有 TCP(control) 和 UDP(data) socket，构成测试基线。不启动 TCP client 避免 iperf3 单线程处理导致 UDP client 无法建立连接 |
+| 3 | `sleep 3` 等待 TCP 控制连接建立和 UDP 关联 | 比平时多睡 1 秒，给 UDP 连接留足时间 |
+| 4 | 三次查询：<br>① 无过滤（baseline）<br>② `--proto tcp --lport 21417`（组合过滤）<br>③ `--proto udp --lport 99999`（negative 组合） | |
+| 5 | 统计每次查询的 tcp/udp 行数、端口匹配数 | |
+| 6 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+五个断言验证 AND 语义：
+1. **无过滤基线**：tcp ≥ 1 且 udp ≥ 1，server 同时有 TCP 和 UDP socket，测试前提成立。
+2. **组合过滤 tcp ≥ 1**：满足 proto=tcp 的 socket 存在。
+3. **组合过滤 udp = 0**：UDP socket 被 `--proto tcp` 过滤掉，证明 proto 条件生效。
+4. **组合过滤端口不匹配 = 0**：本地端口不是 21417 的 socket 被 `--lport` 过滤掉，证明 lport 条件生效。
+5. **negative 组合 `--proto udp --lport 99999` 返回 0 行**：虽然 server 有 UDP socket（proto 条件满足），但没有 UDP socket 使用端口 99999（lport 条件不满足），AND 语义下结果应为空。这验证了"不是只要一个条件满足就返回结果"。
+
+**为什么只启动 UDP client？**
+- iperf3 server 是单线程处理的，如果并行启动 TCP client `-P 2` 会占用 server，导致 UDP client 无法建立 TCP 控制连接，server 侧不会出现 UDP 数据 socket，测试基线不成立。
+- 只启动 UDP client，它会自带一个 TCP 控制连接，天然构造出"同一进程同时有 TCP 和 UDP socket"的测试场景。
 
 ---
 
@@ -351,75 +691,197 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ---
 
-#### Test 17: Reset 非原子语义（流量中 reset 后存在非零）
+#### Test 17: Reset 非原子语义（流量中 reset 后仍存在 count>0）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 验证 RESET 不是全局原子快照：reset 之后，活跃流量仍会累加计数（reset 不阻塞包处理） |
-| **实现** | iperf3 client `-P 2 -t 12` **持续发送中**执行 `-R` → `sleep 1` 后查询 server → 统计 `count>0` 的 socket 数 |
-| **断言** | reset 后存在 ≥ 1 个 `count>0` 的 socket（证明 reset 不会冻结后续流量，即非原子） |
-| **与 Test 03 的关系** | Test 03 在停止流量后 reset 验证「清零能力本身」；Test 17 在活跃流量中 reset 验证「非原子语义」——两者互补，共同构成对 RESET 语义的完整描述 |
-| **重试机制** | 若首次查询为 0（极端 timing：reset 后恰好无新包到达），再 `sleep 2` 重试一次 |
+##### 一、测试目标
+
+验证 RESET 不是全局原子快照：在活跃流量中执行 reset 后，新到达的包仍会继续累加计数，reset 不会阻塞或冻结后续包处理。reset 是"清零当前值"而非"停止统计"，这是与 Test 03（停止流量后 reset 验证清零能力本身）互补的语义验证。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:1150-1197](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L1150-L1197)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 端口 21430 | |
+| 2 | 启动 iperf3 client `-P 2 -t 12`（持续 12 秒，长流），后台运行 | 保证 reset 执行期间流量持续活跃，不会中途停止 |
+| 3 | `sleep 3` 等待流量稳定并积累一定数据 | |
+| 4 | **在流量持续传输中**执行 `get_sockdelays -R` 重置 | 关键：不停止流量直接 reset |
+| 5 | `sleep 1` 等待 reset 完成，并让 reset 后新到达的包有时间累加 | |
+| 6 | 查询 server PID：统计所有 `count>0` 的 socket 数量 | |
+| 7 | 若首次查询为 0（极端 timing：reset 后恰好没有新包到达），`sleep 2` 后重试一次 | 容错 |
+| 8 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+唯一核心断言：
+- **reset 后存在 ≥ 1 个 count>0 的 socket**：证明 reset 只是清零了当时的统计值，但没有冻结后续统计，reset 之后到达的新包仍然会被正常计数——即 RESET 语义是非原子的、不阻塞的。
+
+**与 Test 03 的关系**：
+- Test 03：停止流量后 reset → 验证"清零能力本身"（reset 确实把已有计数清零了）
+- Test 17：活跃流量中 reset → 验证"非原子语义"（reset 不会阻止新包继续累加）
+- 两者共同构成对 RESET 语义的完整描述。
 
 ---
 
 #### Test 18: 双向流量（iperf3 -R 反向，同 socket RX+TX>0）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 验证同一 socket 上 RX 和 TX 同时被统计。iperf3 `-R` 反向模式让 server 发数据 |
-| **实现** | iperf3 `-R -t 6`（server 反向发送数据流）→ `sleep 3` 后查询 server PID |
-| **断言** | server 存在 ≥ 1 个 socket 同时 `RX>0 且 TX>0`（server 发数据 TX via sendmsg + 收 ACK RX via 入口打点） |
-| **awk 配对** | 每个 socket 输出三行（proto/RX/TX），用 awk 按 proto 行重置、RX/TX 行配对，统计同时 `rx>0 && tx>0` 的 socket 数 |
-| **与方向分离的关系** | Test 09 单向验证（server RX / client TX 分开）；Test 18 双向验证（同一 socket 两个方向都有数据），互补 |
+##### 一、测试目标
+
+验证同一个 socket 上 RX 和 TX 统计可以同时非零——即 socket 既接收数据又发送数据时，两个方向的统计都能正确工作，不会互相覆盖或干扰。iperf3 `-R` 反向模式让 server 发送数据，此时 server 侧同一个 socket 既有 TX（发送数据）又有 RX（收到 client 的 ACK）。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:1199-1240](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L1199-L1240)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 启动 iperf3 server 端口 21431 | |
+| 2 | 启动 iperf3 client `-R -t 6`（反向模式，server 发数据），后台运行 | `-R` 反向：client 接收，server 发送 |
+| 3 | `sleep 3` 等待反向流量稳定 | |
+| 4 | 查询 server PID：`get_sockdelays -p $_SRV` | server 在发数据（TX）同时收 ACK（RX） |
+| 5 | awk 脚本逐行解析：遇到 `proto=` 行重置 rx/tx 标志；遇到 RX 行记录 rx count；遇到 TX 行记录 tx count；若同时 rx>0 && tx>0 则双向 socket 计数加 1 | 每个 socket 输出三行：proto/RX/TX |
+| 6 | 断言双向 socket 数 ≥ 1，清理 | |
+
+##### 三、核心断言与原理
+
+唯一核心断言：
+- **存在 ≥ 1 个 socket 同时 RX>0 且 TX>0**：证明同一 socket 上双向统计可以同时工作，互不干扰。
+
+**awk 配对逻辑**：每个 socket 的输出是连续三行（proto 行 → RX 行 → TX 行），awk 按 proto 行重置状态，在 TX 行检查 RX 是否已经有值，从而统计出"同一 socket 双向都有计数"的数量。
+
+**与 Test 09 的关系**：Test 09 是单向流量验证（server RX、client TX 分开验证方向分离）；Test 18 是双向流量验证（同一 socket 两个方向同时有计数），两者互补。
 
 ---
 
 #### Test 19: TCP splice RX 路径（tcp_read_sock）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 验证 `tcp_read_sock()` RX 路径打点：`splice()` 系统调用走 `tcp_read_sock` 而非 `tcp_recvmsg_locked`，iperf3 无法触发 |
-| **实现** | helper `splice-server` 监听 → helper `tcp-sender` 连接并发送 → splice-server 用 `splice()` 将数据导到 `/dev/null` → 查 server PID |
-| **断言** | splice-server 的 TCP data socket `RX count > 0` |
-| **辅助程序** | [tests/helper/delayacct_path_test.c](file:///home/lai/Code/NET_DELAYACCT/tests/helper/delayacct_path_test.c) `splice-server` + `tcp-sender` 子命令；缺失时 `_require_helper` 自动 SKIP |
+##### 一、测试目标
+
+验证 `tcp_read_sock()` RX 路径打点正确：`splice()` 系统调用接收数据时走 `tcp_read_sock` 而非 `tcp_recvmsg_locked`，iperf3 使用常规 recvmsg 无法触发该路径，需要专用辅助程序覆盖。这是 v6.0.0 修复 BUG-5 后新增的路径覆盖测试。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:1242-1276](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L1242-L1276)，依赖辅助程序 `delayacct_path_test`，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 检查辅助程序 `delayacct_path_test` 是否存在 | 不存在则 SKIP（graceful degradation） |
+| 2 | 启动 helper `splice-server` 监听端口 21432 | splice-server accept 连接后，用 `splice(sock_fd, ..., pipe_fd, ...)` + `splice(pipe_fd, ..., /dev/null, ...)` 将数据直接导到 `/dev/null`，不走 recvmsg/copy_to_user |
+| 3 | `sleep 1` 等待 server 就绪 | |
+| 4 | 启动 helper `tcp-sender` 连接 127.0.0.1:21432，发送 8 个数据包 | tcp-sender 是简单的 TCP 发送端 |
+| 5 | `sleep 3` 等待数据传输和 splice 处理完成 | |
+| 6 | 查询 splice-server PID：统计 TCP socket 数和 RX 总计数 | |
+| 7 | 断言，清理 sender 和 server | |
+
+##### 三、核心断言与原理
+
+两个断言：
+- **`proto=tcp` 行 ≥ 1**：splice-server 持有的 TCP socket 被枚举到。
+- **RX 总计数 > 0**：证明 splice 路径（`tcp_read_sock`）的 RX end 打点被触发，数据被正确统计——这是本测试的核心目标，验证 BUG-5 修复后 splice 接收路径不再漏统计。
+
+**辅助程序**：[tests/helper/delayacct_path_test.c](file:///home/lai/Code/NET_DELAYACCT/tests/helper/delayacct_path_test.c) 中的 `splice-server` 和 `tcp-sender` 子命令，专门用于触发 iperf3 无法覆盖的特殊路径。辅助程序未编译安装时测试优雅 SKIP，不会导致失败。
 
 ---
 
 #### Test 20: TCP zerocopy RX 路径（tcp_zerocopy_receive）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 验证 `tcp_zerocopy_receive()` RX 路径打点。`TCP_ZEROCOPY_RECEIVE` getsockopt 触发该内核函数 |
-| **实现** | helper `zerocopy-server` 监听 → `tcp-sender` 发送 → accept 后 `mmap(cfd)` 获得 socket VMA → 循环 `getsockopt(TCP_ZEROCOPY_RECEIVE)` 接收 → 查 server PID |
-| **断言** | zerocopy-server 的 TCP data socket `RX count > 0` |
-| **SKIP 降级** | 内核不支持 `TCP_ZEROCOPY_RECEIVE`（或 `CONFIG_MMU=n`）时 helper 返回退出码 3，测试据此 SKIP（而非 FAIL） |
-| **struct 兼容** | helper 使用 `<linux/tcp.h>` 内核 UAPI 定义（64 字节 struct），避免与 `<netinet/tcp.h>` 用户态定义大小不匹配导致 `ENOPROTOOPT` |
-| **环境依赖** | 需要 `CONFIG_MMU=y`；该选项在 x86/x86_64 defconfig 中默认启用，已在 `ci/kernel.config.fragment` 中显式声明 |
+##### 一、测试目标
+
+验证 `tcp_zerocopy_receive()` RX 路径打点正确：`TCP_ZEROCOPY_RECEIVE` getsockopt（TCP 接收零拷贝）触发 `tcp_zerocopy_receive()` 内核函数接收数据，该路径绕过 `tcp_recvmsg_locked`，iperf3 不使用该机制，需要专用辅助程序覆盖。这是 v6.0.0 修复 BUG-6 后新增的路径覆盖测试。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:1278-1327](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L1278-L1327)，依赖辅助程序，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 检查辅助程序存在 | 不存在则 SKIP |
+| 2 | 启动 helper `zerocopy-server` 监听端口 21433，日志输出到 `/tmp/zc.log` | zerocopy-server 关键实现：<br>① accept 后用 `mmap(cfd, ..., MAP_SHARED)` 创建 socket VMA（必须是 MAP_SHARED，不能是匿名 mmap）<br>② 设置 `TCP_MAXSEG = page_size + 12`（12 是 TCP timestamp 选项长度）提高页面对齐概率<br>③ 循环调用 `getsockopt(TCP_ZEROCOPY_RECEIVE)` 接收数据，处理 `recv_skip_hint` 消费非页面对齐数据 |
+| 3 | `sleep 1`，检查 server 是否立即退出 | 若启动即退出（exit code 3），说明内核不支持 TCP_ZEROCOPY_RECEIVE（或 CONFIG_MMU=n），SKIP 测试 |
+| 4 | 启动 helper `tcp-sender` 发送数据 | |
+| 5 | `sleep 3` 等待传输完成 | |
+| 6 | 再次检查 server 是否存活：若连接后退出（exit code 3）说明 getsockopt 失败，SKIP | |
+| 7 | 查询 zerocopy-server PID：统计 TCP socket 数和 RX 总计数 | |
+| 8 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+两个断言（内核支持 zerocopy 时）：
+- **`proto=tcp` 行 ≥ 1**：TCP socket 被枚举到。
+- **RX 总计数 > 0**：证明 `tcp_zerocopy_receive()` 路径的 RX end 打点被触发，零拷贝接收路径数据被正确统计——验证 BUG-6 修复。
+
+**SKIP 降级机制**：
+- helper 返回 exit code 3 表示内核不支持 `TCP_ZEROCOPY_RECEIVE`（可能是内核版本 < 5.18，或 `CONFIG_MMU=n`）
+- 此时测试 SKIP 而非 FAIL，因为这是环境不支持而非代码 bug
+- x86/x86_64 defconfig 默认启用 `CONFIG_MMU`，已在 `ci/kernel.config.fragment` 中显式声明
+
+**struct 兼容注意**：helper 必须使用内核 UAPI 头 `<linux/tcp.h>` 中的 `struct tcp_zerocopy_receive` 定义（64 字节），不能使用用户态 `<netinet/tcp.h>` 中的定义（大小可能不匹配导致 `ENOPROTOOPT`）。
 
 ---
 
 #### Test 21: UDP corked TX 路径（udp_push_pending_frames）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 验证 `udp_push_pending_frames()` TX 路径打点：`UDP_CORK` flush 触发 corked 发送路径 |
-| **实现** | helper `corked-udp-client` 用 `setsockopt(UDP_CORK)` 发送（每 8 包 uncork 一次触发 flush）→ 查 client PID |
-| **断言** | corked-udp-client 的 UDP socket `TX count > 0` |
-| **无需接收端** | TX 打点在 `udp_push_pending_frames`（send 路径），与对端是否存在无关；发往无监听端口仅产生 ICMP unreachable，不影响 TX 计数 |
-| **缓冲区控制** | 每 `CORK_BURST=8` 个包 uncork 一次，避免 cork 缓冲区累积超过 64K 导致 `EMSGSIZE` |
+##### 一、测试目标
+
+验证 `udp_push_pending_frames()` TX 路径打点正确：使用 `UDP_CORK` 选项时，多个 `sendmsg` 调用的数据被攒到一个大 skb 中，最后通过 `udp_push_pending_frames()` flush 发送。普通 UDP 发送（非 corked）走 `udp_sendmsg` 中 `ip_make_skb` 之后打点，corked 路径完全绕过该打点位置，需要在 `udp_push_pending_frames` 单独打 TX start。这是 v6.0.0 修复 BUG-2 后新增的路径覆盖测试。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:1330-1358](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L1330-L1358)，依赖辅助程序，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 检查辅助程序存在 | 不存在则 SKIP |
+| 2 | 启动 helper `corked-udp-client` 向 127.0.0.1:21434 发送数据：<br>`setsockopt(UDP_CORK, 1)` → 发 8 个包 → `setsockopt(UDP_CORK, 0)` flush → 重复 | 每 8 个包 uncork 一次触发 `udp_push_pending_frames`，避免 cork 缓冲区超过 64K 导致 `EMSGSIZE`。**无需启动 server**，发往无监听端口仅产生 ICMP unreachable，不影响 TX 统计（因为 TX 打点在发送路径，与对端是否存在无关） |
+| 3 | `sleep 1` 等待发送和 flush 完成 | |
+| 4 | 查询 corked-udp-client PID：统计 UDP socket 数和 TX 总计数 | |
+| 5 | 断言，清理 client | |
+
+##### 三、核心断言与原理
+
+两个断言：
+- **`proto=udp` 行 ≥ 1**：UDP socket 被枚举到。
+- **TX 总计数 > 0**：证明 corked 路径（`udp_push_pending_frames`）的 TX start 打点被触发，corked 发送数据被正确统计——验证 BUG-2 修复。
+
+**无需接收端**：TX 打点位于 `udp_push_pending_frames`（发送路径，skb 构造完成即将发送时），与对端是否存在、是否回复 ICMP 无关，所以不需要启动 UDP server 来接收数据。
 
 ---
 
 #### Test 22: IPv6 TCP+UDP 路径（iperf3 -c ::1）
 
-| 项目 | 内容 |
-|------|------|
-| **原理** | 验证 IPv6 loopback（`::1`）的 TCP/UDP 路径打点（`udpv6_recvmsg`/`udpv6_sendmsg`、tcpv6）。IPv4 与 IPv6 在内核中是不同插桩路径，只测 IPv4 无法保证 IPv6 无 bug |
-| **实现** | iperf3 server → IPv6 TCP client（`-c ::1 -t 4`）+ IPv6 UDP client（`-u -c ::1 -t 6 -b 10M`）→ 查 server 和 udp client |
-| **断言** | 存在 IPv6 socket（`local=[...]` 带方括号）+ server RX>0 + udp client TX>0 |
-| **IPv6 检测** | 工具输出无 `family=` 字段，IPv6 通过 `local=\[` 检测（IPv6 地址带方括号包裹） |
-| **环境守卫** | `/proc/net/if_inet6` 不存在时 SKIP（IPv6 未启用） |
+##### 一、测试目标
+
+验证 IPv6 loopback（`::1`）的 TCP/UDP 路径打点正确。IPv4 和 IPv6 在内核中是独立的协议栈实现：
+- TCPv6：`tcp_v6_recvmsg`/`tcp_v6_sendmsg`（虽然最终会调用 IPv4 通用逻辑，但入口函数不同）
+- UDPv6：`udpv6_recvmsg`/`udpv6_sendmsg`（独立于 UDPv4，v6.0.0 修复 BUG-1 后补上 UDPv6 打点）
+
+只测 IPv4（127.0.0.1）无法保证 IPv6 路径无 bug，需要专项验证。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:1360-1420](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L1360-L1420)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 检查 `/proc/net/if_inet6` 是否存在 | 不存在说明内核未启用 IPv6，SKIP 测试 |
+| 2 | 启动 iperf3 server 端口 21435 | iperf3 默认双栈监听（同时支持 IPv4 和 IPv6） |
+| 3 | 启动 IPv6 TCP client：`iperf3 -c ::1 -t 4`，后台运行 | 通过 IPv6 loopback 连接 |
+| 4 | `sleep 3` 等待 TCP 传输完成，kill TCP client | |
+| 5 | 启动 IPv6 UDP client：`iperf3 -u -c ::1 -t 6 -b 10M`，后台运行 | `-t 6` 保证查询时 UDP socket 存活 |
+| 6 | `sleep 2` 等待 UDP 流量稳定 | |
+| 7 | 查询 server PID：统计 IPv6 socket 数（`local=[`）和 RX 总计数 | |
+| 8 | 查询 UDP client PID：统计 IPv6 socket 数和 TX 总计数 | |
+| 9 | 断言，清理 | |
+
+##### 三、核心断言与原理
+
+三个断言：
+1. **IPv6 socket 总数 ≥ 1**（server 和 client 侧加起来）：证明至少有一个 IPv6 socket 被枚举到，通过 `local=\[` 正则匹配（IPv6 地址在输出中用方括号包裹，如 `local=[::1]:21435`）。
+2. **server RX > 0**：IPv6 TCP 接收路径打点工作正常。
+3. **UDP client TX > 0**：IPv6 UDP 发送路径打点工作正常（验证 BUG-1 修复，UDPv6 打点）。
+
+**IPv6 检测方式**：工具输出目前没有显式 `family=` 字段，IPv6 通过地址格式隐式检测——IPv6 地址在输出中会被方括号包裹（`[::1]`、`[fe80::...]`），用 `local=\[` 正则即可匹配。
 
 ---
 
