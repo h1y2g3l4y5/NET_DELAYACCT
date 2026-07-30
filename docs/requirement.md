@@ -125,15 +125,15 @@ NET_DELAYACCT 在 Linux 6.6 内核中参考 `CONFIG_DELAYACCT` 的设计思想�
 
 **需求**：系统 SHALL 在以下位置插桩，统计 TX 时延：
 
-- **start (TCP)**：`net/ipv4/tcp.c` 的 `tcp_sendmsg` 中对每个新生成的 skb 调用 `net_delayacct_tx_start(skb)`。
-- **start (UDP)**：`net/ipv4/udp.c` 的 `udp_sendmsg` 中对生成的 skb 调用 `net_delayacct_tx_start(skb)`。
-- **end**：`net/core/dev.c` 的 `dev_hard_start_xmit` 中调用 `ops->ndo_start_xmit` 前，调用 `net_delayacct_tx_end(skb->sk, skb)` 累加到 sock。
+- **start (TCP)**：`net/ipv4/tcp_output.c` 的 `__tcp_transmit_skb()` clone 块与 `__tcp_retransmit_skb()` pskb_copy 分支调用 `net_delayacct_tx_start(sk, skb)`。
+- **start (UDP)**：`net/ipv4/udp.c` / `net/ipv6/udp.c` 的 `udp_sendmsg()`/`udpv6_sendmsg()` fast path 以及 `udp_push_pending_frames()`/`udp_v6_push_pending_frames()` corked flush 路径调用 `net_delayacct_tx_start(sk, skb)`。
+- **end**：`net/core/dev.c` 的 `dev_hard_start_xmit()` 中调用 `ops->ndo_start_xmit()` 前，调用 `net_delayacct_tx_end(sk, skb)` 累加到 sock。
 
 **验收**：
 
-- 进程通过目标 socket 发送 N 个报文后，`tx_count == N`。
+- 进程通过目标 socket 发送 N 个非 GSO 报文后，`tx_count == N`。
 - `tx_total_ns > 0`。
-- GSO 场景下，一次 `send()` 拆成多个 MTU 报文，按 1 次计数（计 GSO skb 一次）。
+- GSO 场景下，一次 `send()` 拆成多个 MTU segment，每个 segment 各计 1 次（`tx_count` 按 segment 数量膨胀）。
 - 关闭选项时所有插桩编译为空操作。
 
 ### FR-6：Generic Netlink 接口

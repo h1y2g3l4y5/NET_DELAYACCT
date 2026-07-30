@@ -29,9 +29,9 @@ GitHub Actions CI
 | 内核 | 打上所有 `kernel-patches/*.patch` 的 linux-6.6，`CONFIG_NET_DELAYACCT=y` |
 | 文件系统 | 内存 initramfs（busybox + bash + iperf3 + nc(ncat) + get_sockdelays） |
 | 网络 | `-netdev user` user-mode 网络，e1000 网卡，`lo` 回环（`ip link set lo up`） |
-| 加速 | KVM 优先（90s 超时），不可用则降级 TCG（240s 超时，阈值取保守值） |
+| 加速 | KVM 优先（300s 超时），不可用则降级 TCG（600s 超时，阈值取保守值） |
 | init | [ci/qemu/guest-init.sh](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/guest-init.sh)：挂载 /proc/sys/dev → 诊断（genl family 验证 + dmesg）→ 调 `run-tests.sh` → 写结果到 /root/test-output.txt → poweroff |
-| watchdog | `sleep 360; poweroff -f` 防测试挂死（QEMU 内部）；CI 层另有 QEMU_TIMEOUT_KVM=90s / QEMU_TIMEOUT_TCG=240s 硬超时 |
+| watchdog | `sleep 540; poweroff -f` 防测试挂死（QEMU 内部）；CI 层另有 QEMU_TIMEOUT_KVM=300s / QEMU_TIMEOUT_TCG=600s 硬超时 |
 
 ### 1.3 流量生成工具
 
@@ -46,7 +46,7 @@ GitHub Actions CI
 ### 1.4 判定框架（[ci/qemu/run-tests.sh](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh)）
 
 ```bash
-_PASSED=0   _FAILED=0   _SKIPPED=0   _TEST_NUM=0
+_PASSED=0   _FAILED=0   _SKIPPED=0   _test_num=0
 
 _pass()   { echo "    [PASS] $*"; _PASSED=$((_PASSED + 1)); }
 _fail()   { echo "    [FAIL] $*"; _FAILED=$((_FAILED + 1)); }
@@ -64,7 +64,7 @@ _desc()          # 打印测试原理/实现/断言三行说明
 ╔══════════════════════════════════════════════════════════════╗
 ║  NET_DELAYACCT Test Results                                  ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Tests run: 22     PASS: 21     FAIL:  0     SKIP:  1       ║
+║  Tests run: 22     PASS: 22     FAIL:  0     SKIP:  0       ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  RESULT: ALL PASS                                            ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -303,7 +303,7 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ---
 
-### 第六部分：过滤功能（Test 14-16，v5.0.0 新增）
+### 第六部分：过滤功能（Test 14-16，于 v5.0.0 review 轮次引入）
 
 验证内核侧 `net_delayacct_match_filter()` 6 维过滤功能（`--proto`/`--family`/`--lport`/`--rport`/`--laddr`/`--raddr`），确保过滤条件正确传递到内核、在内核 dumpit 回调中正确筛选 socket。
 
@@ -345,7 +345,7 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ---
 
-### 第七部分：语义验证 / 双向流量 / 路径覆盖（Test 17-22，v6.0.0 新增）
+### 第七部分：语义验证 / 双向流量 / 路径覆盖（Test 17-22，于 v6.0.0 review 轮次引入）
 
 针对 v6.0.0 review 反馈新增：①RESET 非原子语义专项验证；②双向流量同 socket RX+TX；③iperf3 无法触发的 splice/zerocopy/corked/IPv6 路径专项覆盖。
 
@@ -537,10 +537,10 @@ Git push 到 `main` 或 `dev` 分支自动触发 `.github/workflows/ci.yml`：
 
 | 场景 | 超时 | 说明 |
 |------|------|------|
-| CI KVM 硬超时 | 90s | `QEMU_TIMEOUT_KVM=90` |
-| CI TCG 硬超时 | 240s | `QEMU_TIMEOUT_TCG=240`（软件模拟慢） |
-| Guest 内部 watchdog | 360s | guest-init.sh 中的 `sleep 360; poweroff -f` |
-| run-tests.sh 整体超时 | 由 guest-init 的 `timeout 240` 包裹整个脚本 | 单测无独立超时 |
+| CI KVM 硬超时 | 300s | `QEMU_TIMEOUT_KVM=300` |
+| CI TCG 硬超时 | 600s | `QEMU_TIMEOUT_TCG=600`（软件模拟慢） |
+| Guest 内部 watchdog | 540s | guest-init.sh 中的 `sleep 540; poweroff -f` |
+| run-tests.sh 整体超时 | 由 guest-init 的 `timeout 480` 包裹整个脚本 | 单测无独立超时 |
 
 ### 5.4 单元测试（KUnit，待集成）
 

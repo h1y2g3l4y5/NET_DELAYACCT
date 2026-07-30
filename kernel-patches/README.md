@@ -13,52 +13,51 @@
 
 ## 文件清单
 
-| 文件 | 用途 | 目标位置 |
+| 文件 | 用途 | 应用方式 |
 |------|------|----------|
-| `Kconfig-fragment` | Kconfig 选项 | 手动追加到 `net/Kconfig` |
-| `Makefile-fragment` | 构建规则 | 手动追加到 `net/core/Makefile` |
-| `include-uapi-linux-net-delayacct.h` | UAPI 头文件 | 复制为 `include/uapi/linux/net-delayacct.h` |
-| `include-net-net-delayacct.h` | 内核头文件 | 复制为 `include/net/net-delayacct.h` |
+| `0005-net-add-uapi-header.patch` | UAPI 头文件 | `git apply` |
+| `0006-net-add-internal-header.patch` | 内核内部头文件 | `git apply` |
+| `0007-net-core-add-module.patch` | 核心实现（含 Kconfig / Makefile） | `git apply` |
+| `0008-net-add-Kconfig-entry.patch` | Kconfig 入口 | `git apply` |
+| `0009-net-add-module-to-Makefile.patch` | Makefile 规则 | `git apply` |
+| `0010-sock-init-net-delayacct.patch` | `sock.c` 初始化插桩 | `git apply` |
 | `sock_h-modification.patch` | 修改 `struct sock` | `git apply` |
 | `skbuff_h-modification.patch` | 修改 `struct sk_buff` | `git apply` |
-| `net-core-net-delayacct.c` | 核心实现 | 复制为 `net/core/net-delayacct.c` |
 | `rx-instrumentation.patch` | RX 路径插桩 | `git apply` |
 | `tx-instrumentation.patch` | TX 路径插桩 | `git apply` |
+
+> 注：编号补丁 `0005-0010` 对应原先独立的 UAPI 头文件、内部头文件、核心实现、
+> Kconfig 片段、Makefile 片段及 `sock.c` 初始化代码。直接使用 `git apply` 应用
+> 编号补丁即可，无需再手动复制零散文件。
 
 ## 应用顺序（顺序很重要）
 
 ```bash
 cd /path/to/linux-6.6
 
-# 1. Kconfig 选项（手动追加到 net/Kconfig 的适当位置）
-cat /path/to/NET_DELAYACCT/kernel-patches/Kconfig-fragment >> net/Kconfig
+PATCH_DIR=/path/to/NET_DELAYACCT/kernel-patches
 
-# 2. Makefile 规则（手动追加到 net/core/Makefile）
-cat /path/to/NET_DELAYACCT/kernel-patches/Makefile-fragment >> net/core/Makefile
+# 1. 修改 struct sock（必须在 0007 之前，核心实现会依赖新增字段）
+git apply "$PATCH_DIR/sock_h-modification.patch"
 
-# 3. UAPI 头文件
-cp /path/to/NET_DELAYACCT/kernel-patches/include-uapi-linux-net-delayacct.h \
-   include/uapi/linux/net-delayacct.h
+# 2. 修改 struct sk_buff
+git apply "$PATCH_DIR/skbuff_h-modification.patch"
 
-# 4. 内核头文件
-cp /path/to/NET_DELAYACCT/kernel-patches/include-net-net-delayacct.h \
-   include/net/net-delayacct.h
+# 3. 编号补丁：UAPI 头、内部头、核心实现、Kconfig、Makefile、sock 初始化
+for p in "$PATCH_DIR"/0005-*.patch \
+         "$PATCH_DIR"/0006-*.patch \
+         "$PATCH_DIR"/0007-*.patch \
+         "$PATCH_DIR"/0008-*.patch \
+         "$PATCH_DIR"/0009-*.patch \
+         "$PATCH_DIR"/0010-*.patch; do
+    git apply "$p"
+done
 
-# 5. 修改 struct sock
-git apply /path/to/NET_DELAYACCT/kernel-patches/sock_h-modification.patch
+# 4. RX 路径插桩
+git apply "$PATCH_DIR/rx-instrumentation.patch"
 
-# 6. 修改 struct sk_buff
-git apply /path/to/NET_DELAYACCT/kernel-patches/skbuff_h-modification.patch
-
-# 7. 核心实现
-cp /path/to/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c \
-   net/core/net-delayacct.c
-
-# 8. RX 路径插桩
-git apply /path/to/NET_DELAYACCT/kernel-patches/rx-instrumentation.patch
-
-# 9. TX 路径插桩
-git apply /path/to/NET_DELAYACCT/kernel-patches/tx-instrumentation.patch
+# 5. TX 路径插桩
+git apply "$PATCH_DIR/tx-instrumentation.patch"
 ```
 
 > 注意：`sock_h-modification.patch`、`skbuff_h-modification.patch`、

@@ -8,6 +8,8 @@ NET_DELAYACCT 是一个面向 Linux 内核的网络套接字级时延统计框�
 
 项目基于 Linux 6.6 内核开发，遵循 Linux 内核社区贡献规范。
 
+> **当前状态**：v6.0.1 —— 已完成 22 项统一 QEMU 测试套件、过滤功能、路径覆盖测试（splice/zerocopy/corked/IPv6）及 robustness 收尾；CI 通过 checkpatch / build-kernel / build-tool / qemu-test 全流程。
+
 ## 主要特性
 
 - 内核框架：在 socket 生命周期关键路径上记录收发时延，按 socket 聚合统计。
@@ -17,6 +19,7 @@ NET_DELAYACCT 是一个面向 Linux 内核的网络套接字级时延统计框�
   - 重置所有统计：`-R`
   - JSON 格式输出：`-j`
   - 调试诊断模式：`-d`
+  - 多维过滤：`--proto`、`--family`、`--lport`、`--rport`、`--laddr`、`--raddr`（仅与 `--pid` 组合使用）
 
 ## 命令行选项
 
@@ -31,6 +34,14 @@ get_sockdelays [options]
 输出选项：
   -j, --json            输出 JSON 格式（便于脚本解析）
 
+过滤选项（仅与 --pid 配合使用，可选，可组合，AND 语义）：
+      --proto <p>       按协议过滤：tcp、udp 或数字 IPPROTO 值
+      --family <4|6>    按地址族过滤：4（IPv4）或 6（IPv6）
+      --lport <port>    按本地端口过滤
+      --rport <port>    按远端端口过滤
+      --laddr <addr>    按本地地址过滤（IPv4 或 IPv6）
+      --raddr <addr>    按远端地址过滤（IPv4 或 IPv6）
+
 其他：
   -h, --help            显示帮助
   -V, --version         显示版本号
@@ -42,9 +53,9 @@ get_sockdelays [options]
 `get_sockdelays` 默认输出人类可读格式，每个 socket 占三行：
 
 ```
-proto=tcp pid=305 inode=805 owner_task=iperf3 local=[::]:5204 remote=[::]:0
-  RX  count=2075     total=   4289.503ms  average=     2.067ms
-  TX  count=0        total=       0.000ms  average=     0.000ms
+proto=tcp pid=305 inode=805 owner_task=iperf3 local=127.0.0.1:5204 remote=127.0.0.1:0
+  RX  count=2075     total=   4289.503ms  average=     2.067ms  min=     0.235ms  max=     8.638ms
+  TX  count=0        total=       0.000ms  average=     0.000ms  min=     0.000ms  max=     0.000ms
 ```
 
 | 字段 | 说明 |
@@ -58,26 +69,30 @@ proto=tcp pid=305 inode=805 owner_task=iperf3 local=[::]:5204 remote=[::]:0
 | `count` | 收/发数据包次数 |
 | `total` | 累计延迟（毫秒） |
 | `average` | 平均每次延迟（毫秒） |
+| `min` / `max` | 最小 / 最大延迟（毫秒） |
 
 ## 仓库结构
 
 ```
 .
-├── kernel-patches/          # 针对 linux-6.6 的内核补丁集
+├── kernel-patches/          # 针对 linux-6.6 的内核补丁集（已编号 0005-0010）
 ├── userspace/
 │   └── get_sockdelays/      # 用户态查询工具源码
 ├── ci/                      # CI 管道脚本 + 内核 config 片段
-│   └── qemu/                 #   QEMU 测试脚本（guest-init, ci-test 等）
+│   ├── qemu/                #   QEMU 测试脚本（guest-init, run-tests.sh 等）
+│   └── kernel.config.fragment  # 内核配置片段（含 CONFIG_NET_DELAYACCT / CONFIG_MMU）
 ├── Documentation/networking/ # 内核上游 RST 格式文档
 ├── docs/                    # 项目设计文档与说明
 ├── tests/
-│   ├── func/                # 功能测试
-│   ├── perf/                # 性能测试
-│   ├── selftests/           # 内核风格 selftest + KUnit
-│   └── reports/             # 测试报告
+│   ├── helper/              # 路径覆盖辅助程序（splice/zerocopy/corked）
+│   ├── reports/             # 本地 / CI 测试日志
+│   ├── func/                # 历史遗留功能测试（已合并入 run-tests.sh，不再维护）
+│   ├── perf/                # 历史遗留性能测试（手动执行，待集成 CI）
+│   └── selftests/           # 历史遗留 selftest + KUnit（待集成）
 ├── Makefile                 # 顶层便捷构建入口
 ├── LICENSE                  # GPL-2.0-only
 ├── README.md
+├── INSTALL.md               # 环境搭建与安装指南
 └── CONTRIBUTING.md
 ```
 
@@ -95,29 +110,42 @@ git clone --depth 1 --branch linux-6.6.y \
 cd linux-6.6
 ```
 
-### 2. 安装 NET_DELAYACCT 源文件并应用补丁
+### 2. 应用内核补丁
+
+补丁位于 `$REPO/kernel-patches/`，按顺序应用（顺序很重要）：
 
 ```bash
 REPO=/path/to/NET_DELAYACCT
+PATCH_DIR="$REPO/kernel-patches"
 
-# (a) 安装新增源文件到内核树的规范路径
-install -m 0644 "$REPO/kernel-patches/include-net-net-delayacct.h"        include/net/net-delayacct.h
-install -m 0644 "$REPO/kernel-patches/include-uapi-linux-net-delayacct.h" include/uapi/linux/net-delayacct.h
-install -m 0644 "$REPO/kernel-patches/net-core-net-delayacct.c"           net/core/net-delayacct.c
+# 1. 修改 struct sock（必须在 0007 之前，核心实现依赖新增字段）
+git apply "$PATCH_DIR/sock_h-modification.patch"
 
-# (b) 追加 Kconfig / Makefile 片段
-cat "$REPO/kernel-patches/Kconfig-fragment"  >> net/Kconfig
-cat "$REPO/kernel-patches/Makefile-fragment" >> net/core/Makefile
+# 2. 修改 struct sk_buff
+git apply "$PATCH_DIR/skbuff_h-modification.patch"
 
-# (c) 应用对现有内核文件的补丁（sock.h / skbuff.h / tx / rx instrumentation）
-for p in "$REPO"/kernel-patches/*.patch; do
-    git apply "$p" || patch -p1 < "$p"
+# 3. 编号补丁：UAPI 头、内部头、核心实现、Kconfig、Makefile、sock 初始化
+for p in "$PATCH_DIR"/0005-*.patch \
+         "$PATCH_DIR"/0006-*.patch \
+         "$PATCH_DIR"/0007-*.patch \
+         "$PATCH_DIR"/0008-*.patch \
+         "$PATCH_DIR"/0009-*.patch \
+         "$PATCH_DIR"/0010-*.patch; do
+    git apply "$p"
 done
 
-# (d) 在 sock.c 的 sk_prot_alloc 中初始化 per-socket 统计结构
-sed -i 's/sk_tx_queue_clear(sk);/sk_tx_queue_clear(sk);\n\tnet_delayacct_init(\&sk->sk_net_delayacct);/' \
-    net/core/sock.c
+# 4. RX / TX 路径插桩
+git apply "$PATCH_DIR/rx-instrumentation.patch"
+git apply "$PATCH_DIR/tx-instrumentation.patch"
 ```
+
+> 说明：`kernel-patches/` 下同时保留了 `include-net-net-delayacct.h`、
+> `net-core-net-delayacct.c` 等独立源文件作为阅读参考，但推荐直接应用
+> 编号补丁 `0005-0010`，避免手动复制零散文件带来的遗漏。
+>
+> 若 `git apply` 因 6.6.x point release 上下文差异失败，可改用
+> `patch -p1 --fuzz=3 < xxx.patch`，详见
+> [`kernel-patches/README.md`](kernel-patches/README.md)。
 
 ### 3. 启用 CONFIG_NET_DELAYACCT 并编译内核
 
@@ -187,18 +215,25 @@ make tool
 
 ### 测试架构概览
 
+当前项目使用统一的 QEMU 内测试套件 [`ci/qemu/run-tests.sh`](ci/qemu/run-tests.sh)，
+共 **22 项测试**，覆盖基础功能、工具展示、压力测试、边界条件、稳定性、过滤功能、
+RESET 语义、双向流量以及 splice/zerocopy/corked/IPv6 等专项路径。历史遗留的
+`tests/func/`、`tests/perf/`、`tests/selftests/` 目录已不再维护，功能已合并到
+`run-tests.sh` 或待后续集成。
+
 ```
 tests/
-├── selftests/net-delayacct/    # 内核风格自测试（selftest），7 个场景
-├── func/                       # 独立功能测试（5 个套件）
+├── helper/                     # 路径覆盖辅助程序（splice/zerocopy/corked）
 ├── reports/
-│   ├── local/                  #   本地测试日志
-│   └── qemu/                  #   CI QEMU 测试报告
-└── perf/                       #   性能测试
+│   ├── local/                  # 本地测试日志
+│   └── qemu/                   # CI QEMU 测试报告
+├── func/                       # 历史遗留功能测试（已废弃）
+├── perf/                       # 历史遗留性能测试（手动执行）
+└── selftests/                  # 历史遗留 selftest + KUnit（待集成）
 ```
 
 核心验证链路 —— 用户态 `get_sockdelays` 通过 genetlink（`family=net_delayacct`）下发
-三条命令，内核 `genl_ops` 分发到对应 doit 回调，遍历进程 fd 表定位 socket 后回复统计：
+命令，内核 `genl_ops` 分发到对应回调，遍历进程 fd 表定位 socket 后回复统计：
 
 ```
 get_sockdelays  ──genetlink──▶  genl_ops 分发
@@ -209,11 +244,13 @@ get_sockdelays  ──genetlink──▶  genl_ops 分发
 
 > inode 查询通过 `file_inode(file)->i_ino` 获取 socket 的 inode 号（不依赖可能为
 > NULL 的 `sk->sk_socket->file`），与 `/proc/<pid>/fd/N → socket:[<inode>]` 对齐。
+>
+> 22 项测试的详细说明见 [`tests/README.md`](tests/README.md)。
 
 ### 本地测试（推荐）
 
 `local-test.sh` 用 busybox 构建轻量 initramfs，在 QEMU 中启动自编译内核并跑测试，
-无需 CI runner，约 1-2 分钟完成一个循环：
+无需 CI runner：
 
 ```bash
 ./local-test.sh                # 完整：同步源码 → 编译内核 → 构建工具 → QEMU 测试
@@ -224,51 +261,32 @@ get_sockdelays  ──genetlink──▶  genl_ops 分发
 日志自动保存到 `tests/reports/local/test-YYYYMMDD_HHMMSS.log`。
 
 > **注意**：改了内核源码后必须重跑 `--kernel-only`（或完整流程），`--qemu-only`
-> 不会重新同步源码/重编内核，否则 QEMU 跑的还是旧内核。本地 busybox 环境缺少
-> `iperf3`、`nc` 行为也有差异，部分 func tests 会 SKIP；如需完整覆盖请用 CI。
+> 不会重新同步源码/重编内核，否则 QEMU 跑的还是旧内核。
 
 ### CI 测试
 
-推送到 GitHub 后，GitHub Actions 自动触发 QEMU 测试（Debian rootfs 环境）：
+推送到 GitHub 后，GitHub Actions 自动触发 QEMU 测试：
 
 1. `checkpatch` — 代码风格检查
-2. `build-kernel` — 编译内核
-3. `qemu-test` — 在 Debian QEMU 虚拟机中跑全部测试
+2. `build-kernel` — 打 patch 并编译内核
+3. `build-tool` — 编译用户态工具
+4. `qemu-test` — 在 QEMU 虚拟机中跑全部 22 项测试
 
-测试报告自动提交到 `tests/reports/qemu/`。
+测试结果摘要输出到 GitHub Actions step summary（最近 1000 行），原始日志作为 artifact 上传。
 
-### 测试套件简表
+### 22 项测试简表
 
-| 套件 | 文件 | 覆盖命令 |
-|------|------|----------|
-| 主自测试 | `tests/selftests/net-delayacct/test_netdelayacct.sh` | cmd=1/2/3 全覆盖（7 场景） |
-| reset | `tests/func/test_reset.sh` | cmd=3 |
-| inode 查询 | `tests/func/test_inode_query.sh` | cmd=2 |
-| PID 查询 | `tests/func/test_pid_query.sh` | cmd=1 |
-| TCP/UDP 路径 | `tests/func/test_tcp_udp.sh` | cmd=1 |
-| 多 socket | `tests/func/test_multi_socket.sh` | cmd=1 |
-
-### 各测试内容简述
-
-**主自测试 `test_netdelayacct.sh`**
-端到端串联验证，覆盖 7 个场景：查询自身 PID 确认工具不 crash；`nc -l` 建 TCP 监听后按 PID 查询确认 fd 迭代能找到 socket；从 `/proc/<pid>/fd` 提取 `socket:[<inode>]` 后按 inode 查询验证定位到同一 socket；产生流量后 reset 再查验证计数器归零；分别用 iperf3 的 TCP/UDP 模式验证协议标识正确；Python 脚本同时开 3 个连接验证多 socket 枚举。是判定整条链路是否打通的关键套件。
-
-**reset `test_reset.sh`**
-先用 iperf3 + nc 产生真实流量，确保 socket 的 `rx_count`/`tx_count` 非零；执行 `get_sockdelays -R` 让内核遍历所有进程的所有 socket 清零统计；再次查询同一 PID，用 awk 校验所有计数器列已归零。额外验证重置前输出非空，确认流量确实被统计到。
-
-**inode 查询 `test_inode_query.sh`**
-启动 `nc -l` TCP 监听并记录其 PID，通过 `readlink /proc/<pid>/fd/N` 解析出 `socket:[<inode>]` 中的 inode 号，再用 `get_sockdelays -i <inode>` 查询。验证输出包含该 inode 且恰好一行 —— 一个 inode 全系统只对应一个 socket。这条路径独立于 PID，适用于只知 inode（如来自 `ss -p` 或 eBPF）的场景。
-
-**PID 查询 `test_pid_query.sh`**
-用 `iperf3 -s -D` 起服务端、`iperf3 -c 127.0.0.1 -t 5` 起客户端建 TCP 连接，在客户端退出前用 `get_sockdelays -p <client_pid>` 查询。验证输出非空且包含 "TCP" 标识。若客户端已退出则回退查询服务端 PID。
-
-**TCP/UDP 路径 `test_tcp_udp.sh`**
-分别用 `iperf3 -c`（TCP）和 `iperf3 -c -u`（UDP）产生流量，查询后 grep 输出是否含 "TCP"/"UDP"，验证两种传输层协议的 socket 都能被 `is_inet_tcp_udp` 正确采集，且 `sk_protocol` 字段填充正确。
-
-**多 socket `test_multi_socket.sh`**
-模拟反向代理/连接池场景：起 3 个 nc 监听，Python 脚本同时 connect 3 个 TCP 连接并 `sleep` 保持，查询该 PID。验证返回 ≥3 行数据且所有行 PID 一致 —— 确认 fd 迭代无遗漏且不跨进程污染。
-
-每个 func test 的退出码：`0`=全通过、`1`=有失败、`4`=环境不满足（SKIP）。
+| 部分 | 测试项 | 覆盖能力 |
+|------|--------|----------|
+| 基础功能（6 项） | PID 查询 / Inode 查询 / Reset / TCP 路径 / UDP 路径 / 多 Socket | `-p`、`-i`、`-R`、协议识别、fd 枚举 |
+| 工具展示（2 项） | JSON 输出 / Debug 模式 | `-j`、`-d` |
+| 压力测试（3 项） | 高并发 / 大流量 / 混合协议 | 8 并行连接、计数器不溢出、协议隔离 |
+| 边界条件（1 项） | PID 1 / 不存在 PID / `-h` / `-V` | 健壮性 |
+| 稳定性（1 项） | 并发查询压力 | 80 次并发 dumpit 查询 + dmesg Oops 检测 |
+| 过滤功能（3 项） | `--proto` / `--lport` / 组合过滤 | 内核侧 6 维过滤 |
+| 语义验证（1 项） | Reset 非原子语义 | 活跃流量中 reset 后仍存在非零计数 |
+| 双向流量（1 项） | 同 socket RX+TX | `iperf3 -R` 反向模式 |
+| 路径覆盖（4 项） | TCP splice RX / TCP zerocopy RX / UDP corked TX / IPv6 TCP+UDP | `tests/helper/delayacct_path_test` |
 
 ### 常见失败模式
 
@@ -276,7 +294,7 @@ get_sockdelays  ──genetlink──▶  genl_ops 分发
 |------|----------|
 | `(no matching sockets)` | 查询的进程已退出 / socket 已关闭 / inode 匹配失败 |
 | `(timeout or error)` | 内核模块未加载、genl family 未注册、或 genl_ops 未分发 |
-| `output has N line(s), expected >= M` | fd 迭代遗漏，或 `is_inet_tcp_udp` 过滤了不该过滤的 socket |
+| `output has N line(s), expected >= M` | fd 迭代遗漏，或过滤条件错误 |
 | `No test results found` | QEMU guest 未正常输出 —— 多为 initramfs 缺命令或内核未含新代码 |
 
 ---

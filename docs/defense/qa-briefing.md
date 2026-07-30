@@ -49,7 +49,7 @@
 
 ## Q6：GSO/分片报文如何处理？会不会重复计数或漏计？
 
-**A**：设计原则是"一次用户态 send/recv 调用对应一次计数"。RX 方向：GRO 聚合的从 skb 在合并到主 skb 后释放，主 skb 进入 __netif_receive_skb_core 时打一次 start，tcp_recvmsg 拷贝时打一次 end，按 1 次计数；从 skb 的原始到达时间被丢弃，这是已知误差，因为 GRO 的目的就是降低 per-packet 开销。TX 方向：对原始 GSO skb 在 tcp_sendmsg 中打一次 start，dev_hard_start_xmit 对 GSO skb 整体计一次 end；拆分后的子 skb 由 skb_gso_segment 生成，不会自动复制 delayacct_start 字段，end 函数检测到 0 直接跳过。这样用户态一次 send() 调用对应一次延迟样本，与用户视角一致。丢包场景下 skb 在 kfree_skb 时 delayacct_start 一并释放，不发生 end 累加——这是预期行为，丢包不计入时延。
+**A**：RX 方向：GRO 聚合的从 skb 在合并到主 skb 后释放，主 skb 进入 __netif_receive_skb_core 时打一次 start，tcp_recvmsg 拷贝时打一次 end，按 1 次计数；从 skb 的原始到达时间被丢弃，这是已知误差，因为 GRO 的目的就是降低 per-packet 开销。TX 方向：当前实现选择 segment 级精度。`delayacct_start` 位于 `struct sk_buff` headers `struct_group` 内，GSO 拆分时 `__copy_skb_header()` 自动复制到每个子 segment；`dev_hard_start_xmit` 中对每个子 segment 调用 `tx_end`，因此一次 `send()` 产生的 GSO skb 会被计为多次（segment 数）。这是"segment 级精度 + 代码简洁"的 trade-off，每个 segment 的延迟测量准确，但 `tx_count` 不等同于应用层 `send()` 次数。丢包场景下 skb 在 `kfree_skb` 时 `delayacct_start` 一并释放，不发生 end 累加——这是预期行为，丢包不计入时延。
 
 **补充材料**：参见 docs/protocol-stack.md 第 1.3 节（GRO）、第 2.3 节（GSO/TSO）、第 4.3 节（skb 克隆字段保留）；docs/design.md 第 8.1、8.4 节。
 

@@ -247,21 +247,21 @@ GRO（Generic Receive Offload）会把多个同流的报文聚合成一个大 sk
 ### 2.2 推荐 TX 插桩点
 
 - **TX start**：
-  - TCP：`net/ipv4/tcp.c` 的 `tcp_sendmsg()` 入口（在 `tcp_sendmsg_locked` 之前，对每个新生成的 skb 打时间戳）调用 `net_delayacct_tx_start(skb)`。
-  - UDP：`net/ipv4/udp.c` 的 `udp_sendmsg()` 中，对最终生成的 skb（在 `ip_make_skb` 之后或 `udp_send_skb` 之前）调用 `net_delayacct_tx_start(skb)`。
-  - 选这两个点的原因：紧跟进程系统调用入口，时间戳代表"用户态请求发送的时刻"；并且此处 skb 与发送它的 sock 一一对应，便于绑定 `sk`。
-- **TX end**：`net/core/dev.c` 的 `dev_hard_start_xmit()` 中，在调用 `ops->ndo_start_xmit(skb, dev)` 之前调用 `net_delayacct_tx_end(skb_get(skb)->sk, skb)`（或直接用 skb->sk）。
+  - TCP：`net/ipv4/tcp_output.c` 的 `__tcp_transmit_skb()` clone 块与 `__tcp_retransmit_skb()` pskb_copy 分支调用 `net_delayacct_tx_start(sk, skb)`。这两个位置覆盖首次传输、正常重传、SYN/SYNACK、Fast Open、MTU probe 等所有 TCP 出站路径。
+  - UDP：`net/ipv4/udp.c` / `net/ipv6/udp.c` 的 `udp_sendmsg()`/`udpv6_sendmsg()` fast path 以及 `udp_push_pending_frames()`/`udp_v6_push_pending_frames()` corked flush 路径调用 `net_delayacct_tx_start(sk, skb)`。
+  - 选这些点的原因：时间戳代表"skb 即将进入 IP 层发送的时刻"；并且此处 skb 与发送它的 sock 一一对应，便于绑定 `sk`。控制包（纯 ACK、RST、窗口探测）使用 `alloc_skb` 分配，`delayacct_start` 为零，在 end 处被跳过。
+- **TX end**：`net/core/dev.c` 的 `dev_hard_start_xmit()` 中，在调用 `ops->ndo_start_xmit(skb, dev)` 之前调用 `net_delayacct_tx_end(sk, skb)`。
   - 选此点的原因：是报文离开协议栈、交给驱动的最后一刻，时延正好覆盖整个协议栈滞留时间；并且所有协议路径都汇聚到这里，单点插桩开销最小。
 
 ### 2.3 GSO/TSO 拆分场景
 
 TSO（TCP Segmentation Offload）与 GSO（Generic Segmentation Offload）让内核只构造一个大的"超级 skb"，由网卡或 `dev_hard_start_xmit` 前的 `skb_gso_segment()` 拆分成多个 MTU 大小的报文。
 
-设计上：
-- 在 `tcp_sendmsg` / `udp_sendmsg` 处对原始 GSO skb 打一次 start 时间戳。
-- 在 `dev_hard_start_xmit` 处对 GSO skb 整体计一次 end（而非对每个拆分后的子 skb 分别计一次）。
-- 原因：用户态的一次 `send()` 调用对应一次延迟样本；如果按拆分后计 N 次，会让计数与用户视角不一致，且子 skb 经过 `skb_gso_segment` 后是新生成的，可能丢失 `delayacct_start` 字段（克隆时未拷贝）。
-- 实现：在 `dev_hard_start_xmit` 中读取 `skb->delayacct_start`，若为 0 则跳过（说明该子 skb 未经过 start 打点，或为 GSO 拆分后的从 skb）。
+当前实现：
+- `delayacct_start` 位于 `struct sk_buff` headers `struct_group` 内，`skb_segment()` 内部调用 `__copy_skb_header()` 时会自动把该字段复制到每个 GSO 子 segment。
+- `net_delayacct_tx_end()` 在 `dev_hard_start_xmit()` 的循环中对每个子 segment 各调用一次，因此一次 `send()` 产生的大 GSO skb 会被计为多次（segment 数）。
+- 结果：`tx_count` 按 segment 数量膨胀，不等于应用层 `send()` 次数；每个 segment 的延迟测量准确。
+- 这是"segment 级精度 + 代码简洁"的设计 trade-off，与 RX 侧 GRO 合并导致 `rx_count` 减少是同一类取舍。
 
 ### 2.4 skb 克隆与共享
 

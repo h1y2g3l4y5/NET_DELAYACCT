@@ -83,7 +83,7 @@ static void usage(FILE *out)
 
 static void version(void)
 {
-	printf("%s 1.0\n", prog_name);
+	printf("%s v6.0.1\n", prog_name);
 }
 
 /*

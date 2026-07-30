@@ -109,12 +109,12 @@ RX 时延的语义是"报文从进入协议栈入口到进程读出到用户态�
 
 ### 2.3 TX 插桩点选择
 
-TX 时延的语义是"进程调用 send/sendmsg 到报文送达网卡驱动的时间差"。
+TX 时延的语义是"skb 创建/克隆到报文送达网卡驱动的时间差"。
 
-**start 选择: `tcp_sendmsg_locked`（TCP）/ `udp_sendmsg`（UDP）**
+**start 选择: `__tcp_transmit_skb` clone 块 / `__tcp_retransmit_skb` pskb_copy 分支（TCP）/ `udp_sendmsg` / `udp_push_pending_frames`（UDP）**
 
-- TCP: 在 `tcp_sendmsg_locked` 中对每个新生成的 skb（`sk_stream_alloc_skb` 之后）调用 `net_delayacct_tx_start(skb)`, 紧贴"进程数据刚进入 skb"的瞬间。
-- UDP: 在 `ip_make_skb` 之后、`udp_send_skb` 之前对 skb 打戳。
+- TCP: 在 `__tcp_transmit_skb` 的 clone 块中对克隆出的 skb 调用 `net_delayacct_tx_start(sk, skb)`, 覆盖首次传输、正常重传、SYN/SYNACK、Fast Open、MTU probe 等路径; `__tcp_retransmit_skb` 的 `__pskb_copy` 分支覆盖 clone_it=0 的重传路径。
+- UDP: 在 `ip_make_skb`/`ip6_make_skb` 之后、`udp_send_skb`/`udp_v6_send_skb` 之前对 skb 打戳; corked 路径在 `udp_push_pending_frames()`/`udp_v6_push_pending_frames()` 中打戳。
 
 **end 选择: `dev_hard_start_xmit`（`net/core/dev.c`）**
 
@@ -293,16 +293,14 @@ struct net_delayacct { };   /* 0 字节占位 */
 
 ### 3.3 GSO 拆分时子 skb 携带 delayacct_start 的传递策略
 
-**问题**: GSO（Generic Segmentation Offload）场景下, 进程一次 `send()` 产生一个大的 GSO skb, 在 `dev_hard_start_xmit` 之前由 `skb_gso_segment` 拆分为多个 MTU 大小的子 skb。子 skb 是新分配的, 默认不携带父 skb 的 `delayacct_start`, 导致 TX end 时这些子 skb 被当作"未打点"跳过, TX 统计丢失。
+**问题**: GSO（Generic Segmentation Offload）场景下, 进程一次 `send()` 产生一个大的 GSO skb, 在 `dev_hard_start_xmit` 之前由 `skb_gso_segment` 拆分为多个 MTU 大小的子 skb。子 skb 是否继承父 skb 的 `delayacct_start`, 直接影响 `tx_count` 的语义。
 
-**处理**: 在 `skb_gso_segment` 拆分时, 将父 skb 的 `delayacct_start` 复制到每个子 skb。这样:
+**处理**: `delayacct_start` 放在 `struct sk_buff` 的 headers `struct_group` 内, `skb_segment()` 内部调用 `__copy_skb_header()` 时会自动把该字段复制到每个 GSO 子 segment。同时 `net_delayacct_tx_end()` 在 `dev_hard_start_xmit()` 的循环中对每个子 segment 各调用一次。结果:
 
-- 拆分后每个子 skb 都有 start 戳, `dev_hard_start_xmit` 对每个子 skb 调 `tx_end` 会各自累加一次。
-- 但按需求 GSO 应"按 1 次计数"（计 GSO skb 一次, 非拆分后的多次）。
+- 每个 GSO 子 segment 都有 start 戳, 因此都被计入 TX 统计。
+- `tx_count` 按 segment 数量膨胀, 不等于应用层 `send()` 次数。
 
-实际策略权衡后选择: **在 GSO 拆分前（即对 GSO skb 本身）打 TX end, 而非对每个子 skb 打**。即 `dev_hard_start_xmit` 检测到 `skb_is_gso(skb)` 时, 仅对该 GSO skb 调一次 `net_delayacct_tx_end`, 之后拆分出的子 skb 不再计入。这实现了"GSO 计 1 次"的语义, 与 `docs/design.md` 4.1 节及 RST Limitations 一致。
-
-实现上, `dev_hard_start_xmit` 中 GSO 与非 GSO 分支都调用 `tx_end`, 但 GSO 分支在 `skb_gso_segment` 之前调用, 拆分出的子 skb 的 `delayacct_start` 不再复制（保持 0）, 子 skb 在后续 `ndo_start_xmit` 中被 end 函数的 zero-start 检查跳过。
+这是当前实现主动接受的设计 trade-off: 以"segment 级精度 + 代码简洁"换取每个 segment 的真实发送时延, 而非强制"GSO 计 1 次"。该语义与 RX 侧 GRO 合并导致 `rx_count` 减少是同一类取舍, 已在 `kernel-patches/README.md` 与 `tx-instrumentation.patch` commit message 中文档化。
 
 ### 3.4 sk->sk_lock.slock 不能直接复用
 

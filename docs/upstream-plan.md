@@ -60,10 +60,10 @@
 
 ### Patch 5/6 "net-delayacct: add TX path instrumentation"
 
-- 内容: 修改 `tcp.c` / `udp.c` / `dev.c`, 添加 TX 路径插桩。
-  - `net/ipv4/tcp.c`: `tcp_sendmsg_locked` 新 skb 后调 `net_delayacct_tx_start(skb)`。
-  - `net/ipv4/udp.c`: `udp_sendmsg` skb 生成后调 `net_delayacct_tx_start(skb)`。
-  - `net/core/dev.c`: `dev_hard_start_xmit` 调驱动前调 `net_delayacct_tx_end(skb->sk, skb)`; GSO 分支处理"GSO 计 1 次"语义。
+- 内容: 修改 `tcp_output.c` / `udp.c` / `udp6.c` / `dev.c`, 添加 TX 路径插桩。
+  - `net/ipv4/tcp_output.c`: `__tcp_transmit_skb` clone 块与 `__tcp_retransmit_skb` pskb_copy 分支调 `net_delayacct_tx_start(sk, skb)`。
+  - `net/ipv4/udp.c` / `net/ipv6/udp.c`: `udp_sendmsg`/`udpv6_sendmsg` fast path 与 `udp_push_pending_frames`/`udp_v6_push_pending_frames` corked flush 路径调 `net_delayacct_tx_start(sk, skb)`。
+  - `net/core/dev.c`: `dev_hard_start_xmit` 调驱动前调 `net_delayacct_tx_end(sk, skb)`; GSO 子 segment 各自计入 TX（segment 级精度）。
 - 验收: RX/TX 都有累计, 但用户态尚无法查询。
 
 ### Patch 6/6 "net-delayacct: add generic netlink interface"
@@ -426,10 +426,10 @@ sock_diag 已有 `SOCK_DIAG_BY_FAMILY` 等接口, reviewer 可能建议复用而
 
 ### 7.4 风险: GSO 语义争议
 
-**描述**: "GSO 计 1 次"的语义可能被质疑: 有人认为应按实际发送的 MTU 帧数计, 有人认为按 send() 调用计。
+**描述**: 当前实现选择 segment 级精度: GSO 拆分的每个子 segment 都继承 `delayacct_start` 并在 `dev_hard_start_xmit` 中各计一次 TX, 因此 `tx_count` 按 segment 数量膨胀。这可能被质疑是否应按应用层 `send()` 调用计 1 次。
 
 **缓解**:
 
-- 在 commit message 与 cover letter 中明确语义定义。
-- 与 `tx_count` 的含义对齐: "被 start 打戳的 skb 数", GSO skb 被打一次戳即计一次。
-- 接受 reviewer 建议的语义调整, 若合理则在 v2 修改。
+- 在 commit message 与 cover letter 中明确语义定义: `tx_count` 反映"被 start 打戳的 skb 数", GSO 拆分后每个子 segment 都是独立 skb, 故各自计入。
+- 在 Limitations / 设计权衡中说明这是"segment 级精度 + 代码简洁"的 trade-off。
+- 接受 reviewer 建议的语义调整, 若合理则在 v2 改为"GSO 计 1 次"或提供配置开关。

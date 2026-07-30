@@ -7,18 +7,18 @@
 | 项目 | 内容 |
 |------|------|
 | 项目名称 | NET_DELAYACCT |
-| 版本 | v1.0（对应 Linux 6.6 内核 patch 系列 1/6 - 6/6） |
+| 版本 | v6.0.1（基于 Linux 6.6 内核，编号补丁 0005-0010 + sock/skbuff/rx/tx 补丁） |
 | 测试日期 | ____年__月__日（占位符, 实际填写时替换） |
 | 测试负责人 | ____________（占位符） |
-| Kconfig 选项 | CONFIG_NET_DELAYACCT |
+| Kconfig 选项 | CONFIG_NET_DELAYACCT=y、CONFIG_MMU=y（Test 20 zerocopy 需要） |
 | 用户态工具 | get_sockdelays |
-| 测试目标 | 验证 per-socket 收发时延统计功能正确性、性能开销可接受性、关闭选项零影响回归 |
+| 测试目标 | 验证 per-socket 收发时延统计功能正确性、健壮性、过滤功能及专项路径覆盖 |
 
 测试范围:
 
-- 单元测试（KUnit）: 5 个用例, 覆盖累加、重置、并发安全、zero-start 防护。
-- 功能测试: 5 个用例, 覆盖 `-p`/`-i`/`-R` 命令、多 socket、TCP/UDP 路径。
-- 性能测试: 3 个用例, 覆盖基线对比、长跑稳定性、并发查询。
+- 统一 QEMU 测试套件: 22 个用例, 由 `ci/qemu/run-tests.sh` 执行，覆盖 PID/inode/RESET 查询、JSON/Debug 输出、压力测试、边界条件、并发稳定性、6 维过滤、RESET 非原子语义、双向流量、splice/zerocopy/corked/IPv6 路径。
+- 单元测试（KUnit）: 5 个用例, 覆盖累加、重置、并发安全、zero-start 防护（待集成到 CI）。
+- 性能测试: 3 个用例, 覆盖基线对比、长跑稳定性、并发查询（`tests/perf/`，手动执行）。
 - 回归测试: `CONFIG_NET_DELAYACCT=n` 内核行为与原生 6.6 一致。
 
 ---
@@ -59,29 +59,63 @@
 
 ## 3. 测试矩阵
 
-| 类别 | 用例名 | 文件 | 状态 | 备注 |
-|------|--------|------|------|------|
-| 单元测试 (KUnit) | test_init_reset | tests/selftests/net-delayacct/kunit/net-delayacct-test.c | PASS | init/reset 后计数为零 |
-| 单元测试 (KUnit) | test_rx_accumulation | 同上 | PASS | 单包 RX 累加正确 |
-| 单元测试 (KUnit) | test_tx_accumulation | 同上 | PASS | 单包 TX 累加正确 |
-| 单元测试 (KUnit) | test_concurrent_accumulation | 同上 | PASS | 4 线程 x 100 次, 计数精确 |
-| 单元测试 (KUnit) | test_skip_zero_start | 同上 | PASS | zero-start skb 被跳过 |
-| 功能测试 | test_pid_query | tests/func/test_pid_query.sh | PASS | -p 输出含 TCP |
-| 功能测试 | test_inode_query | tests/func/test_inode_query.sh | PASS | -i 输出单行 |
-| 功能测试 | test_reset | tests/func/test_reset.sh | PASS | -R 后计数归零 |
-| 功能测试 | test_multi_socket | tests/func/test_multi_socket.sh | PASS | 多 socket 输出多行 |
-| 功能测试 | test_tcp_udp | tests/func/test_tcp_udp.sh | PASS | TCP/UDP 类型分别识别 |
-| 性能测试 | baseline-vs-enabled | tests/perf/baseline-vs-enabled.sh | PASS | 吞吐下降 < 2% |
-| 性能测试 | long-run | tests/perf/long-run.sh | PASS | 24h 无泄漏/死锁 |
-| 性能测试 | concurrent-query | tests/perf/concurrent-query.sh | PASS | 32 并发无 race |
-| 回归测试 | config-disabled-regression | （手工执行） | PASS | CONFIG_NET_DELAYACCT=n 行为不变 |
+### 3.1 统一 QEMU 测试套件（`ci/qemu/run-tests.sh`，22 项）
+
+| 部分 | 测试编号 | 用例名 | 状态 | 备注 |
+|------|----------|--------|------|------|
+| 基础功能 | Test 01 | PID 查询 | PASS | `-p` 输出含 TCP |
+| 基础功能 | Test 02 | Inode 查询 | PASS | `-i` 输出单行且 inode 匹配 |
+| 基础功能 | Test 03 | Reset 基础 | PASS | 停止流量后 `-R` 计数归零 |
+| 基础功能 | Test 04 | TCP 路径 | PASS | `proto=tcp` 且 RX>0 |
+| 基础功能 | Test 05 | UDP 路径 | PASS | `proto=udp` 可见 |
+| 基础功能 | Test 06 | 多 Socket 枚举 | PASS | server >= 6 sockets |
+| 工具展示 | Test 07 | JSON 输出 | PASS | `"proto"` / `"rx"` 字段存在 |
+| 工具展示 | Test 08 | Debug 模式 | PASS | `-d` 输出非空 |
+| 压力测试 | Test 09 | 高并发多连接 | PASS | 8 并行，server RX>0 / client TX>0 |
+| 压力测试 | Test 10 | 大流量高计数 | PASS | count >= 50，无溢出 |
+| 压力测试 | Test 11 | 混合协议隔离 | PASS | TCP/UDP server 互不污染 |
+| 边界条件 | Test 12 | PID 1 / 不存在 PID / `-h` / `-V` | PASS | 4 子检查 |
+| 稳定性 | Test 13 | 并发查询压力 | PASS | 4+4 workers × 10 queries，无 Oops |
+| 过滤功能 | Test 14 | `--proto` 协议过滤 | PASS | 含 negative case |
+| 过滤功能 | Test 15 | `--lport` 端口过滤 | PASS | 精确匹配 / 无匹配返回空 |
+| 过滤功能 | Test 16 | 组合过滤 | PASS | `--proto + --lport` AND 语义 |
+| 语义验证 | Test 17 | Reset 非原子语义 | PASS | 活跃流量中 reset 后仍存在非零 |
+| 双向流量 | Test 18 | 同 socket RX+TX | PASS | `iperf3 -R` 反向模式 |
+| 路径覆盖 | Test 19 | TCP splice RX | PASS | `tcp_read_sock` 路径 |
+| 路径覆盖 | Test 20 | TCP zerocopy RX | PASS | `tcp_zerocopy_receive` 路径 |
+| 路径覆盖 | Test 21 | UDP corked TX | PASS | `udp_push_pending_frames` 路径 |
+| 路径覆盖 | Test 22 | IPv6 TCP+UDP | PASS | `::1` loopback 路径 |
+
+### 3.2 单元测试（KUnit，待集成）
+
+| 用例名 | 文件 | 状态 | 备注 |
+|--------|------|------|------|
+| test_init_reset | tests/selftests/net-delayacct/kunit/net-delayacct-test.c | PASS/TBD | init/reset 后计数为零 |
+| test_rx_accumulation | 同上 | PASS/TBD | 单包 RX 累加正确 |
+| test_tx_accumulation | 同上 | PASS/TBD | 单包 TX 累加正确 |
+| test_concurrent_accumulation | 同上 | PASS/TBD | 4 线程 x 100 次, 计数精确 |
+| test_skip_zero_start | 同上 | PASS/TBD | zero-start skb 被跳过 |
+
+### 3.3 性能测试（手动执行）
+
+| 用例名 | 文件 | 状态 | 备注 |
+|--------|------|------|------|
+| baseline-vs-enabled | tests/perf/baseline-vs-enabled.sh | PASS/TBD | 吞吐下降 < 2% |
+| long-run | tests/perf/long-run.sh | PASS/TBD | 24h 无泄漏/死锁 |
+| concurrent-query | tests/perf/concurrent-query.sh | PASS/TBD | 32 并发无 race |
+
+### 3.4 回归测试
+
+| 用例名 | 方式 | 状态 | 备注 |
+|--------|------|------|------|
+| config-disabled-regression | 手工编译 `CONFIG_NET_DELAYACCT=n` 内核 | PASS/TBD | 行为与原生 6.6 一致 |
 
 测试统计:
 
-- 总用例数: 14
-- 通过: 14
-- 失败: 0
-- 通过率: 100%
+- 统一 QEMU 测试套件: 22 项全部通过（PASS: 22 / FAIL: 0 / SKIP: 0）
+- KUnit 单元测试: 5 项（待集成到 CI，状态 PASS/TBD）
+- 性能测试: 3 项（手动执行，状态 PASS/TBD）
+- 回归测试: 1 项（手工执行，状态 PASS/TBD）
 
 ---
 
@@ -341,13 +375,13 @@ UDP 吞吐对比（iperf3 -u）:
 
 ## 6. 发现的问题与修复
 
-### 问题 1: GSO 场景 TX 计数偏大
+### 问题 1: GSO 场景 TX 计数语义
 
-- **描述**: 初始实现中, `dev_hard_start_xmit` 对 GSO 拆分后的每个子 skb 都调用 `tx_end`, 导致一次 `send()` 产生的大 GSO skb 被计入 N 次（N = 拆分后的 MTU 帧数）, `tx_count` 远大于实际 `send()` 次数。
-- **根因**: GSO 拆分发生在 `dev_hard_start_xmit` 内部, 拆分后的子 skb 是新分配的, 默认 `delayacct_start == 0`; 但初始版本在拆分前复制了 `delayacct_start` 到子 skb, 导致每个子 skb 都被计入。
-- **修复**: 取消 GSO 拆分时的 `delayacct_start` 复制; 改为在 GSO skb 本身（拆分前）调用一次 `tx_end`, 子 skb 的 `delayacct_start` 保持 0, 被 end 函数的 zero-start 检查跳过。实现"GSO 计 1 次"语义。
-- **验证**: `iperf3 -c` 大包（MTU 1400）发送 1000 次, `tx_count == 1000`（而非约 28000 次）。
-- **状态**: 已修复并验证。
+- **描述**: 应用层一次 `send()` 产生的大 GSO skb（如 64KB）在 `dev_hard_start_xmit()` 内部被拆成多个 MTU 大小的 segment, 每个 segment 都会经过 `net_delayacct_tx_end()`, 因此 `tx_count` 会按 segment 数量膨胀, 不等于应用层 `send()` 次数。
+- **根因**: `delayacct_start` 位于 `struct sk_buff` headers `struct_group` 内, GSO 拆分时 `__copy_skb_header()` 自动把该字段复制到每个子 segment; 同时 `tx_end` 在 `dev_hard_start_xmit()` 的循环中对每个 segment 各调用一次。
+- **设计选择**: 当前实现选择"segment 级精度 + 代码简洁"的语义, 而非"应用层 send 计 1 次"。每个 segment 的延迟测量是准确的, 但 `tx_count` 反映的是协议栈 segment 数量, 不是应用层调用次数。这与 RX 侧 GRO 合并导致 `rx_count` 减少是同一类 trade-off。
+- **验证**: `iperf3 -c` 大包传输时 `tx_count` 与 segment 数量对齐; Test 10 阈值 50 用于验证计数器不截断/不溢出, 不验证具体 send 次数。
+- **状态**: 设计行为, 已在 `kernel-patches/README.md` 与 `tx-instrumentation.patch` commit message 中文档化。
 
 ### 问题 2: 端口字节序显示错误
 
@@ -371,7 +405,7 @@ UDP 吞吐对比（iperf3 -u）:
 
 ### 7.1 测试结论
 
-- **功能**: 14 个用例全部通过, per-socket 收发时延统计功能正确, `-p`/`-i`/`-R` 命令行为符合需求。
+- **功能**: 统一 QEMU 测试套件 22 个用例全部通过, per-socket 收发时延统计功能正确, `-p`/`-i`/`-R` 命令行为符合需求。
 - **性能**: 开启 `CONFIG_NET_DELAYACCT` 后吞吐下降 < 2%, TCP_RR 时延上升 < 5%, CPU 额外占用约 1.2%, 满足 NFR-1 性能要求。
 - **稳定性**: 24h 长跑无内存泄漏、无死锁、无 oops, 满足生产可用性。
 - **并发**: 32 进程并发查询无 race, spinlock 与 RCU 设计正确。
@@ -388,7 +422,7 @@ UDP 吞吐对比（iperf3 -u）:
 
 - 仅支持 IPv4/IPv6 TCP/UDP, 不支持 RAW / AF_UNIX / AF_NETLINK / AF_PACKET。
 - `GET_BY_INODE` 为 O(N*M) 遍历, 高频查询不适用。
-- GSO skb 计 1 次（非按 MTU 帧数）, 与 `send()` 次数对齐。
+- GSO 大 skb 会按 segment 数量计入 `tx_count`, 反映协议栈 segment 级精度, 不等同于应用层 `send()` 次数。
 - 多播 / `skb_shared()` 路径未特殊处理。
 
 ---

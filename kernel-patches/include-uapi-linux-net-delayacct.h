@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
-/* Copyright (c) 2026 h1y2g3l4y5 */
+/* Copyright (c) 2026 laiguo-liang */
 #ifndef _UAPI_LINUX_NET_DELAYACCT_H
 #define _UAPI_LINUX_NET_DELAYACCT_H
 

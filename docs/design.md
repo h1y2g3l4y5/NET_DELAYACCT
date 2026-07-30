@@ -288,9 +288,9 @@ struct sk_buff {
 | RX start | `net/core/dev.c` | `__netif_receive_skb_core` | `net_delayacct_rx_start(skb)` | 函数入口处，紧接 rcu_read_lock 之后；对所有协议族生效 |
 | RX end (TCP) | `net/ipv4/tcp.c` | `tcp_recvmsg` | `net_delayacct_rx_end(sk, skb)` | 调用 `skb_copy_datagram_iter` 之前 |
 | RX end (UDP) | `net/ipv4/udp.c` | `__skb_recv_udp` | `net_delayacct_rx_end(sk, skb)` | 出队成功、返回 skb 之前 |
-| TX start (TCP) | `net/ipv4/tcp.c` | `tcp_sendmsg` | `net_delayacct_tx_start(skb)` | 在 `tcp_sendmsg_locked` 内对每个新生成的 skb 打戳 |
-| TX start (UDP) | `net/ipv4/udp.c` | `udp_sendmsg` | `net_delayacct_tx_start(skb)` | 在 `ip_make_skb` 之后、`udp_send_skb` 之前对 skb 打戳 |
-| TX end | `net/core/dev.c` | `dev_hard_start_xmit` | `net_delayacct_tx_end(sk, skb)` | 在调用 `ops->ndo_start_xmit(skb, dev)` 之前 |
+| TX start (TCP) | `net/ipv4/tcp_output.c` | `__tcp_transmit_skb` / `__tcp_retransmit_skb` | `net_delayacct_tx_start(sk, skb)` | clone/pskb_copy 块中，覆盖首次传输、重传、SYN/SYNACK 等路径 |
+| TX start (UDP) | `net/ipv4/udp.c` / `net/ipv6/udp.c` | `udp_sendmsg` / `udpv6_sendmsg` / `udp_push_pending_frames` / `udp_v6_push_pending_frames` | `net_delayacct_tx_start(sk, skb)` | 在 `ip_make_skb`/`ip6_make_skb` 之后或 corked flush 时对 skb 打戳 |
+| TX end | `net/core/dev.c` | `dev_hard_start_xmit` | `net_delayacct_tx_end(sk, skb)` | 在调用 `ops->ndo_start_xmit(skb, dev)` 之前；GSO 子 segment 各自计入 |
 
 ### 4.2 插桩点选择原则
 
@@ -334,17 +334,41 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 }
 ```
 
-TX start（在 `tcp_sendmsg_locked` 中生成新 skb 后）：
+TX start（在 `__tcp_transmit_skb` 的 clone 块中）：
 
 ```c
-int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
+                              int clone_it, gfp_t gfp_mask, u32 rcv_nxt)
 {
     /* ... */
-    skb = sk_stream_alloc_skb(sk, 0, sk->sk_allocation, first_skb);
+    if (clone_it) {
+        /* ... */
+        skb = skb_clone(skb, gfp_mask);
+        /* ... */
+        skb->dev = NULL;
+        net_delayacct_tx_start(sk, skb);   /* <-- 新增 */
+    }
     /* ... */
-    net_delayacct_tx_start(skb);   /* <-- 新增 */
+}
+```
+
+重传路径 `__tcp_retransmit_skb` 的 `__pskb_copy` 分支同理。
+
+UDP TX start（在 `udp_sendmsg` fast path 中）：
+
+```c
+int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+{
     /* ... */
-    tcp_skb_entail(sk, skb);
+    skb = ip_make_skb(sk, fl4, getfrag, msg->msg_iov, ulen,
+                      sizeof(struct udphdr), &ipc, &rt,
+                      &cork, msg->msg_flags);
+    err = PTR_ERR(skb);
+    if (!IS_ERR_OR_NULL(skb)) {
+        net_delayacct_tx_start(sk, skb);   /* <-- 新增 */
+        err = udp_send_skb(skb, fl4, &cork);
+    }
+    /* ... */
 }
 ```
 
@@ -771,10 +795,12 @@ objdump -d net/core/dev.o | grep -A5 __netif_receive_skb_core  # 应无 delayacc
 
 场景：
 - 报文经过的路径未插桩（如 RAW socket、AF_UNIX）。
-- 报文是从 skb_clone 拆分出的 GSO 子包。
-- skb 复用（如重传）。
+- 控制包使用 `alloc_skb` 分配，零初始化使 `delayacct_start` 为 0（如纯 ACK、RST、窗口探测）。
+- skb 复用且旧戳已被显式重置（如重传 clone 会重新打戳，旧戳不再使用）。
 
 处理：end 函数首先检查 `skb->delayacct_start`，若为 0 直接 `return`，不累加、不计 count。
+
+> **注意**：GSO 子 segment 会继承父 skb 的 `delayacct_start`（`delayacct_start` 位于 headers `struct_group`，`__copy_skb_header()` 自动复制），因此不会被 zero-start 检查跳过；`tx_count` 会按 segment 数量膨胀，这是当前实现的设计 trade-off。
 
 ### 8.2 进程退出后查询
 
@@ -862,9 +888,9 @@ else
 
 ### Patch 4/6: `net-delayacct: add TX path instrumentation`
 
-- 修改 `net/ipv4/tcp.c`：`tcp_sendmsg_locked` 中新 skb 生成后添加 `net_delayacct_tx_start(skb)`。
-- 修改 `net/ipv4/udp.c`：`udp_sendmsg` 中 skb 生成后添加 `net_delayacct_tx_start(skb)`。
-- 修改 `net/core/dev.c`：`dev_hard_start_xmit` 调用驱动前添加 `net_delayacct_tx_end(skb->sk, skb)`。
+- 修改 `net/ipv4/tcp_output.c`：`__tcp_transmit_skb` clone 块与 `__tcp_retransmit_skb` pskb_copy 分支添加 `net_delayacct_tx_start(sk, skb)`。
+- 修改 `net/ipv4/udp.c` / `net/ipv6/udp.c`：`udp_sendmsg`/`udpv6_sendmsg` fast path 与 `udp_push_pending_frames`/`udp_v6_push_pending_frames` corked 路径添加 `net_delayacct_tx_start(sk, skb)`。
+- 修改 `net/core/dev.c`：`dev_hard_start_xmit` 调用驱动前添加 `net_delayacct_tx_end(sk, skb)`。
 - 此 patch 后 RX/TX 都有累计，但用户态尚无法查询。
 
 ### Patch 5/6: `net-delayacct: add generic netlink interface`
@@ -974,8 +1000,9 @@ else
 | `include/linux/skbuff.h` | `struct sk_buff` 新增 `ktime_t delayacct_start` |
 | `net/core/sock.c` | `sock_init_data` 调用 `net_delayacct_init` |
 | `net/core/dev.c` | `__netif_receive_skb_core` 起始、`dev_hard_start_xmit` 调用驱动前插桩 |
-| `net/ipv4/tcp.c` | `tcp_sendmsg_locked` 新 skb 后、`tcp_recvmsg` 拷贝前插桩 |
-| `net/ipv4/udp.c` | `udp_sendmsg` skb 后、`__skb_recv_udp` 返回前插桩 |
+| `net/ipv4/tcp_output.c` | `__tcp_transmit_skb` clone 块 / `__tcp_retransmit_skb` pskb_copy 分支插桩 |
+| `net/ipv4/tcp.c` | `tcp_recvmsg_locked` / `tcp_read_sock` / `tcp_zerocopy_receive` 插桩 |
+| `net/ipv4/udp.c` / `net/ipv6/udp.c` | `udp_sendmsg`/`udpv6_sendmsg` fast path 与 corked flush 路径、`udp_recvmsg`/`udpv6_recvmsg` 插桩 |
 | `Documentation/networking/index.rst` | 添加 `net-delayacct` 索引 |
 
 ### 11.3 不修改的文件

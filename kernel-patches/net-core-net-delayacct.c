@@ -132,7 +132,10 @@ static int net_delayacct_fill_sock(struct sk_buff *skb, struct sock *sk,
 
 	family = sk->sk_family;
 	proto  = sk->sk_protocol;
-	lport  = ntohs(sk->sk_num);
+	/* sk->sk_num is already in host byte order (__u16); sk->sk_dport
+	 * is in network byte order (__be16) and needs ntohs().
+	 */
+	lport  = sk->sk_num;
 	rport  = ntohs(sk->sk_dport);
 
 	if (family == AF_INET) {
@@ -256,12 +259,14 @@ static bool net_delayacct_match_filter(struct sock *sk,
 
 	if (info->attrs[NET_DELAYACCT_A_LPORT]) {
 		u16 lport = nla_get_u16(info->attrs[NET_DELAYACCT_A_LPORT]);
-		if (ntohs(sk->sk_num) != lport)
+		/* sk->sk_num is already in host byte order (__u16). */
+		if (sk->sk_num != lport)
 			return false;
 	}
 
 	if (info->attrs[NET_DELAYACCT_A_RPORT]) {
 		u16 rport = nla_get_u16(info->attrs[NET_DELAYACCT_A_RPORT]);
+		/* sk->sk_dport is in network byte order (__be16). */
 		if (ntohs(sk->sk_dport) != rport)
 			return false;
 	}
