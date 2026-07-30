@@ -2,7 +2,11 @@
 # Merge into .config via:
 #   scripts/kconfig/merge_config.sh -m .config ci/kernel.config.fragment
 #
-# Dependencies: CONFIG_NET is the base networking subsystem and is required.
+# Dependencies:
+#   - CONFIG_NET is the base networking subsystem and is required.
+#   - CONFIG_MMU is required for TCP_ZEROCOPY_RECEIVE (tcp_mmap depends on it).
+#     It is enabled by default on x86/x86_64 defconfig; kept here for explicitness.
 
 CONFIG_NET=y
 CONFIG_NET_DELAYACCT=y
+CONFIG_MMU=y

@@ -195,12 +195,25 @@ jobs:
           test -x userspace/get_sockdelays/get_sockdelays
           ./userspace/get_sockdelays/get_sockdelays -h || true
 
+      - name: Build test helper (splice/zerocopy/corked path coverage)
+        run: |
+          make -C tests/helper CC="ccache gcc" || echo "helper build failed, path tests will SKIP"
+          test -x tests/helper/delayacct_path_test && echo "helper OK" || echo "helper MISSING"
+
       - name: Upload get_sockdelays artifact
         uses: actions/upload-artifact@v4
         with:
           name: get_sockdelays
           path: userspace/get_sockdelays/get_sockdelays
           retention-days: 1
+
+      - name: Upload test helper artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: delayacct_path_test
+          path: tests/helper/delayacct_path_test
+          retention-days: 1
+          if-no-files-found: ignore
 
   qemu-test:
     name: QEMU runtime test (KVM)
@@ -237,6 +250,12 @@ jobs:
           name: get_sockdelays
           path: /tmp/artifacts
 
+      - name: Download test helper artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: delayacct_path_test
+          path: /tmp/artifacts
+
       - name: Build initramfs and run QEMU (KVM)
         run: |
           set -e
@@ -252,7 +271,7 @@ jobs:
           for applet in sh ls cat cp mount umount sleep kill echo grep date head tail \
             awk sed test mknod mkdir chmod readlink true false ifconfig ip timeout nc \
             nslookup wget tee sort wc uname dmesg sync reboot poweroff halt \
-            modprobe mountpoint strings seq basename dirname tr cut; do
+            modprobe mountpoint strings seq basename dirname tr cut mktemp rm; do
             ln -sf /bin/busybox "/tmp/initrd/bin/$applet"
           done
 
@@ -269,6 +288,16 @@ jobs:
           # Copy get_sockdelays
           cp /tmp/artifacts/get_sockdelays /tmp/initrd/usr/local/bin/
           chmod +x /tmp/initrd/usr/local/bin/get_sockdelays
+
+          # Copy test helper (splice/zerocopy/corked path coverage, Test 17-19)
+          # 静态链接；缺失时 path-coverage 测试自动 SKIP
+          if [ -f /tmp/artifacts/delayacct_path_test ]; then
+            cp /tmp/artifacts/delayacct_path_test /tmp/initrd/usr/local/bin/
+            chmod +x /tmp/initrd/usr/local/bin/delayacct_path_test
+            echo "Copied delayacct_path_test helper"
+          else
+            echo "WARNING: delayacct_path_test not found, path tests will SKIP"
+          fi
 
           # Copy unified test script
           mkdir -p /tmp/initrd/opt
@@ -373,9 +402,9 @@ jobs:
           {
             echo "## NET_DELAYACCT Test Results"
             echo ""
-            echo "### Test Suite Output (last 500 lines)"
+            echo "### Test Suite Output (last 1000 lines)"
             echo '```'
-            tail -500 /tmp/qemu.log 2>/dev/null || true
+            tail -1000 /tmp/qemu.log 2>/dev/null || true
             echo '```'
             echo ""
             PASS=$(grep -c '\[PASS\]' /tmp/qemu.log 2>/dev/null || true)
@@ -383,7 +412,7 @@ jobs:
             SKIP=$(grep -c '\[SKIP\]' /tmp/qemu.log 2>/dev/null || true)
             echo "**Result: ${PASS} PASS, ${FAIL} FAIL, ${SKIP} SKIP**"
           } >> "$GITHUB_STEP_SUMMARY"
-          tail -500 /tmp/qemu.log > /tmp/test-summary.txt 2>/dev/null || true
+          tail -1000 /tmp/qemu.log > /tmp/test-summary.txt 2>/dev/null || true
           echo "Step summary updated"
 
       - name: Upload test summary

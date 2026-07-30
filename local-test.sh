@@ -28,8 +28,8 @@ LOG_FILE="$LOG_DIR/test-${TIMESTAMP}.log"
 
 KERNEL_PATCH_DIR="$PROJECT_DIR/kernel-patches"
 QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
-QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-120}"
-QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-300}"
+QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-300}"
+QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-600}"
 # Backward compatibility: if user still exports QEMU_TIMEOUT, use it for both.
 if [ -n "${QEMU_TIMEOUT:-}" ]; then
 	QEMU_TIMEOUT_KVM="$QEMU_TIMEOUT"
@@ -178,6 +178,26 @@ step_build_tool() {
 }
 
 # ============================================================================
+# Step 4b: Build test helper (splice/zerocopy/corked path coverage)
+# ============================================================================
+step_build_helper() {
+	log_section "Building delayacct_path_test helper"
+
+	cd "$PROJECT_DIR/tests/helper"
+	# 静态优先，方便打包进 initramfs 无需拖依赖库
+	if make 2>&1 | tail -5; then
+		if [ -x delayacct_path_test ]; then
+			echo "${GREEN}Helper build OK${NC}"
+		else
+			echo "${YELLOW}Helper build FAILED — path-coverage tests will SKIP${NC}"
+		fi
+	else
+		echo "${YELLOW}Helper build FAILED — path-coverage tests will SKIP${NC}"
+	fi
+	cd "$PROJECT_DIR"
+}
+
+# ============================================================================
 # Step 5: Create initramfs with busybox + tests
 # ============================================================================
 step_create_initramfs() {
@@ -208,7 +228,8 @@ step_create_initramfs() {
 		   mount umount mknod chmod chown mkdir rmdir cp mv rm ln \
 		   timeout dmesg readlink command killall sort uniq dirname \
 		   basename date test tr cut which true false \
-		   ip ifconfig nslookup wget; do
+		   ip ifconfig nslookup wget mktemp \
+		   tee uname sync reboot poweroff halt modprobe mountpoint strings seq; do
 		ln -sf /bin/busybox "$INITRD_DIR/bin/$cmd" 2>/dev/null || true
 	done
 	ln -sf /bin/busybox "$INITRD_DIR/sbin/init"
@@ -246,6 +267,17 @@ step_create_initramfs() {
 		cp -L "$lib" "$dest"
 	done
 	echo "Copied shared libraries for get_sockdelays"
+
+	# Copy test helper (splice/zerocopy/corked path coverage, Test 19-21)
+	# 静态链接，无需复制依赖库；构建失败时跳过（run-tests.sh 会 SKIP）
+	local HELPER_BIN="$PROJECT_DIR/tests/helper/delayacct_path_test"
+	if [ -x "$HELPER_BIN" ]; then
+		cp "$HELPER_BIN" "$INITRD_DIR/usr/local/bin/delayacct_path_test"
+		chmod +x "$INITRD_DIR/usr/local/bin/delayacct_path_test"
+		echo "Copied delayacct_path_test helper"
+	else
+		echo "WARNING: delayacct_path_test not built, path-coverage tests will SKIP"
+	fi
 
 	# Copy bash for test scripts (test scripts use bash-specific syntax)
 	if [ -f /bin/bash ]; then
@@ -396,6 +428,7 @@ init_log
 			step_apply_patches
 			step_build_kernel
 			step_build_tool
+			step_build_helper
 			echo "${GREEN}Kernel + tool built. Run './local-test.sh --qemu-only' to test.${NC}"
 			;;
 		--qemu-only)
@@ -415,6 +448,7 @@ init_log
 			step_apply_patches
 			step_build_kernel
 			step_build_tool
+			step_build_helper
 			step_create_initramfs
 			step_run_qemu
 			step_show_results

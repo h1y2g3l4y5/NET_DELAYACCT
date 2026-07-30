@@ -18,8 +18,9 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo "=== QEMU guest boot: $(date -u) ==="
 
-# Watchdog: force poweroff after 360s (KVM fast, but self-hosted runner may be slow)
-( sleep 360; echo "WATCHDOG: forcing poweroff after 360s timeout"; poweroff -f ) &
+# Watchdog: force poweroff after 540s (must exceed run-tests.sh timeout of 480s;
+# TCG software emulation is much slower than KVM and needs the extra headroom)
+( sleep 540; echo "WATCHDOG: forcing poweroff after 540s timeout"; poweroff -f ) &
 WATCHDOG_PID=$!
 
 # --- Mount essential filesystems (idempotent — skip if already mounted) ---
@@ -98,14 +99,14 @@ RESULT_FILE="/root/test-output.txt"
 			set +e
 			# Use bash if available (test scripts use bash syntax), fall back to sh
 			if command -v bash >/dev/null 2>&1; then
-				timeout 240 bash /opt/run-tests.sh 2>&1
+				timeout 480 bash /opt/run-tests.sh 2>&1
 			else
-				timeout 240 sh /opt/run-tests.sh 2>&1
+				timeout 480 sh /opt/run-tests.sh 2>&1
 			fi
 			rc=$?
 			set -e
 			if [ "$rc" -eq 124 ]; then
-				echo "  (tests timed out after 240s)"
+				echo "  (tests timed out after 480s)"
 			elif [ "$rc" -ne 0 ]; then
 				echo "  (tests exited with rc=$rc)"
 			fi
