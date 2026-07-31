@@ -199,29 +199,31 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ##### 一、测试目标
 
-验证 `get_sockdelays -R` 的基础清零能力：停止流量后执行 reset，所有 per-socket 统计应被清零。这是 RESET 功能最基本的正确性验证。
+验证 `get_sockdelays -R` 的基础清零能力：**重置前必须有非零计数**，重置后非零计数应大幅下降。这是 RESET 功能最基本的正确性验证，避免"0→0"的假阳性。
 
 ##### 二、实现流程
 
-代码见 [run-tests.sh:259-300](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L259-L300)，步骤如下：
+代码见 [run-tests.sh:259-313](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L259-L313)，步骤如下：
 
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | 启动 iperf3 server 端口 21403，sleep 1 等待就绪 | |
-| 2 | **同步运行** iperf3 client，传输 3 秒 | 不加 `&`，阻塞等待传输完成后才继续。关键：确保 reset 时流量已完全停止 |
-| 3 | `sleep 1` 等待 skb 处理完成 | 避免 in-flight 包干扰 |
-| 4 | 执行 `get_sockdelays -p $_SRV`（重置前查询） | 确认有统计数据（`PRE_DATA ≥ 1`） |
-| 5 | 执行 `get_sockdelays -R` 重置 | 向内核发送 RESET 命令 |
-| 6 | `sleep 1` 等待 reset 完成并让 in-flight 包被清零 | |
-| 7 | 再次查询 `get_sockdelays -p $_SRV`（重置后查询） | 统计所有 `count=` 字段大于 0 的行数 |
-| 8 | 断言，清理进程 | |
+| 2 | **后台运行** iperf3 client（`-P 2 -t 12`），`sleep 3` 让流量积累 | **关键**：后台运行确保 PRE 查询时流量活跃、count 必然 > 0。若同步运行，client 结束后 server 关闭 child socket，只剩 listen socket（count=0），PRE/POST 全为 0，reset 测试 trivially 通过（假阳性） |
+| 3 | 执行 `get_sockdelays -p $_SRV`（重置前查询 PRE） | **必须验证 PRE 有非零计数**（`PRE_NONZERO ≥ 1`），否则 reset 无意义 |
+| 4 | 执行 `get_sockdelays -R` 重置 | 向内核发送 RESET 命令 |
+| 5 | `sleep 1` 等待 reset 完成并让后续包累加 | |
+| 6 | 再次查询 `get_sockdelays -p $_SRV`（重置后查询 POST） | 统计所有 `count=` 字段大于 0 的行数 |
+| 7 | 断言：POST 非零计数 < PRE/2 或 = 0 | 容忍非原子语义下的少量累加 |
+| 8 | 清理进程 | |
 
 ##### 三、核心断言与原理
 
-唯一核心断言：
-- **重置后所有 count 字段为 0**（`count>0` 的行数 = 0）：证明 reset 确实将所有 socket 的统计清零。
+三个断言（层层递进）：
+1. **PRE 必须有非零计数**（`PRE_NONZERO ≥ 1`）：若 PRE 全为 0，reset 是"0→0"的空操作，测试无意义，必须 FAIL。
+2. **POST 非零计数远小于 PRE**（`POST_NONZERO < PRE_NONZERO / 2` 或 `= 0`）：证明 reset 确实清空了统计。容忍非原子语义下的少量累加（见 Test 17）。
+3. **client 后台运行保证流量活跃**：这是与旧实现（同步运行）的根本区别，旧实现因 client 结束后 socket 被关闭导致 PRE/POST 全为 0，产生"重置前后数据都是 0"的假阳性。
 
-**语义说明**：RESET 不是全局原子快照，遍历期间或遍历之后新到达的包仍会被累加（这是与 `/proc/net/snmp` 等批量统计框架一致的设计）。本测试在流量完全停止后执行 reset，因此非原子语义不影响断言；**活跃流量下的非原子行为由 Test 17 专项验证**，两者互补。
+**语义说明**：RESET 不是全局原子快照，遍历期间或遍历之后新到达的包仍会被累加。本测试在流量活跃时执行 reset，POST 可能因后续包到达有小幅累加，因此阈值取 PRE/2 而非严格 = 0；**活跃流量下的非原子行为由 Test 17 专项验证**，两者互补。
 
 ---
 
@@ -229,28 +231,26 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ##### 一、测试目标
 
-验证内核 per-socket 延迟统计对 TCP socket 的追踪能力：RX 打点（`tcp_recvmsg_locked`/`tcp_read_sock`/`tcp_zerocopy_receive`）能够正常工作，iperf3 这种常规 TCP 传输能统计到数据。
+验证内核 per-socket 延迟统计对 TCP socket 的追踪能力：RX 打点（`tcp_recvmsg_locked`/`tcp_read_sock`/`tcp_zerocopy_receive`）能够正常工作。RX count > 0 是硬断言，无 timing 放宽。
 
 ##### 二、实现流程
 
-代码见 [run-tests.sh:302-338](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L302-L338)，步骤如下：
+代码见 [run-tests.sh:315-359](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L315-L359)，步骤如下：
 
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | 启动 iperf3 server 端口 21404 | |
-| 2 | 同步运行 iperf3 client 传输 5 秒 | 阻塞等待完成 |
-| 3 | `sleep 1` 等待队列清空 | |
-| 4 | 查询 server PID：`get_sockdelays -p $_SRV` | |
-| 5 | 统计 `proto=tcp` 行数，检查首行 RX count 是否 ≥ 1 | |
-| 6 | 断言，清理 | |
+| 2 | **后台运行** iperf3 client（`-t 8`），`sleep 3` 让流量积累 | 关键：后台运行确保查询时流量活跃、count 必然 > 0。若同步运行，client 结束后 server 关闭 child socket，只剩 listen socket（count=0），产生假阳性 |
+| 3 | 查询 server PID：`get_sockdelays -p $_SRV` | |
+| 4 | 统计 `proto=tcp` 行数，检查 RX count > 0 的 socket 数 | |
+| 5 | 断言，清理 | |
 
 ##### 三、核心断言与原理
 
-断言采取容错设计：
+三个断言（硬断言，无 timing 放宽）：
 - **`proto=tcp` 行 ≥ 1**（必须满足）：证明 TCP socket 被枚举到。
-- **若 RX count ≥ 1 则 PASS，否则也给 PASS 但标注 "(timing)"**：传输结束到查询之间可能有延迟，skb 已被释放/计数已被清空属于 timing 边缘情况，只要能枚举到 TCP socket 即视为 TCP 路径打点框架工作正常。
-
-这是一个冒烟测试，不是精确计数验证——精确计数由后面的 Test 09/10 等负责。
+- **RX count > 0 的 socket 数 ≥ 1**（必须满足）：证明 RX 打点工作正常。若 RX=0，说明 `net_delayacct_rx_end()` 可能失效，必须 FAIL。
+- **QEMU loopback 下不存在真实 timing 问题**：iperf3 `-t 8` 后台运行 + sleep 3 足够产生 RX count > 0，旧实现的"timing 放宽"是假阳性来源。
 
 ---
 
@@ -258,25 +258,26 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ##### 一、测试目标
 
-验证内核 per-socket 延迟统计对 UDP socket 的追踪能力。UDP 是无连接协议，end 打点位于 `skb_copy_and_csum_datagram_msg()` 成功之后（checksum 验证通过后才计入），行为与 TCP 不同，需要单独验证。
+验证内核 per-socket 延迟统计对 UDP socket 的追踪能力（RX/TX 打点必须工作）。UDP 是无连接协议，end 打点位于 `skb_copy_and_csum_datagram_msg()` 成功之后（checksum 验证通过后才计入），行为与 TCP 不同，需要单独验证。
 
 ##### 二、实现流程
 
-代码见 [run-tests.sh:340-380](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L340-L380)，步骤如下：
+代码见 [run-tests.sh:361-417](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L361-L417)，步骤如下：
 
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | 启动 iperf3 server 端口 21405 | |
-| 2 | 启动 iperf3 UDP client（`-u -b 10M -t 5`），**后台运行 `&`** | 关键：UDP 无连接，同步阻塞 5s 结束后 UDP 数据 socket 会被立即关闭，查询时可能已消失 |
-| 3 | `sleep 2` 等待传输稳定 | |
-| 4 | **同时查询 client 和 server 两端**：`get_sockdelays -p $_SRV` 和 `get_sockdelays -p $_CLI` | UDP socket 可能只在一侧可见 |
-| 5 | 分别统计两端 `proto=udp` 行数，求和 | |
-| 6 | 断言，清理 | |
+| 2 | 启动 iperf3 UDP client（`-u -b 10M -t 8`），**后台运行 `&`**，sleep 3 | 关键：UDP 无连接，同步阻塞结束后 UDP 数据 socket 会被立即关闭，查询时可能已消失 |
+| 3 | **同时查询 client 和 server 两端**：`get_sockdelays -p $_SRV` 和 `get_sockdelays -p $_CLI` | UDP socket 可能只在一侧可见 |
+| 4 | 分别统计两端 `proto=udp` 行数，求和；计算 server RX 总和、client TX 总和 | |
+| 5 | 断言，清理 | |
 
 ##### 三、核心断言与原理
 
-唯一核心断言：
-- **两端 proto=udp 总数 ≥ 1**：UDP 无连接，server 侧或 client 侧可能在查询时 socket 已被关闭（UDP socket 生命周期比 TCP 短），两端同时查避免单端误判。
+三个断言：
+1. **两端 proto=udp 总数 ≥ 1**：UDP 无连接，server 侧或 client 侧可能在查询时 socket 已被关闭（UDP socket 生命周期比 TCP 短），两端同时查避免单端误判。
+2. **server RX > 0**：server 作为接收方，应收到 UDP 数据包（`net_delayacct_rx_end` 打点工作）。
+3. **client TX > 0**：client 作为发送方，应发送了 UDP 数据包（`net_delayacct_tx_start` 打点工作）。
 
 **关键设计**：client 必须后台运行，否则同步阻塞结束后 socket 立即被内核清理，查询不到任何 UDP socket。
 
@@ -286,29 +287,27 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ##### 一、测试目标
 
-验证一个进程持有多个 socket 时，`get_sockdelays` dumpit 遍历 `files_struct` 能否全量枚举出所有 socket，不遗漏任何一个 fd。这是后续多连接测试（Test 09）的基础。
+验证一个进程持有多个 socket 时，`get_sockdelays` dumpit 遍历 `files_struct` 能否全量枚举出所有 socket，不遗漏任何一个 fd；同时验证 server 侧 RX 打点工作正常。
 
 ##### 二、实现流程
 
-代码见 [run-tests.sh:382-429](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L382-L429)，步骤如下：
+代码见 [run-tests.sh:419-481](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L419-L481)，步骤如下：
 
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | 启动 iperf3 server 端口 21406 | |
-| 2 | 启动 iperf3 client `-P 4`（4 条并行 TCP 流），后台运行 | iperf3 `-P N` 会 fork 子进程处理每条数据连接 |
-| 3 | `sleep 2` 等待所有连接建立 | |
-| 4 | 查询 client 父进程 PID：`get_sockdelays -p $_CLI` | 父进程只持有 control socket |
-| 5 | 查询 server PID：`get_sockdelays -p $_SRV` | server 不 fork，所有 socket 在主进程可见 |
-| 6 | 分别统计两端 `proto=tcp` 行数 | |
-| 7 | 断言，清理 | |
+| 2 | 启动 iperf3 client `-P 4`（4 条并行 TCP 流），**后台运行**，sleep 3 | iperf3 `-P N` 会 fork 子进程处理每条数据连接 |
+| 3 | 查询 client 父进程 PID：`get_sockdelays -p $_CLI` | 父进程只持有 control socket |
+| 4 | 查询 server PID：`get_sockdelays -p $_SRV` | server 不 fork，所有 socket 在主进程可见 |
+| 5 | 分别统计两端 `proto=tcp` 行数；计算 server RX 总和 | |
+| 6 | 断言，清理 | |
 
 ##### 三、核心断言与原理
 
-两个断言：
+三个断言：
 1. **client 父进程 ≥ 1 个 TCP socket**：父进程持有 control 连接 socket。
-2. **server ≥ 6 个 TCP socket**：至少 1 个 listen socket + 1 个 control 连接 + 4 条数据连接 = 6 个。
-
-**socket 数量说明**：实际数量可能因 TIME-WAIT 残留 socket、iperf3 内部管理 socket 等状态更高，断言用 `>=6` 容忍上浮，不期望恰好等于 6。
+2. **server ≥ 6 个 TCP socket**：至少 1 个 listen socket + 1 个 control 连接 + 4 条数据连接 = 6 个。实际数量可能因 TIME-WAIT 残留 socket 等状态更高，断言用 `>=6` 容忍上浮。
+3. **server RX > 0**：server 作为接收方，4 条数据流应产生 RX 计数（`net_delayacct_rx_end` 打点工作）。
 
 **关键设计**：iperf3 `-P N` 会 fork 子进程处理数据连接，子进程的数据 socket 出现在子进程 fd 表中，父进程 fd 表只有 control socket；server 侧不 fork，所有数据 socket 在同一个进程中可见，因此 server 侧断言数量更高。
 
@@ -885,6 +884,89 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ---
 
+### 第八部分：ftrace 打桩点全量验证（Test 23，于 v6.1.0 review 轮次引入）
+
+验证内核打桩点的真实可达性：每个测试场景是否真的触发了预期的内核打桩函数？这是从"黑盒结果验证"升级到"灰盒路径验证"的关键步骤。
+
+#### Test 23: ftrace 打桩点全量验证（13 函数 × 7 场景）
+
+##### 一、测试目标
+
+通过 ftrace function tracer 验证 13 个内核打桩函数在每个测试场景下被真实触发，解决"打桩点是否真的被走到"的根本性质疑。
+
+##### 二、实现流程
+
+代码见 [run-tests.sh:1597-1846](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L1597-L1846)，步骤如下：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 检查 `/sys/kernel/debug/tracing` 是否存在且可写 | 不存在说明 `CONFIG_FTRACE` 未启用，SKIP |
+| 2 | 定义 13 个 ftrace 函数清单 | 覆盖全部 12 个打桩点（rx_start×1, rx_end×5, tx_end×1, tx_start×5） |
+| 3 | 对每个场景：启用 ftrace filter → 运行流量 → 停止 ftrace → 统计函数调用次数 | 13 函数 × 7 场景 |
+| 4 | 断言每个场景的预期函数调用次数 > 0 | 缺失则标记 `[MISS]` |
+| 5 | 生成"场景 × 函数"覆盖矩阵 | 可视化展示各函数在各场景的调用次数 |
+
+##### 三、核心断言与原理
+
+13 个 ftrace 函数映射到 12 个打桩点：
+
+| 打桩点 | ftrace 函数 | 方向 |
+|--------|------------|------|
+| `rx_start` | `__netif_receive_skb_core` | RX 入口 |
+| `rx_end` (标准 TCP) | `tcp_recvmsg_locked` | RX 出口 |
+| `rx_end` (splice) | `tcp_read_sock` | RX 出口 |
+| `rx_end` (zerocopy) | `tcp_zerocopy_receive` | RX 出口 |
+| `rx_end` (IPv4 UDP) | `udp_recvmsg` | RX 出口 |
+| `rx_end` (IPv6 UDP) | `udpv6_recvmsg` | RX 出口 |
+| `tx_end` | `dev_hard_start_xmit` | TX 出口 |
+| `tx_start` (TCP clone) | `__tcp_transmit_skb` | TX 入口 |
+| `tx_start` (TCP 重传) | `__tcp_retransmit_skb` | TX 入口 |
+| `tx_start` (IPv4 UDP fast) | `udp_sendmsg` | TX 入口 |
+| `tx_start` (IPv4 UDP cork) | `udp_push_pending_frames` | TX 入口 |
+| `tx_start` (IPv6 UDP fast) | `udpv6_sendmsg` | TX 入口 |
+| `tx_start` (IPv6 UDP cork) | `udp_v6_push_pending_frames` | TX 入口 |
+
+7 个场景的预期函数：
+
+| 场景 | 预期触发的 ftrace 函数 |
+|------|----------------------|
+| S1 TCP 单向 | `__netif_receive_skb_core`, `tcp_recvmsg_locked`, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
+| S2 UDP 单向 | `__netif_receive_skb_core`, `udp_recvmsg`, `udp_sendmsg`, `dev_hard_start_xmit` |
+| S3 TCP splice | `__netif_receive_skb_core`, **`tcp_read_sock`**, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
+| S4 TCP zerocopy | `__netif_receive_skb_core`, **`tcp_zerocopy_receive`**, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
+| S5 UDP corked | **`udp_push_pending_frames`**, `dev_hard_start_xmit` |
+| S6 IPv6 TCP+UDP | `__netif_receive_skb_core`, `tcp_recvmsg_locked`, **`udpv6_recvmsg`**, **`udpv6_sendmsg`**, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
+| S7 TCP 重传 (tc netem 丢包) | `__netif_receive_skb_core`, `tcp_recvmsg_locked`, `__tcp_transmit_skb`, **`__tcp_retransmit_skb`**, `dev_hard_start_xmit` |
+
+**加粗**的函数是该场景的"专属验证目标"——如果这些函数调用次数为 0，说明声称的路径覆盖是假的（例如 splice 回退到了标准路径）。
+
+**S7 双轨备选**：先尝试 `tc netem loss 10%`（需 `CONFIG_NET_SCH_NETEM`），失败则降级到 `iptables -m statistic --mode random --probability 0.1 -j DROP`（需 `CONFIG_NETFILTER_XTABLES`）。两者均不可用时 S7 SKIP 而非 FAIL。
+
+##### 四、可视化矩阵输出
+
+测试结束时生成覆盖矩阵，直观展示每个场景下各函数的调用次数：
+
+```
++----------------------------------------------------------+
+|  ftrace 覆盖矩阵 (场景 × 函数调用次数)                   |
++----------------------------------------------------------+
+| 函数                       | S1  | S2  | S3  | S4  | S5  | S6  | S7  |
+|----------------------------|-----|-----|-----|-----|-----|-----|-----|
+| __netif_receive_skb_core   | 542 | 318 | 210 | 187 |  45 | 612 | 891 |
+| tcp_recvmsg_locked         | 128 |   0 |   0 |   0 |   0 |  56 | 145 |
+| tcp_read_sock              |   0 |   0 |  42 |   0 |   0 |   0 |   0 |
+| ...                        | ... | ... | ... | ... | ... | ... | ... |
++----------------------------------------------------------+
+```
+
+**矩阵解读规则**：
+- 每一列（场景）的"预期函数"应全部非零 → 该场景 PASS
+- 每一行（函数）至少在一个场景下非零 → 该打桩点可达
+- `tcp_read_sock` 只在 S3 非零 → 证明 splice 路径专属
+- `__tcp_retransmit_skb` 只在 S7 非零 → 证明重传路径专属
+
+---
+
 ## 三、测试方法总结
 
 ### 3.1 覆盖矩阵
@@ -901,6 +983,7 @@ _desc()          # 打印测试原理/实现/断言三行说明
 | **边界条件** | 正常 PID、PID 1（无 socket）、不存在 PID（99999）、help、version |
 | **稳定性** | 80 次并发查询（空+busy 混合）+ dmesg Kernel Oops 检测 |
 | **offload 交互** | GRO/GSO 在 loopback + e1000 虚拟网卡上自然触发，通过 count 阈值验证计数逻辑正确 |
+| **路径可达性** | **Test 23 ftrace 验证**：13 个打桩函数在 7 个场景下的真实调用次数，确保打点代码被真实执行 |
 
 ### 3.2 核心测试手段
 

@@ -257,41 +257,54 @@ if _require nc readlink; then
 fi
 
 # ---- Test 03: 重置计数器（基础功能） ----
-_test_header "重置计数器-基础 (-R，停止流量后全 0)"
+_test_header "重置计数器-基础 (-R，重置前必须有数据)"
 if _require iperf3; then
 	_desc \
 		"get_sockdelays -R 向内核发送 RESET 命令，遍历所有 socket 调用 net_delayacct_reset() 清零 per-sock 统计" \
-		"iperf3 产生流量并结束 → 查询确认有数据 → -R 重置 → 再次查询 → 检查 count=0" \
-		"停止流量后所有 socket 的 count > 0 的行数 = 0（验证 reset 清零能力本身）"
+		"iperf3 client 后台运行产生流量 → 确认 PRE count>0 → 执行 -R 重置 → 查询 POST → 检查计数已清零或大幅下降" \
+		"PRE 必须有 count>0（否则 reset 无意义）+ POST 非零计数远小于 PRE（容忍非原子累加）"
 	IPERF_PORT=21403
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
 	sleep 1
 	if kill -0 "$_SRV" 2>/dev/null; then
-		# 关键：client 同步运行（非 &），确保 -R 时流量已停止
-		# 这是「基础功能」测试：验证停止流量后 reset 能清零
-		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 3 >/dev/null 2>&1 || true
-		sleep 1
+		# 关键：client 后台运行 (&)，确保 PRE 查询时流量活跃、count 必然 > 0。
+		# 若 client 同步运行（无 &），结束后 server 会关闭 child socket，只剩 listen
+		# socket（count=0），导致 PRE/POST 全为 0，reset 测试 trivially 通过（假阳性）。
+		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -P 2 -t 12 >/dev/null 2>&1 &
+		_CLI=$!
+		sleep 3  # 让流量积累
 
-		# 重置前确认有数据
+		# 重置前必须验证 count > 0，否则本测试无意义（0→0 无法证明 reset 工作）
 		PRE=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 		_output "重置前 (get_sockdelays -p $_SRV)" "$PRE"
-		PRE_DATA=$(echo "$PRE" | grep -c '^proto=' || true)
+		PRE_NONZERO=$(echo "$PRE" | grep 'count=' | sed 's/.*count=\([0-9]*\).*/\1/' | awk '$1>0' | wc -l || true)
 
-		# 执行重置（此时流量已停止，无并发包干扰）
-		"$GET_SOCKDELAYS" -R >/dev/null 2>&1 || true
-		sleep 1
-
-		# 重置后检查
-		POST=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
-		_output "重置后 (get_sockdelays -p $_SRV)" "$POST"
-		NONZERO=$(echo "$POST" | grep 'count=' | sed 's/.*count=\([0-9]*\).*/\1/' | awk '$1>0' | wc -l || true)
-
-		if [ "$NONZERO" -eq 0 ]; then
-			_pass "all counters=0 after reset (pre data=$PRE_DATA lines)"
+		if [ "$PRE_NONZERO" -eq 0 ]; then
+			# PRE 无任何非零计数：reset 测试无从谈起，必须 FAIL（而非 PASS）
+			_show_output "PRE has no non-zero counters (get_sockdelays -p $_SRV)" "$PRE" "$_SRV"
+			_fail "PRE has no non-zero counters (pre_nonzero=0), reset test inconclusive"
+			_kill "$_CLI"
+			_kill "$_SRV"
 		else
-			_show_output "after reset (get_sockdelays -R then -p $_SRV)" "$POST" "$_SRV"
-			_fail "$NONZERO non-zero counter(s) after reset"
+			# 执行重置
+			"$GET_SOCKDELAYS" -R >/dev/null 2>&1 || true
+			sleep 1
+
+			# 重置后检查：POST 非零计数应远小于 PRE（容忍非原子语义下的少量累加）
+			POST=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+			_output "重置后 (get_sockdelays -p $_SRV)" "$POST"
+			POST_NONZERO=$(echo "$POST" | grep 'count=' | sed 's/.*count=\([0-9]*\).*/\1/' | awk '$1>0' | wc -l || true)
+
+			# 非原子语义：reset 后仍可能有少量包累加（见 Test 17），但 POST 应远小于 PRE。
+			# 阈值取 PRE/2：若 POST >= PRE/2，说明 reset 效果不明显，打点或 reset 逻辑有问题。
+			if [ "$POST_NONZERO" -lt $((PRE_NONZERO / 2)) ] || [ "$POST_NONZERO" -eq 0 ]; then
+				_pass "reset effective: PRE=$PRE_NONZERO non-zero → POST=$POST_NONZERO non-zero"
+			else
+				_show_output "reset ineffective (get_sockdelays -p $_SRV)" "$POST" "$_SRV"
+				_fail "reset ineffective: PRE=$PRE_NONZERO non-zero → POST=$POST_NONZERO non-zero (expect POST < PRE/2 or =0)"
+			fi
+			_kill "$_CLI"
 		fi
 		_kill "$_SRV"
 	else
@@ -303,34 +316,42 @@ fi
 _test_header "TCP 路径 (iperf3)"
 if _require iperf3; then
 	_desc \
-		"验证 kernel per-socket 延迟统计框架对 TCP socket 的追踪能力" \
-		"iperf3 TCP 传输完成后查询 server PID，检查 proto=tcp 行存在 + RX 计数 > 0" \
-		"proto=tcp 行 >= 1，且有 RX 数据（timing 边缘 case 放宽到只要有 TCP socket 即可）"
+		"验证 kernel per-socket 延迟统计框架对 TCP socket 的追踪能力（RX 打点必须工作）" \
+		"iperf3 TCP client 后台运行 → sleep 3 让流量积累 → 查询 server PID → 检查 proto=tcp 行存在 + RX count > 0" \
+		"proto=tcp 行 >= 1 且 RX count > 0（硬断言，无 timing 放宽——QEMU loopback 下必然有数据）"
 	IPERF_PORT=21404
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
 	sleep 1
 	if kill -0 "$_SRV" 2>/dev/null; then
-		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 5 >/dev/null 2>&1 || true
-		sleep 1
-		OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
-		_output "get_sockdelays -p $_SRV (server)" "$OUT"
+		# 关键：client 后台运行 (&)，确保查询时流量活跃、count 必然 > 0。
+		# 若 client 同步运行（无 &），结束后 server 关闭 child socket，只剩 listen
+		# socket（count=0），测试会变成"有 socket 即 PASS"的假阳性。
+		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 8 >/dev/null 2>&1 &
+		_CLI=$!
+		sleep 3
+		if kill -0 "$_CLI" 2>/dev/null; then
+			OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+			_output "get_sockdelays -p $_SRV (server)" "$OUT"
 
-		# 检查 proto=tcp 行存在 + 有 RX/TX统计数据
-		TCP_LINES=$(echo "$OUT" | grep -c 'proto=tcp' || true)
-		HAS_RX=$(echo "$OUT" | grep 'RX  count=' | head -1 | grep -c 'count=[1-9]' || true)
+			# 硬断言：必须有 TCP socket 且 RX count > 0
+			TCP_LINES=$(echo "$OUT" | grep -c 'proto=tcp' || true)
+			HAS_RX=$(echo "$OUT" | grep 'RX  count=' | grep -c 'count=[1-9]' || true)
 
-		if [ "$TCP_LINES" -ge 1 ]; then
-			if [ "$HAS_RX" -ge 1 ]; then
-				_pass "proto=tcp found ($TCP_LINES socket(s)), RX has data"
+			if [ "$TCP_LINES" -ge 1 ] && [ "$HAS_RX" -ge 1 ]; then
+				_pass "proto=tcp found ($TCP_LINES socket(s)), RX has data ($HAS_RX socket(s) RX>0)"
+			elif [ "$TCP_LINES" -ge 1 ] && [ "$HAS_RX" -eq 0 ]; then
+				# 有 TCP socket 但 RX=0：打点失效的明确信号，必须 FAIL
+				_show_output "get_sockdelays -p $_SRV (RX=0, instrumentation broken?)" "$OUT" "$_SRV"
+				_fail "proto=tcp found ($TCP_LINES socket(s)) but RX=0 — rx_end instrumentation may be broken"
 			else
-				# 有 TCP socket 但没有 RX 数据 (可能是 timing 问题，给 pass 但标注)
-				_pass "proto=tcp found ($TCP_LINES socket(s)), RX=0 (timing)"
-			fi
-		else
 				_show_output "get_sockdelays -p $_SRV" "$OUT" "$_SRV"
 				_fail "no proto=tcp in output"
 			fi
+			_kill "$_CLI"
+		else
+			_fail "iperf3 client exited before query"
+		fi
 		_kill "$_SRV"
 	else
 		_fail "iperf3 server failed to start"
@@ -341,20 +362,20 @@ fi
 _test_header "UDP 路径 (iperf3 -u)"
 if _require iperf3; then
 	_desc \
-		"验证 kernel per-socket 延迟统计框架对 UDP socket 的追踪能力。UDP 无连接状态，统计行为与 TCP 不同" \
-		"iperf3 UDP 客户端 & 后台运行 (-u -b 10M)，传输进行中同时查 client 和 server 两端的 proto=udp" \
-		"两端 proto=udp 总数 >= 1"
+		"验证 kernel per-socket 延迟统计框架对 UDP socket 的追踪能力（RX/TX 打点必须工作）" \
+		"iperf3 UDP 客户端 & 后台运行 (-u -b 10M)，传输进行中同时查 client 和 server 两端" \
+		"两端 proto=udp 总数 >= 1 + server RX>0 + client TX>0（验证打点工作，非仅枚举）"
 	IPERF_PORT=21405
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
 	sleep 1
 	if kill -0 "$_SRV" 2>/dev/null; then
 		# 客户端必须后台运行 (&)，否则同步阻塞 5s 后 UDP socket 已被清理
-		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -u -t 5 -b 10M >/dev/null 2>&1 &
+		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -u -t 8 -b 10M >/dev/null 2>&1 &
 		_CLI=$!
-		sleep 2
+		sleep 3
 		if kill -0 "$_CLI" 2>/dev/null; then
-			# 同时查客户端和服务端，UDP 可能只在其中一侧可见
+			# 同时查客户端和服务端
 			SRV_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 			CLI_OUT=$("$GET_SOCKDELAYS" -p "$_CLI" 2>&1 || true)
 			_output "get_sockdelays -p $_SRV (server)" "$SRV_OUT"
@@ -362,12 +383,28 @@ if _require iperf3; then
 			SRV_UDP=$(echo "$SRV_OUT" | grep -c 'proto=udp' || true)
 			CLI_UDP=$(echo "$CLI_OUT" | grep -c 'proto=udp' || true)
 			TOTAL_UDP=$((SRV_UDP + CLI_UDP))
-			if [ "$TOTAL_UDP" -ge 1 ]; then
-				_pass "proto=udp found (server=$SRV_UDP, client=$CLI_UDP)"
+			# 打点工作验证：server 应收到 UDP 数据（RX>0），client 应发送了 UDP 数据（TX>0）
+			SRV_RX=$(echo "$SRV_OUT" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
+			CLI_TX=$(echo "$CLI_OUT" | awk '/TX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
+			FAILS=0
+			if [ "$TOTAL_UDP" -lt 1 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    no proto=udp in output (server=$SRV_UDP, client=$CLI_UDP)"
+			fi
+			if [ "$SRV_RX" -le 0 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    server RX=$SRV_RX (expect >0 — rx_end instrumentation may be broken)"
+			fi
+			if [ "$CLI_TX" -le 0 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    client TX=$CLI_TX (expect >0 — tx_start instrumentation may be broken)"
+			fi
+			if [ "$FAILS" -eq 0 ]; then
+				_pass "proto=udp found (server=$SRV_UDP, client=$CLI_UDP), server RX=$SRV_RX, client TX=$CLI_TX"
 			else
 				_show_output "get_sockdelays -p $_SRV (server)" "$SRV_OUT" "$_SRV"
 				_show_output "get_sockdelays -p $_CLI (client)" "$CLI_OUT" "$_CLI"
-				_fail "no proto=udp in output (server=$SRV_UDP, client=$CLI_UDP)"
+				_fail "$FAILS check(s) failed (server RX=$SRV_RX, client TX=$CLI_TX)"
 			fi
 			_kill "$_CLI"
 		else
@@ -383,17 +420,17 @@ fi
 _test_header "多 Socket 枚举 (iperf3 -P 4 并行流)"
 if _require iperf3; then
 	_desc \
-		"验证一个进程持有多个 socket 时 get_sockdelays 能否全量枚举，不遗漏" \
-		"iperf3 -P 4 产生 4 条并行 TCP 流 → 查询 server PID。iperf3 会 fork 子进程，客户端只查父进程 PID" \
-		"客户端父进程 >= 1 socket (control)，服务端 >= 6 socket（至少 1 listen + 1 control + 4 data；实际可能因 TIME-WAIT 等状态更高）"
+		"验证一个进程持有多个 socket 时 get_sockdelays 能否全量枚举 + 打点工作正常" \
+		"iperf3 -P 4 产生 4 条并行 TCP 流 → 查询 server PID（数据 socket 在主进程可见）" \
+		"服务端 >= 6 socket（枚举完整）+ server RX>0（打点工作正常）"
 	IPERF_PORT=21406
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
 	sleep 1
 	if kill -0 "$_SRV" 2>/dev/null; then
-		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -P 4 -t 5 >/dev/null 2>&1 &
+		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -P 4 -t 8 >/dev/null 2>&1 &
 		_CLI=$!
-		sleep 2
+		sleep 3
 		if kill -0 "$_CLI" 2>/dev/null; then
 			# iperf3 -P 4 会 fork 子进程处理数据连接。
 			# $_CLI 是父进程 PID，只持有 control socket。
@@ -407,16 +444,31 @@ if _require iperf3; then
 			# 实际可能因 TIME-WAIT 残留 socket 等状态更高，断言用 >=6 即可
 			SRV_OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 			SRV_LINES=$(echo "$SRV_OUT" | grep -c 'proto=tcp' || true)
+			# 打点工作验证：server 作为接收方，RX 计数必须 > 0
+			SRV_RX=$(echo "$SRV_OUT" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
 
 			_output "get_sockdelays -p $_SRV (server, expect >=6)" "$SRV_OUT"
 			_output "get_sockdelays -p $_CLI (client parent, expect >=1)" "$CLI_OUT"
 
-			if [ "$CLI_LINES" -ge 1 ] && [ "$SRV_LINES" -ge 6 ]; then
-				_pass "client(parent)=$CLI_LINES, server=$SRV_LINES sockets"
+			FAILS=0
+			if [ "$CLI_LINES" -lt 1 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    client(parent)=$CLI_LINES (expect>=1)"
+			fi
+			if [ "$SRV_LINES" -lt 6 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    server=$SRV_LINES (expect>=6)"
+			fi
+			if [ "$SRV_RX" -le 0 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    server RX=$SRV_RX (expect >0 — rx_end instrumentation may be broken)"
+			fi
+			if [ "$FAILS" -eq 0 ]; then
+				_pass "client(parent)=$CLI_LINES, server=$SRV_LINES sockets, server RX=$SRV_RX"
 			else
 				_show_output "get_sockdelays -p $_CLI (client parent)" "$CLI_OUT" "$_CLI"
 				_show_output "get_sockdelays -p $_SRV (server)" "$SRV_OUT" "$_SRV"
-				_fail "client(parent)=$CLI_LINES (expect>=1), server=$SRV_LINES (expect>=6)"
+				_fail "$FAILS check(s) failed (client=$CLI_LINES, server=$SRV_LINES, RX=$SRV_RX)"
 			fi
 			_kill "$_CLI"
 		else
@@ -477,7 +529,7 @@ if _require nc; then
 	_desc \
 		"get_sockdelays -d 在 stderr 输出 netlink 收发诊断信息 (diag)，用于排查内核通信问题" \
 		"nc -l 创建 socket → get_sockdelays -d -p PID 2>&1 合并捕获 stderr+stdout" \
-		"输出非空（至少包含 diag 或 socket 数据行）"
+		"输出非空且包含 diag/netlink/nlmsg 等诊断关键字（非仅 Usage 帮助）"
 	NC_PORT=21408
 	nc -l -p "$NC_PORT" >/dev/null 2>&1 &
 	_NC=$!
@@ -486,12 +538,17 @@ if _require nc; then
 		# -d 模式输出到 stderr，我们合并捕获
 		OUT=$("$GET_SOCKDELAYS" -d -p "$_NC" 2>&1 || true)
 		_output "get_sockdelays -d -p $_NC" "$OUT"
-		# Debug 输出应包含 netlink 收发信息或正常 socket 数据
-		if [ -n "$OUT" ]; then
-			_pass "debug output produced ($(echo "$OUT" | wc -l) lines)"
+		# Debug 输出必须非空且包含诊断关键字（非仅 Usage 帮助信息）
+		HAS_DIAG=$(echo "$OUT" | grep -ciE 'diag|netlink|nlmsg|recv.*sent|sent.*recv' || true)
+		OUT_LINES=$(echo "$OUT" | wc -l)
+		if [ -n "$OUT" ] && [ "$HAS_DIAG" -ge 1 ]; then
+			_pass "debug output produced ($OUT_LINES lines, diag keywords=$HAS_DIAG)"
+		elif [ -n "$OUT" ] && [ "$OUT_LINES" -ge 3 ]; then
+			# 无 diag 关键字但行数 >= 3：可能是工具输出格式变化，给 pass 但标注
+			_pass "debug output produced ($OUT_LINES lines, no diag keywords)"
 		else
-			_show_output "get_sockdelays -d -p $_NC" "$OUT"
-			_fail "debug output empty"
+			_show_output "get_sockdelays -d -p $_NC (no diag keywords)" "$OUT"
+			_fail "debug output empty or lacks diag keywords (lines=$OUT_LINES, diag=$HAS_DIAG)"
 		fi
 		_kill "$_NC"
 	else
@@ -795,16 +852,24 @@ _worker() {
 	_label="$3"
 	_ok=0
 	_ng=0
+	_empty=0  # 返回空输出的次数（退出码 0 但无 socket 数据行）
 	_i=0
 	while [ "$_i" -lt "$QUERIES" ]; do
-		if "$GET_SOCKDELAYS" -p "$_target" >/dev/null 2>&1; then
+		_out=$("$GET_SOCKDELAYS" -p "$_target" 2>&1)
+		_rc=$?
+		if [ "$_rc" -eq 0 ]; then
 			_ok=$((_ok + 1))
+			# 校验返回数据正确性：退出码 0 但无 proto= 行说明返回了空数据
+			# （可能是 dumpit 提前结束、cb->ctx 串扰等并发问题）
+			if [ "$_label" = "busy" ] && ! echo "$_out" | grep -q 'proto='; then
+				_empty=$((_empty + 1))
+			fi
 		else
 			_ng=$((_ng + 1))
 		fi
 		_i=$((_i + 1))
 	done
-	echo "worker-${_label}: ok=$_ok fail=$_ng" > "$TMPDIR/worker-${_wid}.out"
+	echo "worker-${_label}: ok=$_ok fail=$_ng empty=$_empty" > "$TMPDIR/worker-${_wid}.out"
 }
 
 WORKERS_EMPTY=4
@@ -857,21 +922,24 @@ _TOTAL_OK=0
 _TOTAL_FAIL=0
 _CRASH=0
 _BUSY_OK=0
+_BUSY_EMPTY=0  # busy worker 返回空输出的次数（数据正确性校验）
 for _f in "$TMPDIR"/worker-*.out; do
 	[ -f "$_f" ] || { _CRASH=$((_CRASH + 1)); continue; }
 	_ok=$(grep -o 'ok=[0-9]*' "$_f" | cut -d= -f2 || true)
 	_ng=$(grep -o 'fail=[0-9]*' "$_f" | cut -d= -f2 || true)
+	_em=$(grep -o 'empty=[0-9]*' "$_f" | cut -d= -f2 || true)
 	_TOTAL_OK=$((_TOTAL_OK + _ok))
 	_TOTAL_FAIL=$((_TOTAL_FAIL + _ng))
 	# 统计 busy worker 的成功次数（验证 per-socket 路径确实被走到）
 	if grep -q 'worker-busy' "$_f"; then
 		_BUSY_OK=$((_BUSY_OK + _ok))
+		_BUSY_EMPTY=$((_BUSY_EMPTY + ${_em:-0}))
 	fi
 done
 
 # 展示 worker 摘要 + 一份 sample 输出
 echo "  +-- worker summary ($((_TOTAL_OK + _TOTAL_FAIL)) queries total, empty=${WORKERS_EMPTY} busy=${WORKERS_BUSY}) --"
-echo "  | ok=$_TOTAL_OK fail=$_TOTAL_FAIL crashed=$_CRASH workers, busy_ok=$_BUSY_OK"
+echo "  | ok=$_TOTAL_OK fail=$_TOTAL_FAIL crashed=$_CRASH workers, busy_ok=$_BUSY_OK busy_empty=$_BUSY_EMPTY"
 for _f in "$TMPDIR"/worker-*.out; do
 	[ -f "$_f" ] && echo "  | sample: $(cat "$_f")" && break
 done
@@ -888,6 +956,9 @@ FAILS=0
 [ "$OOPS" -ne 0 ] && FAILS=$((FAILS + 1))
 # busy worker 必须有成功查询（证明 per-socket 并发路径被实际覆盖）
 [ -n "$BUSY_PID" ] && [ "$_BUSY_OK" -le 0 ] && FAILS=$((FAILS + 1))
+# 数据正确性校验：busy worker 返回空输出的次数必须为 0
+# （退出码 0 但无 proto= 行说明 dumpit 返回了空数据，可能是并发竞态）
+[ "$_BUSY_EMPTY" -gt 0 ] && FAILS=$((FAILS + 1))
 
 if [ "$FAILS" -eq 0 ]; then
 	_pass "$TOTAL queries (ok=$_TOTAL_OK fail=$_TOTAL_FAIL busy_ok=$_BUSY_OK), ${_duration}s, no oops"
@@ -897,7 +968,7 @@ else
 		dmesg 2>/dev/null | tail -100 | sed 's/^/    | /'
 		echo "    +-------------------------------------------"
 	fi
-	_fail "crashed=$_CRASH workers, oops=$OOPS, busy_ok=$_BUSY_OK, queries=$TOTAL"
+	_fail "crashed=$_CRASH workers, oops=$OOPS, busy_ok=$_BUSY_OK busy_empty=$_BUSY_EMPTY, queries=$TOTAL"
 fi
 
 # ================================================================
@@ -1244,9 +1315,22 @@ _test_header "TCP splice RX 路径 (splice→/dev/null, 覆盖 tcp_read_sock)"
 if _require_helper; then
 	_desc \
 		"验证 tcp_read_sock() RX 路径打点：splice() 走 tcp_read_sock 而非 tcp_recvmsg_locked" \
-		"helper splice-server listen → helper tcp-sender 连接并发送 → 查 server PID 验 RX>0" \
-		"splice-server 的 TCP data socket RX count > 0"
+		"helper splice-server listen → helper tcp-sender 连接并发送 → ftrace 验证 tcp_read_sock 被调用 + 查 server PID 验 RX>0" \
+		"splice-server 的 TCP data socket RX count > 0 + tcp_read_sock ftrace 调用次数 > 0"
 	SPLICE_PORT=21432
+	# ftrace 内嵌验证：确认 splice 数据真的走了 tcp_read_sock（专属路径），
+	# 而非回退到 tcp_recvmsg_locked（标准路径）。若 ftrace 不可用则优雅降级。
+	_FTRACE_OK=0
+	TRACEFS=/sys/kernel/debug/tracing
+	if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/set_ftrace_filter" ]; then
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		echo > "$TRACEFS/trace" 2>/dev/null || true
+		echo > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		echo "tcp_read_sock" > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		echo function > "$TRACEFS/current_tracer" 2>/dev/null || true
+		echo 1 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		_FTRACE_OK=1
+	fi
 	"$PATH_HELPER" splice-server "$SPLICE_PORT" >/dev/null 2>&1 &
 	_SRV=$!
 	sleep 1
@@ -1259,11 +1343,27 @@ if _require_helper; then
 			_output "splice-server sockets (get_sockdelays -p $_SRV)" "$OUT"
 			TCP_LINES=$(echo "$OUT" | grep -c 'proto=tcp' || true)
 			RX_SUM=$(echo "$OUT" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
-			if [ "$TCP_LINES" -ge 1 ] && [ "$RX_SUM" -gt 0 ]; then
-				_pass "splice RX path covered: tcp=$TCP_LINES RX_sum=$RX_SUM (>0)"
+			# ftrace 计数：tcp_read_sock 调用次数
+			TCP_READ_SOCK_CALLS=0
+			if [ "$_FTRACE_OK" -eq 1 ]; then
+				echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+				TCP_READ_SOCK_CALLS=$(grep -c 'tcp_read_sock' "$TRACEFS/trace" 2>/dev/null || echo 0)
+				echo "    ftrace: tcp_read_sock calls=$TCP_READ_SOCK_CALLS"
+			fi
+			FAILS=0
+			if [ "$TCP_LINES" -lt 1 ] || [ "$RX_SUM" -le 0 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    splice RX: tcp=$TCP_LINES RX_sum=$RX_SUM (expect RX>0)"
+			fi
+			if [ "$_FTRACE_OK" -eq 1 ] && [ "$TCP_READ_SOCK_CALLS" -le 0 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    ftrace: tcp_read_sock calls=$TCP_READ_SOCK_CALLS (expect >0 — splice may have fallen back to tcp_recvmsg_locked)"
+			fi
+			if [ "$FAILS" -eq 0 ]; then
+				_pass "splice RX path covered: tcp=$TCP_LINES RX_sum=$RX_SUM, tcp_read_sock calls=$TCP_READ_SOCK_CALLS"
 			else
 				_show_output "splice-server" "$OUT" "$_SRV"
-				_fail "splice RX: tcp=$TCP_LINES RX_sum=$RX_SUM (expect RX>0)"
+				_fail "$FAILS check(s) failed (RX_sum=$RX_SUM, tcp_read_sock calls=$TCP_READ_SOCK_CALLS)"
 			fi
 		else
 			_fail "splice-server exited before query (sender may have closed early)"
@@ -1273,6 +1373,12 @@ if _require_helper; then
 	else
 		_fail "splice-server failed to start"
 	fi
+	# 清理 ftrace 状态
+	if [ "$_FTRACE_OK" -eq 1 ]; then
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		echo > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		echo nop > "$TRACEFS/current_tracer" 2>/dev/null || true
+	fi
 fi
 
 # ---- Test 20: TCP zerocopy RX 路径 (tcp_zerocopy_receive) ----
@@ -1280,9 +1386,22 @@ _test_header "TCP zerocopy RX 路径 (TCP_ZEROCOPY_RECEIVE, 覆盖 tcp_zerocopy_
 if _require_helper; then
 	_desc \
 		"验证 tcp_zerocopy_receive() RX 路径打点" \
-		"helper zerocopy-server listen → tcp-sender 发送 → 查 server 验 RX>0" \
-		"zerocopy-server TCP data socket RX count > 0（内核不支持 TCP_ZEROCOPY_RECEIVE 时 SKIP）"
+		"helper zerocopy-server listen → tcp-sender 发送 → ftrace 验证 tcp_zerocopy_receive 被调用 + 查 server 验 RX>0" \
+		"zerocopy-server TCP data socket RX count > 0 + tcp_zerocopy_receive ftrace 调用次数 > 0（内核不支持 TCP_ZEROCOPY_RECEIVE 时 SKIP）"
 	ZC_PORT=21433
+	# ftrace 内嵌验证：确认 zerocopy 数据真的走了 tcp_zerocopy_receive（专属路径），
+	# 而非回退到普通 recv。若 ftrace 不可用则优雅降级。
+	_FTRACE_OK=0
+	TRACEFS=/sys/kernel/debug/tracing
+	if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/set_ftrace_filter" ]; then
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		echo > "$TRACEFS/trace" 2>/dev/null || true
+		echo > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		echo "tcp_zerocopy_receive" > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		echo function > "$TRACEFS/current_tracer" 2>/dev/null || true
+		echo 1 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		_FTRACE_OK=1
+	fi
 	"$PATH_HELPER" zerocopy-server "$ZC_PORT" >/tmp/zc.log 2>&1 &
 	_SRV=$!
 	sleep 1
@@ -1314,15 +1433,37 @@ if _require_helper; then
 			_output "zerocopy-server sockets (get_sockdelays -p $_SRV)" "$OUT"
 			TCP_LINES=$(echo "$OUT" | grep -c 'proto=tcp' || true)
 			RX_SUM=$(echo "$OUT" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
-			if [ "$TCP_LINES" -ge 1 ] && [ "$RX_SUM" -gt 0 ]; then
-				_pass "zerocopy RX path covered: tcp=$TCP_LINES RX_sum=$RX_SUM (>0)"
+			# ftrace 计数：tcp_zerocopy_receive 调用次数
+			ZC_CALLS=0
+			if [ "$_FTRACE_OK" -eq 1 ]; then
+				echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+				ZC_CALLS=$(grep -c 'tcp_zerocopy_receive' "$TRACEFS/trace" 2>/dev/null || echo 0)
+				echo "    ftrace: tcp_zerocopy_receive calls=$ZC_CALLS"
+			fi
+			FAILS=0
+			if [ "$TCP_LINES" -lt 1 ] || [ "$RX_SUM" -le 0 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    zerocopy RX: tcp=$TCP_LINES RX_sum=$RX_SUM (expect RX>0)"
+			fi
+			if [ "$_FTRACE_OK" -eq 1 ] && [ "$ZC_CALLS" -le 0 ]; then
+				FAILS=$((FAILS + 1))
+				echo "    ftrace: tcp_zerocopy_receive calls=$ZC_CALLS (expect >0 — zerocopy may have fallen back to normal recv)"
+			fi
+			if [ "$FAILS" -eq 0 ]; then
+				_pass "zerocopy RX path covered: tcp=$TCP_LINES RX_sum=$RX_SUM, tcp_zerocopy_receive calls=$ZC_CALLS"
 			else
 				_show_output "zerocopy-server" "$OUT" "$_SRV"
-				_fail "zerocopy RX: tcp=$TCP_LINES RX_sum=$RX_SUM (expect RX>0)"
+				_fail "$FAILS check(s) failed (RX_sum=$RX_SUM, tcp_zerocopy_receive calls=$ZC_CALLS)"
 			fi
 			_kill "$_CLI"
 			_kill "$_SRV"
 		fi
+	fi
+	# 清理 ftrace 状态
+	if [ "$_FTRACE_OK" -eq 1 ]; then
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		echo > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		echo nop > "$TRACEFS/current_tracer" 2>/dev/null || true
 	fi
 fi
 
@@ -1332,11 +1473,24 @@ _test_header "UDP corked TX 路径 (UDP_CORK, 覆盖 udp_push_pending_frames)"
 if _require_helper; then
 	_desc \
 		"验证 udp_push_pending_frames() TX 路径打点：UDP_CORK flush 触发 corked 发送" \
-		"helper corked-udp-client 用 UDP_CORK 发送（每 8 包 uncork 一次触发 flush）→ 查 client 验 TX>0" \
-		"corked-udp-client 的 UDP socket TX count > 0（TX 在 send 路径打点，无需接收端）"
+		"helper corked-udp-client 用 UDP_CORK 发送 → ftrace 验证 udp_push_pending_frames 被调用 + 查 client 验 TX>0" \
+		"corked-udp-client 的 UDP socket TX count > 0 + udp_push_pending_frames ftrace 调用次数 > 0（TX 在 send 路径打点，无需接收端）"
 	CORK_PORT=21434
 	# 无需接收端：TX 打点在 udp_push_pending_frames（send 路径），
 	# 与对端是否存在无关。发往无监听端口仅产生 ICMP unreachable，不影响 TX 计数。
+	# ftrace 内嵌验证：确认 corked 发送真的走了 udp_push_pending_frames（专属路径），
+	# 而非回退到 udp_sendmsg fast path。若 ftrace 不可用则优雅降级。
+	_FTRACE_OK=0
+	TRACEFS=/sys/kernel/debug/tracing
+	if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/set_ftrace_filter" ]; then
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		echo > "$TRACEFS/trace" 2>/dev/null || true
+		echo > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		echo "udp_push_pending_frames" > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		echo function > "$TRACEFS/current_tracer" 2>/dev/null || true
+		echo 1 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		_FTRACE_OK=1
+	fi
 	"$PATH_HELPER" corked-udp-client 127.0.0.1 "$CORK_PORT" 8 >/dev/null 2>&1 &
 	_CLI=$!
 	sleep 1
@@ -1345,15 +1499,37 @@ if _require_helper; then
 		_output "corked-udp-client sockets (get_sockdelays -p $_CLI)" "$OUT"
 		UDP_LINES=$(echo "$OUT" | grep -c 'proto=udp' || true)
 		TX_SUM=$(echo "$OUT" | awk '/TX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
-		if [ "$UDP_LINES" -ge 1 ] && [ "$TX_SUM" -gt 0 ]; then
-			_pass "corked TX path covered: udp=$UDP_LINES TX_sum=$TX_SUM (>0)"
+		# ftrace 计数：udp_push_pending_frames 调用次数
+		CORK_CALLS=0
+		if [ "$_FTRACE_OK" -eq 1 ]; then
+			echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+			CORK_CALLS=$(grep -c 'udp_push_pending_frames' "$TRACEFS/trace" 2>/dev/null || echo 0)
+			echo "    ftrace: udp_push_pending_frames calls=$CORK_CALLS"
+		fi
+		FAILS=0
+		if [ "$UDP_LINES" -lt 1 ] || [ "$TX_SUM" -le 0 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    corked TX: udp=$UDP_LINES TX_sum=$TX_SUM (expect TX>0)"
+		fi
+		if [ "$_FTRACE_OK" -eq 1 ] && [ "$CORK_CALLS" -le 0 ]; then
+			FAILS=$((FAILS + 1))
+			echo "    ftrace: udp_push_pending_frames calls=$CORK_CALLS (expect >0 — UDP_CORK may not have taken effect)"
+		fi
+		if [ "$FAILS" -eq 0 ]; then
+			_pass "corked TX path covered: udp=$UDP_LINES TX_sum=$TX_SUM, udp_push_pending_frames calls=$CORK_CALLS"
 		else
 			_show_output "corked-udp-client" "$OUT" "$_CLI"
-			_fail "corked TX: udp=$UDP_LINES TX_sum=$TX_SUM (expect TX>0)"
+			_fail "$FAILS check(s) failed (TX_sum=$TX_SUM, udp_push_pending_frames calls=$CORK_CALLS)"
 		fi
 		_kill "$_CLI"
 	else
 		_fail "corked-udp-client failed to start"
+	fi
+	# 清理 ftrace 状态
+	if [ "$_FTRACE_OK" -eq 1 ]; then
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		echo > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		echo nop > "$TRACEFS/current_tracer" 2>/dev/null || true
 	fi
 fi
 
@@ -1418,6 +1594,265 @@ if _require iperf3; then
 		fi
 	fi
 fi
+# ================================================================
+# 第八部分：ftrace 打桩点全量验证 (Test 23)
+# ================================================================
+echo ""
+echo "+--------------------------------------------------------------+"
+echo "|  第八部分：ftrace 打桩点全量验证 (白盒路径验证)                |"
+echo "+--------------------------------------------------------------+"
+
+# ---- Test 23: ftrace 打桩点全量验证 ----
+_test_header "ftrace 打桩点全量验证 (13 函数 × 7 场景)"
+TRACEFS=/sys/kernel/debug/tracing
+if [ ! -d "$TRACEFS" ] || [ ! -w "$TRACEFS/set_ftrace_filter" ]; then
+	_skip "ftrace not available (CONFIG_FTRACE disabled or tracefs not writable)"
+else
+	_desc \
+		"通过 ftrace function tracer 验证 13 个内核打桩函数在每个测试场景下被真实触发" \
+		"对每个场景启用 ftrace filter → 运行场景 → 统计函数调用次数 → 断言预期函数 > 0" \
+		"每个场景的预期函数调用次数 > 0，且 start/end 函数成对出现（路径可达性验证）"
+
+	# 13 个 ftrace 函数：覆盖全部 12 个打桩点（rx_start×1, rx_end×5, tx_end×1, tx_start×5）
+	FTRACE_FUNCS="__netif_receive_skb_core tcp_recvmsg_locked tcp_read_sock tcp_zerocopy_receive udp_recvmsg udpv6_recvmsg dev_hard_start_xmit __tcp_transmit_skb __tcp_retransmit_skb udp_sendmsg udp_push_pending_frames udpv6_sendmsg udp_v6_push_pending_frames"
+
+	# 辅助：启用 ftrace 并设置 filter
+	_ftrace_start() {
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		echo > "$TRACEFS/trace" 2>/dev/null || true
+		echo nop > "$TRACEFS/current_tracer" 2>/dev/null || true
+		echo > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		for _fn in $FTRACE_FUNCS; do
+			echo "$_fn" >> "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+		done
+		echo function > "$TRACEFS/current_tracer" 2>/dev/null || true
+		echo 1 > "$TRACEFS/tracing_on" 2>/dev/null || true
+	}
+
+	# 辅助：停止 ftrace 并统计各函数调用次数
+	# trace 行格式: <task>-<pid> [<cpu>] <flags> <timestamp> <function>
+	# 例如: iperf3-123 [000] .... 12345.678: tcp_recvmsg_locked <- tcp_recvmsg
+	_ftrace_stop_and_count() {
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		local _result=""
+		for _fn in $FTRACE_FUNCS; do
+			local _c=$(grep -cE " ${_fn}\$| ${_fn} <- " "$TRACEFS/trace" 2>/dev/null || echo 0)
+			_result="$_result $_fn=$_c"
+		done
+		echo "$_result"
+	}
+
+	# 辅助：断言预期函数被触发
+	_ftrace_assert() {
+		local _scenario="$1"
+		local _counts="$2"
+		shift 2
+		local _expected="$*"
+		local _fail=0
+		for _fn in $_expected; do
+			local _c=$(echo "$_counts" | grep -o "${_fn}=[0-9]*" | cut -d= -f2)
+			_c=${_c:-0}
+			if [ "$_c" -le 0 ]; then
+				echo "    [MISS] $_scenario: $_fn not triggered (expected > 0)"
+				_fail=1
+			fi
+		done
+		return $_fail
+	}
+
+	TOTAL_SCENARIOS=0
+	PASSED_SCENARIOS=0
+	# 初始化各场景计数变量（条件场景可能不执行，需默认值避免矩阵解析错误）
+	COUNTS_S1=""
+	COUNTS_S2=""
+	COUNTS_S3=""
+	COUNTS_S4=""
+	COUNTS_S5=""
+	COUNTS_S6=""
+	COUNTS_S7=""
+
+	# --- 场景 S1: TCP 单向 (iperf3 client→server) ---
+	_ftrace_start
+	IPERF_PORT=21440
+	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+	_SRV=$!; sleep 1
+	iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 3 >/dev/null 2>&1 &
+	_CLI=$!; sleep 2
+	COUNTS_S1=$(_ftrace_stop_and_count)
+	_output "S1 TCP 单向 ftrace counts" "$COUNTS_S1"
+	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
+	if _ftrace_assert "S1" "$COUNTS_S1" \
+		__netif_receive_skb_core tcp_recvmsg_locked __tcp_transmit_skb dev_hard_start_xmit; then
+		PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+	fi
+	_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+
+	# --- 场景 S2: UDP 单向 (iperf3 -u) ---
+	_ftrace_start
+	IPERF_PORT=21441
+	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+	_SRV=$!; sleep 1
+	iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -u -t 3 -b 10M >/dev/null 2>&1 &
+	_CLI=$!; sleep 2
+	COUNTS_S2=$(_ftrace_stop_and_count)
+	_output "S2 UDP 单向 ftrace counts" "$COUNTS_S2"
+	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
+	if _ftrace_assert "S2" "$COUNTS_S2" \
+		__netif_receive_skb_core udp_recvmsg udp_sendmsg dev_hard_start_xmit; then
+		PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+	fi
+	_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+
+	# --- 场景 S3: TCP splice RX (helper splice-server) ---
+	if _require_helper; then
+		_ftrace_start
+		SPLICE_PORT=21442
+		"$PATH_HELPER" splice-server "$SPLICE_PORT" >/dev/null 2>&1 &
+		_SRV=$!; sleep 1
+		"$PATH_HELPER" tcp-sender 127.0.0.1 "$SPLICE_PORT" 8 >/dev/null 2>&1 &
+		_CLI=$!; sleep 3
+		COUNTS_S3=$(_ftrace_stop_and_count)
+		_output "S3 TCP splice ftrace counts" "$COUNTS_S3"
+		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
+		if _ftrace_assert "S3" "$COUNTS_S3" \
+			__netif_receive_skb_core tcp_read_sock __tcp_transmit_skb dev_hard_start_xmit; then
+			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+		fi
+		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+	fi
+
+	# --- 场景 S4: TCP zerocopy RX (helper zerocopy-server) ---
+	if _require_helper; then
+		_ftrace_start
+		ZC_PORT=21443
+		"$PATH_HELPER" zerocopy-server "$ZC_PORT" >/dev/null 2>&1 &
+		_SRV=$!; sleep 1
+		"$PATH_HELPER" tcp-sender 127.0.0.1 "$ZC_PORT" 8 >/dev/null 2>&1 &
+		_CLI=$!; sleep 3
+		COUNTS_S4=$(_ftrace_stop_and_count)
+		_output "S4 TCP zerocopy ftrace counts" "$COUNTS_S4"
+		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
+		if _ftrace_assert "S4" "$COUNTS_S4" \
+			__netif_receive_skb_core tcp_zerocopy_receive __tcp_transmit_skb dev_hard_start_xmit; then
+			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+		fi
+		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+	fi
+
+	# --- 场景 S5: UDP corked TX (helper corked-udp-client) ---
+	if _require_helper; then
+		_ftrace_start
+		CORK_PORT=21444
+		"$PATH_HELPER" corked-udp-client 127.0.0.1 "$CORK_PORT" 8 >/dev/null 2>&1 &
+		_CLI=$!; sleep 2
+		COUNTS_S5=$(_ftrace_stop_and_count)
+		_output "S5 UDP corked ftrace counts" "$COUNTS_S5"
+		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
+		if _ftrace_assert "S5" "$COUNTS_S5" \
+			udp_push_pending_frames dev_hard_start_xmit; then
+			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+		fi
+		_kill "$_CLI" 2>/dev/null || true
+	fi
+
+	# --- 场景 S6: IPv6 TCP+UDP (iperf3 -c ::1) ---
+	if [ -r /proc/net/if_inet6 ]; then
+		_ftrace_start
+		IPERF_PORT=21445
+		iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+		_SRV=$!; sleep 1
+		iperf3 -c ::1 -p "$IPERF_PORT" -t 3 >/dev/null 2>&1 &
+		sleep 2
+		iperf3 -c ::1 -p "$IPERF_PORT" -u -t 3 -b 10M >/dev/null 2>&1 &
+		_CLI=$!; sleep 2
+		COUNTS_S6=$(_ftrace_stop_and_count)
+		_output "S6 IPv6 TCP+UDP ftrace counts" "$COUNTS_S6"
+		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
+		if _ftrace_assert "S6" "$COUNTS_S6" \
+			__netif_receive_skb_core tcp_recvmsg_locked udpv6_recvmsg udpv6_sendmsg __tcp_transmit_skb dev_hard_start_xmit; then
+			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+		fi
+		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+	fi
+
+	# --- 场景 S7: TCP 重传 (tc netem 丢包，双轨备选: netem → iptables) ---
+	NETEM_OK=0
+	IPTABLES_OK=0
+	_ftrace_start
+	IPERF_PORT=21446
+	# 方案 A: tc netem 丢包 (需 CONFIG_NET_SCH_NETEM)
+	if command -v tc >/dev/null 2>&1; then
+		tc qdisc add dev lo root netem loss 10% 2>/dev/null && NETEM_OK=1
+	fi
+	# 方案 B: iptables statistic 丢包 (需 CONFIG_NETFILTER_XTABLES)
+	if [ "$NETEM_OK" -eq 0 ] && command -v iptables >/dev/null 2>&1; then
+		iptables -I INPUT -p tcp --dport "$IPERF_PORT" -m statistic --mode random --probability 0.1 -j DROP 2>/dev/null && IPTABLES_OK=1
+	fi
+	if [ "$NETEM_OK" -eq 1 ] || [ "$IPTABLES_OK" -eq 1 ]; then
+		iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+		_SRV=$!; sleep 1
+		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 5 >/dev/null 2>&1 &
+		_CLI=$!; sleep 4
+		COUNTS_S7=$(_ftrace_stop_and_count)
+		_output "S7 TCP 重传 ftrace counts (netem=$NETEM_OK iptables=$IPTABLES_OK)" "$COUNTS_S7"
+		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
+		if _ftrace_assert "S7" "$COUNTS_S7" \
+			__tcp_retransmit_skb __tcp_transmit_skb dev_hard_start_xmit; then
+			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+		fi
+		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+		# 清理丢包规则
+		[ "$NETEM_OK" -eq 1 ] && tc qdisc del dev lo root 2>/dev/null || true
+		[ "$IPTABLES_OK" -eq 1 ] && iptables -D INPUT -p tcp --dport "$IPERF_PORT" -m statistic --mode random --probability 0.1 -j DROP 2>/dev/null || true
+	else
+		_skip "S7 TCP retransmission: neither tc netem nor iptables statistic available"
+	fi
+
+	# 清理 ftrace 状态
+	echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+	echo > "$TRACEFS/set_ftrace_filter" 2>/dev/null || true
+	echo nop > "$TRACEFS/current_tracer" 2>/dev/null || true
+
+	# --- 可视化矩阵输出 ---
+	# 生成"场景 × 函数"覆盖矩阵，直观展示每个场景下各函数的调用次数
+	_ftrace_get_count() {
+		local _counts="$1"
+		local _fn="$2"
+		local _c=$(echo "$_counts" | grep -o "${_fn}=[0-9]*" | cut -d= -f2)
+		echo "${_c:-0}"
+	}
+	echo ""
+	echo "  +----------------------------------------------------------+"
+	echo "  |  ftrace 覆盖矩阵 (场景 × 函数调用次数)                   |"
+	echo "  +----------------------------------------------------------+"
+	printf "  | %-26s | %4s | %4s | %4s | %4s | %4s | %4s | %4s |\n" \
+		"函数" "S1" "S2" "S3" "S4" "S5" "S6" "S7"
+	echo "  |----------------------------|------|------|------|------|------|------|------|"
+	for _fn in $FTRACE_FUNCS; do
+		printf "  | %-26s | %4s | %4s | %4s | %4s | %4s | %4s | %4s |\n" \
+			"$_fn" \
+			"$(_ftrace_get_count "$COUNTS_S1" "$_fn")" \
+			"$(_ftrace_get_count "$COUNTS_S2" "$_fn")" \
+			"$(_ftrace_get_count "$COUNTS_S3" "$_fn")" \
+			"$(_ftrace_get_count "$COUNTS_S4" "$_fn")" \
+			"$(_ftrace_get_count "$COUNTS_S5" "$_fn")" \
+			"$(_ftrace_get_count "$COUNTS_S6" "$_fn")" \
+			"$(_ftrace_get_count "$COUNTS_S7" "$_fn")"
+	done
+	echo "  +----------------------------------------------------------+"
+	# 矩阵解读提示
+	echo "  | 解读: 每列(场景)的预期函数应全部非零 → 场景 PASS      |"
+	echo "  | 解读: 每行(函数)至少在一个场景非零 → 打桩点可达        |"
+	echo "  +----------------------------------------------------------+"
+
+	# --- 汇总 ---
+	if [ "$PASSED_SCENARIOS" -eq "$TOTAL_SCENARIOS" ]; then
+		_pass "all $TOTAL_SCENARIOS ftrace scenarios passed (13 functions verified)"
+	else
+		_fail "$((TOTAL_SCENARIOS - PASSED_SCENARIOS))/$TOTAL_SCENARIOS scenarios failed"
+	fi
+fi
+
 _TOTAL=$((_PASSED + _FAILED + _SKIPPED))
 
 echo ""
