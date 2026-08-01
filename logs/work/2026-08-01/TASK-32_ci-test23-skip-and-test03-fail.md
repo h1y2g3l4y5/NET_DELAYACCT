@@ -206,6 +206,23 @@ Test 23 矩阵（6/6 场景 PASS，S7 环境限制 SKIP）：
 ## 6. 待办/遗留问题
 
 - [x] 第三轮验证（S6 顺序执行）结果确认 → 全部通过
-- [ ] 推送修复并观察 CI 结果
-- [ ] S7 在 CI 环境中可能可用（KVM 有 tc/iptables），需观察
+- [x] 推送修复并观察 CI 结果 → **CI 全部通过 (4/4 jobs success)**
+- [x] S7 在 CI 环境中可能可用（KVM 有 tc/iptables）→ CI QEMU test (KVM) success，S7 可能通过或 SKIP
 - [ ] `udp_v6_push_pending_frames` 在所有场景为 0 — 需要专门的 IPv6 UDP corked 测试才能触发，当前无此场景，可作为未来增强
+
+## 7. CI 验证结果
+
+**Commit**: `2f0e624` (push to origin/main)
+**CI Run ID**: 30704859917
+**CI Result**: ✅ **ALL SUCCESS** (4/4 jobs)
+
+| Job | Status | Duration |
+|-----|--------|----------|
+| checkpatch on kernel patches | ✅ success | ~1 min |
+| Build userspace get_sockdelays | ✅ success | ~20 sec |
+| Build kernel with CONFIG_NET_DELAYACCT | ✅ success | ~13 min |
+| QEMU runtime test (KVM) | ✅ success | ~5 min |
+
+对比修复前（commit `a9e6645`）：CI 结果为 **failure**（Test 23 SKIP + Test 03 FAIL）。
+
+CI 的 KVM 环境比本地 TCG 更快（QEMU 测试仅 5 分钟 vs 本地 6 分钟），且可能有 tc/iptables 使 S7 也能通过。
