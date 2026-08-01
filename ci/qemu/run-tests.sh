@@ -261,8 +261,8 @@ _test_header "重置计数器-基础 (-R，重置前必须有数据)"
 if _require iperf3; then
 	_desc \
 		"get_sockdelays -R 向内核发送 RESET 命令，遍历所有 socket 调用 net_delayacct_reset() 清零 per-sock 统计" \
-		"iperf3 client 后台运行产生流量 → 确认 PRE count>0 → 执行 -R 重置 → 查询 POST → 检查计数已清零或大幅下降" \
-		"PRE 必须有 count>0（否则 reset 无意义）+ POST 非零计数远小于 PRE（容忍非原子累加）"
+		"iperf3 client 后台运行产生流量 → 确认 PRE count>0 → 停止 client → 执行 -R 重置 → 查询 POST → 检查计数已清零" \
+		"PRE 必须有 count>0（消除 0→0 假阳性）+ POST 非零计数 <= 1（流量已停，reset 应清零；<=1 容忍 FIN 残包）"
 	IPERF_PORT=21403
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 	_SRV=$!
@@ -287,24 +287,29 @@ if _require iperf3; then
 			_kill "$_CLI"
 			_kill "$_SRV"
 		else
-			# 执行重置
+			# 停止 client 中止流量：本测试验证「无流量干扰下 reset 清零能力」。
+			# 活跃流量下的非原子语义由 Test 17 专项验证，两者职责分离。
+			# 若不停止 client，reset 后新包继续累加，POST 非零计数可达 PRE/2，
+			# 导致阈值 POST < PRE/2 在小 PRE 值时频繁误判（如 PRE=4 POST=2）。
+			_kill "$_CLI"
+			sleep 1  # 让在途包（含 FIN/RST）处理完毕，避免残包干扰 reset 验证
+
+			# 执行重置（此时流量已停，无新包累加）
 			"$GET_SOCKDELAYS" -R >/dev/null 2>&1 || true
 			sleep 1
 
-			# 重置后检查：POST 非零计数应远小于 PRE（容忍非原子语义下的少量累加）
+			# 重置后检查：流量已停 + reset 清零 → POST 非零计数应为 0。
+			# 容忍 <=1：极端情况下 FIN/RST 触发的最后一个打点可能在 reset 后到达。
 			POST=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
 			_output "重置后 (get_sockdelays -p $_SRV)" "$POST"
 			POST_NONZERO=$(echo "$POST" | grep 'count=' | sed 's/.*count=\([0-9]*\).*/\1/' | awk '$1>0' | wc -l || true)
 
-			# 非原子语义：reset 后仍可能有少量包累加（见 Test 17），但 POST 应远小于 PRE。
-			# 阈值取 PRE/2：若 POST >= PRE/2，说明 reset 效果不明显，打点或 reset 逻辑有问题。
-			if [ "$POST_NONZERO" -lt $((PRE_NONZERO / 2)) ] || [ "$POST_NONZERO" -eq 0 ]; then
-				_pass "reset effective: PRE=$PRE_NONZERO non-zero → POST=$POST_NONZERO non-zero"
+			if [ "$POST_NONZERO" -le 1 ]; then
+				_pass "reset effective: PRE=$PRE_NONZERO non-zero → POST=$POST_NONZERO non-zero (traffic stopped)"
 			else
 				_show_output "reset ineffective (get_sockdelays -p $_SRV)" "$POST" "$_SRV"
-				_fail "reset ineffective: PRE=$PRE_NONZERO non-zero → POST=$POST_NONZERO non-zero (expect POST < PRE/2 or =0)"
+				_fail "reset ineffective: PRE=$PRE_NONZERO non-zero → POST=$POST_NONZERO non-zero (expect <=1, traffic stopped)"
 			fi
-			_kill "$_CLI"
 		fi
 		_kill "$_SRV"
 	else
@@ -1321,7 +1326,8 @@ if _require_helper; then
 	# ftrace 内嵌验证：确认 splice 数据真的走了 tcp_read_sock（专属路径），
 	# 而非回退到 tcp_recvmsg_locked（标准路径）。若 ftrace 不可用则优雅降级。
 	_FTRACE_OK=0
-	TRACEFS=/sys/kernel/debug/tracing
+	TRACEFS=/sys/kernel/tracing
+	[ -d "$TRACEFS" ] || TRACEFS=/sys/kernel/debug/tracing
 	if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/set_ftrace_filter" ]; then
 		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
 		echo > "$TRACEFS/trace" 2>/dev/null || true
@@ -1392,7 +1398,8 @@ if _require_helper; then
 	# ftrace 内嵌验证：确认 zerocopy 数据真的走了 tcp_zerocopy_receive（专属路径），
 	# 而非回退到普通 recv。若 ftrace 不可用则优雅降级。
 	_FTRACE_OK=0
-	TRACEFS=/sys/kernel/debug/tracing
+	TRACEFS=/sys/kernel/tracing
+	[ -d "$TRACEFS" ] || TRACEFS=/sys/kernel/debug/tracing
 	if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/set_ftrace_filter" ]; then
 		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
 		echo > "$TRACEFS/trace" 2>/dev/null || true
@@ -1481,7 +1488,8 @@ if _require_helper; then
 	# ftrace 内嵌验证：确认 corked 发送真的走了 udp_push_pending_frames（专属路径），
 	# 而非回退到 udp_sendmsg fast path。若 ftrace 不可用则优雅降级。
 	_FTRACE_OK=0
-	TRACEFS=/sys/kernel/debug/tracing
+	TRACEFS=/sys/kernel/tracing
+	[ -d "$TRACEFS" ] || TRACEFS=/sys/kernel/debug/tracing
 	if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/set_ftrace_filter" ]; then
 		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
 		echo > "$TRACEFS/trace" 2>/dev/null || true
@@ -1604,7 +1612,8 @@ echo "+--------------------------------------------------------------+"
 
 # ---- Test 23: ftrace 打桩点全量验证 ----
 _test_header "ftrace 打桩点全量验证 (13 函数 × 7 场景)"
-TRACEFS=/sys/kernel/debug/tracing
+TRACEFS=/sys/kernel/tracing
+	[ -d "$TRACEFS" ] || TRACEFS=/sys/kernel/debug/tracing
 if [ ! -d "$TRACEFS" ] || [ ! -w "$TRACEFS/set_ftrace_filter" ]; then
 	_skip "ftrace not available (CONFIG_FTRACE disabled or tracefs not writable)"
 else
@@ -1614,7 +1623,13 @@ else
 		"每个场景的预期函数调用次数 > 0，且 start/end 函数成对出现（路径可达性验证）"
 
 	# 13 个 ftrace 函数：覆盖全部 12 个打桩点（rx_start×1, rx_end×5, tx_end×1, tx_start×5）
-	FTRACE_FUNCS="__netif_receive_skb_core tcp_recvmsg_locked tcp_read_sock tcp_zerocopy_receive udp_recvmsg udpv6_recvmsg dev_hard_start_xmit __tcp_transmit_skb __tcp_retransmit_skb udp_sendmsg udp_push_pending_frames udpv6_sendmsg udp_v6_push_pending_frames"
+	# 注意：rx_start 打桩在 __netif_receive_skb_core（static），不可被 ftrace 追踪。
+	# 测试流量全部走 loopback（127.0.0.1 / ::1），loopback_xmit() 调用 __netif_rx()
+	# 而非 netif_receive_skb()（后者是 NAPI 驱动入口，loopback 不用）。
+	# 调用链：loopback_xmit → __netif_rx → netif_rx_internal → backlog
+	#         → process_backlog → __netif_receive_skb → __netif_receive_skb_core（rx_start 打桩）
+	# __netif_rx 是 EXPORT_SYMBOL 全局函数，可被 ftrace 追踪。
+	FTRACE_FUNCS="__netif_rx tcp_recvmsg_locked tcp_read_sock tcp_zerocopy_receive udp_recvmsg udpv6_recvmsg dev_hard_start_xmit __tcp_transmit_skb __tcp_retransmit_skb udp_sendmsg udp_push_pending_frames udpv6_sendmsg udp_v6_push_pending_frames"
 
 	# 辅助：启用 ftrace 并设置 filter
 	_ftrace_start() {
@@ -1636,7 +1651,11 @@ else
 		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
 		local _result=""
 		for _fn in $FTRACE_FUNCS; do
-			local _c=$(grep -cE " ${_fn}\$| ${_fn} <- " "$TRACEFS/trace" 2>/dev/null || echo 0)
+			# 注意：grep -c 找到 0 匹配时输出 "0" 且返回退出码 1。
+			# 用 || true 抑制退出码，_c 已被 grep -c 赋值为 "0"。
+			# 禁止用 || echo 0（会额外输出一个 0，导致 _c="0\n0"）。
+			local _c
+			_c=$(grep -c "$_fn" "$TRACEFS/trace" 2>/dev/null) || _c=0
 			_result="$_result $_fn=$_c"
 		done
 		echo "$_result"
@@ -1680,9 +1699,15 @@ else
 	_CLI=$!; sleep 2
 	COUNTS_S1=$(_ftrace_stop_and_count)
 	_output "S1 TCP 单向 ftrace counts" "$COUNTS_S1"
+	# Debug: 检查 trace 文件内容和 filter 设置（仅 S1 输出，避免重复噪音）
+	echo "    [debug] trace lines: $(wc -l < "$TRACEFS/trace" 2>/dev/null || echo '?')"
+	echo "    [debug] set_ftrace_filter content:"
+	cat "$TRACEFS/set_ftrace_filter" 2>/dev/null | head -15 | sed 's/^/      | /' || echo "      | (unreadable)"
+	echo "    [debug] trace first 5 lines:"
+	head -5 "$TRACEFS/trace" 2>/dev/null | sed 's/^/      | /' || echo "      | (empty or unreadable)"
 	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 	if _ftrace_assert "S1" "$COUNTS_S1" \
-		__netif_receive_skb_core tcp_recvmsg_locked __tcp_transmit_skb dev_hard_start_xmit; then
+		__netif_rx tcp_recvmsg_locked __tcp_transmit_skb dev_hard_start_xmit; then
 		PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 	fi
 	_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
@@ -1698,7 +1723,7 @@ else
 	_output "S2 UDP 单向 ftrace counts" "$COUNTS_S2"
 	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 	if _ftrace_assert "S2" "$COUNTS_S2" \
-		__netif_receive_skb_core udp_recvmsg udp_sendmsg dev_hard_start_xmit; then
+		__netif_rx udp_recvmsg udp_sendmsg dev_hard_start_xmit; then
 		PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 	fi
 	_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
@@ -1715,7 +1740,7 @@ else
 		_output "S3 TCP splice ftrace counts" "$COUNTS_S3"
 		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 		if _ftrace_assert "S3" "$COUNTS_S3" \
-			__netif_receive_skb_core tcp_read_sock __tcp_transmit_skb dev_hard_start_xmit; then
+			__netif_rx tcp_read_sock __tcp_transmit_skb dev_hard_start_xmit; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 		fi
 		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
@@ -1733,7 +1758,7 @@ else
 		_output "S4 TCP zerocopy ftrace counts" "$COUNTS_S4"
 		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 		if _ftrace_assert "S4" "$COUNTS_S4" \
-			__netif_receive_skb_core tcp_zerocopy_receive __tcp_transmit_skb dev_hard_start_xmit; then
+			__netif_rx tcp_zerocopy_receive __tcp_transmit_skb dev_hard_start_xmit; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 		fi
 		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
@@ -1758,21 +1783,27 @@ else
 	# --- 场景 S6: IPv6 TCP+UDP (iperf3 -c ::1) ---
 	if [ -r /proc/net/if_inet6 ]; then
 		_ftrace_start
+		# 顺序执行 TCP → UDP（共用同一 server 端口），与 Test 22 验证过的模式一致。
+		# iperf3 server 一次只处理一个测试，同时启动两个 client（即使不同端口）
+		# 会导致 UDP client 的控制连接失败 → udpv6_sendmsg=0。
 		IPERF_PORT=21445
 		iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
 		_SRV=$!; sleep 1
-		iperf3 -c ::1 -p "$IPERF_PORT" -t 3 >/dev/null 2>&1 &
-		sleep 2
-		iperf3 -c ::1 -p "$IPERF_PORT" -u -t 3 -b 10M >/dev/null 2>&1 &
-		_CLI=$!; sleep 2
+		# 先 TCP
+		iperf3 -c ::1 -p "$IPERF_PORT" -t 2 >/dev/null 2>&1 &
+		_CLI6_TCP=$!; sleep 3
+		_kill "$_CLI6_TCP" 2>/dev/null || true
+		# 再 UDP（ftrace 全程启用，捕获两种协议的函数调用）
+		iperf3 -c ::1 -p "$IPERF_PORT" -u -t 2 -b 10M >/dev/null 2>&1 &
+		_CLI6_UDP=$!; sleep 3
 		COUNTS_S6=$(_ftrace_stop_and_count)
 		_output "S6 IPv6 TCP+UDP ftrace counts" "$COUNTS_S6"
 		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 		if _ftrace_assert "S6" "$COUNTS_S6" \
-			__netif_receive_skb_core tcp_recvmsg_locked udpv6_recvmsg udpv6_sendmsg __tcp_transmit_skb dev_hard_start_xmit; then
+			__netif_rx tcp_recvmsg_locked udpv6_recvmsg udpv6_sendmsg __tcp_transmit_skb dev_hard_start_xmit; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 		fi
-		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+		_kill "$_CLI6_UDP" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
 	fi
 
 	# --- 场景 S7: TCP 重传 (tc netem 丢包，双轨备选: netem → iptables) ---

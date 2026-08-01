@@ -31,6 +31,15 @@ mkdir -p /dev/pts /dev/shm
 mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts -o mode=0620,gid=5
 mountpoint -q /dev/shm || mount -t tmpfs  tmpfs  /dev/shm
 
+# --- Mount debugfs + tracefs (for Test 23: ftrace instrumentation verification) ---
+# tracefs is needed by Test 23 and embedded ftrace checks in Test 19/20/21.
+# Without these mounts, /sys/kernel/debug/tracing is unavailable → Test 23 SKIPs.
+mkdir -p /sys/kernel/debug
+mountpoint -q /sys/kernel/debug 2>/dev/null || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+# Modern path: tracefs can be mounted independently at /sys/kernel/tracing
+mkdir -p /sys/kernel/tracing
+mountpoint -q /sys/kernel/tracing 2>/dev/null || mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true
+
 # --- Bring up loopback ---
 ip link set lo up 2>/dev/null || true
 

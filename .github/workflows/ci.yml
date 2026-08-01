@@ -142,10 +142,15 @@ jobs:
         run: |
           cd "$LINUX_SRC"
           make defconfig
+          # Merge both fragments:
+          #   - ci/kernel.config.fragment: NET_DELAYACCT core config
+          #   - ci/qemu/kernel-qemu.config: QEMU boot + ftrace (Test 23) + netem (Test 23 S7)
+          #     Without this, Test 23 is SKIPped (no FUNCTION_TRACER) and S7 lacks netem.
           scripts/kconfig/merge_config.sh -m .config \
-            "$GITHUB_WORKSPACE/ci/kernel.config.fragment"
+            "$GITHUB_WORKSPACE/ci/kernel.config.fragment" \
+            "$GITHUB_WORKSPACE/ci/qemu/kernel-qemu.config"
           make olddefconfig
-          grep -E 'CONFIG_(NET|NET_DELAYACCT)=' .config || true
+          grep -E 'CONFIG_(NET|NET_DELAYACCT|FTRACE|FUNCTION_TRACER|NET_SCH_NETEM)=' .config || true
 
       - name: Build kernel
         run: |

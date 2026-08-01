@@ -98,7 +98,7 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ### 1.6 端口分配
 
-测试使用端口范围 **21401-21435**，每个测试分配独立端口，避免并行冲突：
+测试使用端口范围 **21401-21446**，每个测试分配独立端口，避免并行冲突：
 
 | Test | 端口 |
 |------|------|
@@ -123,6 +123,7 @@ _desc()          # 打印测试原理/实现/断言三行说明
 | Test 20 | 21433 |
 | Test 21 | 21434 |
 | Test 22 | 21435 |
+| Test 23 S1-S7 | 21440-21446 |
 
 ---
 
@@ -199,31 +200,32 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 ##### 一、测试目标
 
-验证 `get_sockdelays -R` 的基础清零能力：**重置前必须有非零计数**，重置后非零计数应大幅下降。这是 RESET 功能最基本的正确性验证，避免"0→0"的假阳性。
+验证 `get_sockdelays -R` 的基础清零能力：**重置前必须有非零计数**，停止流量后重置，重置后非零计数应清零。这是 RESET 功能最基本的正确性验证，避免"0→0"的假阳性。
 
 ##### 二、实现流程
 
-代码见 [run-tests.sh:259-313](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L259-L313)，步骤如下：
+代码见 [run-tests.sh:259-318](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-tests.sh#L259-L318)，步骤如下：
 
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | 启动 iperf3 server 端口 21403，sleep 1 等待就绪 | |
 | 2 | **后台运行** iperf3 client（`-P 2 -t 12`），`sleep 3` 让流量积累 | **关键**：后台运行确保 PRE 查询时流量活跃、count 必然 > 0。若同步运行，client 结束后 server 关闭 child socket，只剩 listen socket（count=0），PRE/POST 全为 0，reset 测试 trivially 通过（假阳性） |
 | 3 | 执行 `get_sockdelays -p $_SRV`（重置前查询 PRE） | **必须验证 PRE 有非零计数**（`PRE_NONZERO ≥ 1`），否则 reset 无意义 |
-| 4 | 执行 `get_sockdelays -R` 重置 | 向内核发送 RESET 命令 |
-| 5 | `sleep 1` 等待 reset 完成并让后续包累加 | |
-| 6 | 再次查询 `get_sockdelays -p $_SRV`（重置后查询 POST） | 统计所有 `count=` 字段大于 0 的行数 |
-| 7 | 断言：POST 非零计数 < PRE/2 或 = 0 | 容忍非原子语义下的少量累加 |
-| 8 | 清理进程 | |
+| 4 | **停止 client** 中止流量，`sleep 1` 让在途包排空 | 与 Test 17 职责分离：Test 03 验证无流量干扰下 reset 清零；Test 17 验证活跃流量下 reset 非原子 |
+| 5 | 执行 `get_sockdelays -R` 重置 | 向内核发送 RESET 命令（此时无新包累加） |
+| 6 | `sleep 1` 等待 reset 完成 | |
+| 7 | 再次查询 `get_sockdelays -p $_SRV`（重置后查询 POST） | 统计所有 `count=` 字段大于 0 的行数 |
+| 8 | 断言：POST 非零计数 ≤ 1 | 流量已停，reset 应清零；≤1 容忍 FIN/RST 残包触发的最后一次打点 |
+| 9 | 清理进程 | |
 
 ##### 三、核心断言与原理
 
 三个断言（层层递进）：
 1. **PRE 必须有非零计数**（`PRE_NONZERO ≥ 1`）：若 PRE 全为 0，reset 是"0→0"的空操作，测试无意义，必须 FAIL。
-2. **POST 非零计数远小于 PRE**（`POST_NONZERO < PRE_NONZERO / 2` 或 `= 0`）：证明 reset 确实清空了统计。容忍非原子语义下的少量累加（见 Test 17）。
-3. **client 后台运行保证流量活跃**：这是与旧实现（同步运行）的根本区别，旧实现因 client 结束后 socket 被关闭导致 PRE/POST 全为 0，产生"重置前后数据都是 0"的假阳性。
+2. **POST 非零计数 ≤ 1**（`POST_NONZERO ≤ 1`）：流量已停 + reset 清零 → POST 应为 0。容忍 ≤1 是因为 FIN/RST 触发的最后一个打点可能在 reset 后到达。
+3. **client 后台运行保证 PRE 流量活跃**：这是与旧实现（同步运行）的根本区别，旧实现因 client 结束后 socket 被关闭导致 PRE/POST 全为 0，产生"重置前后数据都是 0"的假阳性。
 
-**语义说明**：RESET 不是全局原子快照，遍历期间或遍历之后新到达的包仍会被累加。本测试在流量活跃时执行 reset，POST 可能因后续包到达有小幅累加，因此阈值取 PRE/2 而非严格 = 0；**活跃流量下的非原子行为由 Test 17 专项验证**，两者互补。
+**设计说明**：Test 03 与 Test 17 职责分离——Test 03 在**无流量干扰**下验证 reset 清零能力（POST ≤ 1），Test 17 在**活跃流量**下验证 reset 非原子语义（POST ≥ 1）。若 Test 03 不停止 client，reset 后新包继续累加，POST 非零计数可达 PRE/2，导致小 PRE 值时频繁误判（如 PRE=4 POST=2 不满足 `POST < PRE/2 = 2`）。
 
 ---
 
@@ -912,7 +914,7 @@ _desc()          # 打印测试原理/实现/断言三行说明
 
 | 打桩点 | ftrace 函数 | 方向 |
 |--------|------------|------|
-| `rx_start` | `__netif_receive_skb_core` | RX 入口 |
+| `rx_start` | `__netif_rx` (loopback 入口)¹ | RX 入口 |
 | `rx_end` (标准 TCP) | `tcp_recvmsg_locked` | RX 出口 |
 | `rx_end` (splice) | `tcp_read_sock` | RX 出口 |
 | `rx_end` (zerocopy) | `tcp_zerocopy_receive` | RX 出口 |
@@ -926,19 +928,27 @@ _desc()          # 打印测试原理/实现/断言三行说明
 | `tx_start` (IPv6 UDP fast) | `udpv6_sendmsg` | TX 入口 |
 | `tx_start` (IPv6 UDP cork) | `udp_v6_push_pending_frames` | TX 入口 |
 
+> ¹ `rx_start` 打桩在 `__netif_receive_skb_core()`（static，不可被 ftrace 追踪）。
+> 测试流量全部走 loopback（`127.0.0.1` / `::1`），而 loopback 驱动 `loopback_xmit()` 调用的是
+> `__netif_rx()`（EXPORT_SYMBOL 全局函数）而非 `netif_receive_skb()`（NAPI 驱动入口）。
+> 调用链：`loopback_xmit → __netif_rx → netif_rx_internal → backlog → process_backlog → __netif_receive_skb → __netif_receive_skb_core`（rx_start 打桩）。
+> 因此用 `__netif_rx` 验证 rx_start 打桩点的可达性。
+
 7 个场景的预期函数：
 
 | 场景 | 预期触发的 ftrace 函数 |
 |------|----------------------|
-| S1 TCP 单向 | `__netif_receive_skb_core`, `tcp_recvmsg_locked`, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
-| S2 UDP 单向 | `__netif_receive_skb_core`, `udp_recvmsg`, `udp_sendmsg`, `dev_hard_start_xmit` |
-| S3 TCP splice | `__netif_receive_skb_core`, **`tcp_read_sock`**, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
-| S4 TCP zerocopy | `__netif_receive_skb_core`, **`tcp_zerocopy_receive`**, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
+| S1 TCP 单向 | `__netif_rx`, `tcp_recvmsg_locked`, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
+| S2 UDP 单向 | `__netif_rx`, `udp_recvmsg`, `udp_sendmsg`, `dev_hard_start_xmit` |
+| S3 TCP splice | `__netif_rx`, **`tcp_read_sock`**, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
+| S4 TCP zerocopy | `__netif_rx`, **`tcp_zerocopy_receive`**, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
 | S5 UDP corked | **`udp_push_pending_frames`**, `dev_hard_start_xmit` |
-| S6 IPv6 TCP+UDP | `__netif_receive_skb_core`, `tcp_recvmsg_locked`, **`udpv6_recvmsg`**, **`udpv6_sendmsg`**, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
-| S7 TCP 重传 (tc netem 丢包) | `__netif_receive_skb_core`, `tcp_recvmsg_locked`, `__tcp_transmit_skb`, **`__tcp_retransmit_skb`**, `dev_hard_start_xmit` |
+| S6 IPv6 TCP+UDP | `__netif_rx`, `tcp_recvmsg_locked`, **`udpv6_recvmsg`**, **`udpv6_sendmsg`**, `__tcp_transmit_skb`, `dev_hard_start_xmit` |
+| S7 TCP 重传 (tc netem 丢包) | `__netif_rx`, `tcp_recvmsg_locked`, `__tcp_transmit_skb`, **`__tcp_retransmit_skb`**, `dev_hard_start_xmit` |
 
 **加粗**的函数是该场景的"专属验证目标"——如果这些函数调用次数为 0，说明声称的路径覆盖是假的（例如 splice 回退到了标准路径）。
+
+**S6 顺序执行**：TCP 和 UDP 顺序执行（先 TCP → kill → 再 UDP），共用同一 iperf3 server 端口。iperf3 server 一次只处理一个测试，同时启动两个 client（即使不同端口）会导致 UDP client 的控制连接失败。ftrace 全程启用，捕获两种协议的函数调用。
 
 **S7 双轨备选**：先尝试 `tc netem loss 10%`（需 `CONFIG_NET_SCH_NETEM`），失败则降级到 `iptables -m statistic --mode random --probability 0.1 -j DROP`（需 `CONFIG_NETFILTER_XTABLES`）。两者均不可用时 S7 SKIP 而非 FAIL。
 
