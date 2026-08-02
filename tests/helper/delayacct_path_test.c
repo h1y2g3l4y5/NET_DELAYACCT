@@ -303,10 +303,56 @@ static int do_zerocopy_server(int port)
 	return 0;
 }
 
-/* UDP client: UDP_CORK 发送，覆盖 udp_push_pending_frames TX 路径。
- * 策略：每 BURST 个包 uncork 一次触发 flush（调用 udp_push_pending_frames），
- * 再重新 cork。避免 cork 缓冲区累积超过 64K 导致 EMSGSIZE。 */
+/* UDP corked 发送公共逻辑：提取自 do_corked_udp_client / do_corked_udp6_client，
+ * 消除 v6.2.0 问题 2.1.3 的 ~90% 代码重复。
+ * 封装 sendto 循环 + cork/uncork burst 逻辑 + 最终 flush。
+ * 调用方负责创建 socket、设置 UDP_CORK、设置目标地址。
+ * 策略：每 CORK_BURST 个包 uncork 一次触发 flush（udp_push_pending_frames /
+ * udp_v6_push_pending_frames），再重新 cork。避免 cork 缓冲区累积超过 64K 导致 EMSGSIZE。 */
 #define CORK_BURST 8
+static int corked_send_loop(int s, struct sockaddr *addr, socklen_t addrlen,
+			    int duration, const char *label)
+{
+	/* 1000 字节包，8 个包 = 8000 字节，远小于 64K cork 上限 */
+	char buf[1000];
+	memset(buf, 'x', sizeof(buf));
+
+	fprintf(stderr, "%s: sending for %ds pid=%d\n", label, duration, getpid());
+	fflush(stderr);
+
+	ssize_t total = 0;
+	int batch = 0;
+	time_t end = time(NULL) + duration;
+	while (!g_stop && time(NULL) < end) {
+		ssize_t n = sendto(s, buf, sizeof(buf), 0, addr, addrlen);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("sendto");
+			break;
+		}
+		total += n;
+		batch++;
+		/* 每 CORK_BURST 个包 uncork 触发一次 flush，然后重新 cork。
+		 * IPv4 触发 udp_push_pending_frames，IPv6 触发 udp_v6_push_pending_frames。 */
+		if (batch >= CORK_BURST) {
+			int no = 0;
+			setsockopt(s, IPPROTO_UDP, UDP_CORK, &no, sizeof(no));
+			usleep(500);
+			int yes = 1;
+			setsockopt(s, IPPROTO_UDP, UDP_CORK, &yes, sizeof(yes));
+			batch = 0;
+		}
+	}
+	/* 最终 uncork flush 剩余缓冲区 */
+	int no = 0;
+	setsockopt(s, IPPROTO_UDP, UDP_CORK, &no, sizeof(no));
+	close(s);
+	fprintf(stderr, "%s: sent %zd bytes, exiting\n", label, total);
+	return 0;
+}
+
+/* UDP client: UDP_CORK 发送，覆盖 udp_push_pending_frames TX 路径。 */
 static int do_corked_udp_client(const char *ip, int port, int duration)
 {
 	int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -331,51 +377,13 @@ static int do_corked_udp_client(const char *ip, int port, int duration)
 		return 1;
 	}
 
-	/* 1000 字节包，8 个包 = 8000 字节，远小于 64K cork 上限 */
-	char buf[1000];
-	memset(buf, 'x', sizeof(buf));
-
-	fprintf(stderr, "corked-udp-client: sending to %s:%d for %ds pid=%d\n",
-		ip, port, duration, getpid());
-	fflush(stderr);
-
-	ssize_t total = 0;
-	int batch = 0;
-	time_t end = time(NULL) + duration;
-	while (!g_stop && time(NULL) < end) {
-		ssize_t n = sendto(s, buf, sizeof(buf), 0,
-				   (struct sockaddr *)&addr, sizeof(addr));
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			perror("sendto");
-			break;
-		}
-		total += n;
-		batch++;
-		/* 每 CORK_BURST 个包 uncork 触发一次 flush（udp_push_pending_frames），
-		 * 然后重新 cork。这样既覆盖 corked flush 路径，又避免缓冲区溢出。 */
-		if (batch >= CORK_BURST) {
-			int no = 0;
-			setsockopt(s, IPPROTO_UDP, UDP_CORK, &no, sizeof(no));
-			usleep(500);
-			yes = 1;
-			setsockopt(s, IPPROTO_UDP, UDP_CORK, &yes, sizeof(yes));
-			batch = 0;
-		}
-	}
-	/* 最终 uncork flush 剩余缓冲区 */
-	int no = 0;
-	setsockopt(s, IPPROTO_UDP, UDP_CORK, &no, sizeof(no));
-	close(s);
-	fprintf(stderr, "corked-udp-client: sent %zd bytes, exiting\n", total);
-	return 0;
+	return corked_send_loop(s, (struct sockaddr *)&addr, sizeof(addr),
+				duration, "corked-udp-client");
 }
 
 /* UDPv6 client: UDP_CORK 发送，覆盖 udp_v6_push_pending_frames TX 路径。
  * 与 corked-udp-client 对应，但使用 AF_INET6 + ::1 loopback，
- * 触发 IPv6 协议栈的 udp_v6_push_pending_frames() 而非 IPv4 的 udp_push_pending_frames()。
- * 策略与 IPv4 版本一致：每 BURST 个包 uncork 一次触发 flush。 */
+ * 触发 IPv6 协议栈的 udp_v6_push_pending_frames() 而非 IPv4 的 udp_push_pending_frames()。 */
 static int do_corked_udp6_client(const char *ip, int port, int duration)
 {
 	int s = socket(AF_INET6, SOCK_DGRAM, 0);
@@ -407,45 +415,8 @@ static int do_corked_udp6_client(const char *ip, int port, int duration)
 		return 1;
 	}
 
-	/* 1000 字节包，8 个包 = 8000 字节，远小于 64K cork 上限 */
-	char buf[1000];
-	memset(buf, 'x', sizeof(buf));
-
-	fprintf(stderr, "corked-udp6-client: sending to [%s]:%d for %ds pid=%d\n",
-		ip, port, duration, getpid());
-	fflush(stderr);
-
-	ssize_t total = 0;
-	int batch = 0;
-	time_t end = time(NULL) + duration;
-	while (!g_stop && time(NULL) < end) {
-		ssize_t n = sendto(s, buf, sizeof(buf), 0,
-				   (struct sockaddr *)&addr, sizeof(addr));
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			perror("sendto");
-			break;
-		}
-		total += n;
-		batch++;
-		/* 每 CORK_BURST 个包 uncork 触发一次 flush（udp_v6_push_pending_frames），
-		 * 然后重新 cork。这样既覆盖 corked flush 路径，又避免缓冲区溢出。 */
-		if (batch >= CORK_BURST) {
-			int no = 0;
-			setsockopt(s, IPPROTO_UDP, UDP_CORK, &no, sizeof(no));
-			usleep(500);
-			yes = 1;
-			setsockopt(s, IPPROTO_UDP, UDP_CORK, &yes, sizeof(yes));
-			batch = 0;
-		}
-	}
-	/* 最终 uncork flush 剩余缓冲区 */
-	int no = 0;
-	setsockopt(s, IPPROTO_UDP, UDP_CORK, &no, sizeof(no));
-	close(s);
-	fprintf(stderr, "corked-udp6-client: sent %zd bytes, exiting\n", total);
-	return 0;
+	return corked_send_loop(s, (struct sockaddr *)&addr, sizeof(addr),
+				duration, "corked-udp6-client");
 }
 
 /* TCP client: 持续发送数据，配合 splice-server / zerocopy-server 使用。

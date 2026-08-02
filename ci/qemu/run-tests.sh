@@ -1991,25 +1991,30 @@ else
 fi
 
 # ================================================================
-# 第九部分：kprobe events 调用计数比验证 (白盒语义验证)
+# 第九部分：kprobe events per-skb 配对验证 (白盒语义验证)
 # ================================================================
 echo ""
 echo "+--------------------------------------------------------------+"
-echo "|  第九部分：kprobe events 调用计数比验证 (白盒语义验证)       |"
+echo "|  第九部分：kprobe events per-skb 配对验证 (白盒语义验证)     |"
 echo "+--------------------------------------------------------------+"
 
-# ---- Test 24: kprobe events 验证 tx_start/tx_end 调用计数比 ----
-_test_header "kprobe events 验证 tx_start/tx_end 调用计数比"
+# ---- Test 24: kprobe events 验证 tx_start/tx_end per-skb 配对 ----
+_test_header "kprobe events 验证 tx_start/tx_end per-skb 配对"
 # TRACEFS 可能在 Test 23 的 else 分支中未定义，这里确保有默认值
 : "${TRACEFS:=/sys/kernel/tracing}"
 # kprobe events 与 ftrace function tracer 不同：
 # - function tracer 只能记录"函数被调用"，不能抓参数
 # - kprobe events 可以抓取函数参数（如 skb 指针），用于辅助诊断
 #
-# 验证目标（关联 v6.1.0 问题 2.3.1）：
-# 验证 tx_start 和 tx_end 的调用次数比在合理范围内。
-# 注意：本测试验证的是"调用计数比"，不是"per-skb 配对"。
-# per-skb 配对需要解析 trace 中的 skb 指针并做集合匹配，留待后续增强。
+# 验证目标（关联 v6.1.0 问题 2.3.1，v6.3.0 TASK-39 完整实现）：
+# 验证 set(tx_end_skb) ⊆ set(tx_start_skb)——每个被 tx_end 读取的 skb
+# 都曾被 tx_start 打过时间戳。这是真正的 per-skb 配对语义，非仅计数比。
+#
+# 断言设计（双断言，强+弱）：
+# - 核心断言（强）：set(tx_end_skb) ⊆ set(tx_start_skb)
+#   失败说明存在"未被 start 打戳却被 end 读取"的 skb，是打点逻辑缺陷
+# - 辅助断言（弱）：tx_end/tx_start 计数比 ∈ [0.5, 2.0]
+#   作为快速失败信号，比率异常说明流量模式异常（即使配对通过）
 #
 # 技术约束：
 # - rx_start 是 static inline，不可被 kprobe 捕获 → 只验证 tx 路径
@@ -2017,12 +2022,13 @@ _test_header "kprobe events 验证 tx_start/tx_end 调用计数比"
 #   → tx_end 调用次数可能略少于 tx_start（纯 ACK 不计入）
 # - GSO 分段：一个 parent skb 经 skb_segment() 分成 N 段，每段都继承 delayacct_start
 #   → tx_end 会被调用 N 次，tx_start 只 1 次 → tx_end 可能多于 tx_start
-# 综合两点，断言用比率范围 [0.5, 2.0] 而非严格相等
+# - 指针重用局限：内核 skb 分配器可能重用已释放 skb 的地址，导致集合匹配
+#   出现假阳性。这不影响"配对语义"的基本正确性验证（实际打点错配会大量出现）
 if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/kprobe_events" ]; then
 	_desc \
-		"通过 kprobe events 捕获 tx_start/tx_end 调用，验证两函数计数比在合理范围" \
-		"注册 kprobe → 运行 TCP 流量 → 统计两函数调用次数 → 断言计数比在合理范围" \
-		"tx_end/tx_start 计数比 ∈ [0.5, 2.0]（容忍纯 ACK 守卫 + GSO 分段）"
+		"通过 kprobe events 捕获 tx_start/tx_end 的 skb 指针，验证 per-skb 配对语义" \
+		"注册 kprobe → 运行 TCP 流量 → 提取 trace 中 skb 指针 → 断言 set(tx_end_skb) ⊆ set(tx_start_skb)" \
+		"错配数 ≤ max(5, tx_end_unique×10%)（容忍纯 ACK 经 tx_end 但不经 tx_start）+ 计数比 ∈ [50%, 200%]"
 
 	# 清理之前的 kprobe 状态
 	echo > "$TRACEFS/kprobe_events" 2>/dev/null || true
@@ -2064,22 +2070,43 @@ if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/kprobe_events" ]; then
 		_CLI=$!; sleep 4
 		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
 
-		# 统计 tx_start 和 tx_end 的调用次数
-		# trace 行格式: <task>-<pid> [<cpu>] .... <ts>: tx_start: (net_delayacct_tx_start+0x0/0x40) skb=0xffff...
-		# 注意：grep -c 找到 0 匹配时返回退出码 1，用 || true 抑制；输出可能含换行，用 $(...) 自动去除尾部换行
-		TX_START_COUNT=$(grep -c 'tx_start:' "$TRACEFS/trace" 2>/dev/null || true)
-		TX_END_COUNT=$(grep -c 'tx_end:' "$TRACEFS/trace" 2>/dev/null || true)
-		TX_START_COUNT=${TX_START_COUNT:-0}
-		TX_END_COUNT=${TX_END_COUNT:-0}
+		# 提取 skb 指针并统计调用次数
+		# trace 行格式: <task>-<pid> [<cpu>] .... <ts>: tx_start: (func+offset) skb=<value>
+		# skb 值格式取决于 kprobe arg 类型（:u64=十进制），awk 解析兼容任意值
+		# 临时文件用于集合运算（awk 关联数组做子集检查）
+		_KP_START_SKBS=/tmp/kp_start_skbs.$$
+		_KP_END_SKBS=/tmp/kp_end_skbs.$$
+		# 提取 tx_start 事件的 skb 指针（去重排序）
+		awk '/tx_start:/ {for(i=1;i<=NF;i++) if($i ~ /^skb=/) {sub(/^skb=/,"",$i); print $i}}' \
+			"$TRACEFS/trace" 2>/dev/null | sort -u > "$_KP_START_SKBS" || true
+		# 提取 tx_end 事件的 skb 指针（去重排序）
+		awk '/tx_end:/ {for(i=1;i<=NF;i++) if($i ~ /^skb=/) {sub(/^skb=/,"",$i); print $i}}' \
+			"$TRACEFS/trace" 2>/dev/null | sort -u > "$_KP_END_SKBS" || true
+
+		# 统计调用次数（含重复，用于计数比辅助断言）
+		TX_START_COUNT=$(grep -c 'tx_start:' "$TRACEFS/trace" 2>/dev/null || true); TX_START_COUNT=${TX_START_COUNT:-0}
+		TX_END_COUNT=$(grep -c 'tx_end:' "$TRACEFS/trace" 2>/dev/null || true); TX_END_COUNT=${TX_END_COUNT:-0}
+		# 统计唯一 skb 指针数（用于配对断言）
+		TX_START_UNIQUE=$(grep -c '.' "$_KP_START_SKBS" 2>/dev/null || true); TX_START_UNIQUE=${TX_START_UNIQUE:-0}
+		TX_END_UNIQUE=$(grep -c '.' "$_KP_END_SKBS" 2>/dev/null || true); TX_END_UNIQUE=${TX_END_UNIQUE:-0}
+
+		# per-skb 配对验证：set(tx_end_skb) ⊆ set(tx_start_skb)
+		# awk 关联数组：第一个文件(tx_start)存入 seen 数组，第二个文件(tx_end)检查每个 skb 是否在 seen 中
+		# 输出 tx_end 中不在 tx_start 的 skb（即错配的 skb）
+		MISMATCHED=$(awk 'NR==FNR {seen[$0]=1; next} !($0 in seen) {print}' \
+			"$_KP_START_SKBS" "$_KP_END_SKBS" 2>/dev/null || true)
+		MISMATCHED_N=$(printf '%s\n' "$MISMATCHED" | grep -c '.' || true); MISMATCHED_N=${MISMATCHED_N:-0}
 
 		# 诊断信息：仅在 NET_DELAYACCT_DEBUG=1 时打印 trace 内容（含内核地址，不宜公开）
 		if [ "${NET_DELAYACCT_DEBUG:-0}" = "1" ]; then
 			echo "    [debug] trace lines: $(wc -l < "$TRACEFS/trace" 2>/dev/null || echo '?')"
 			echo "    [debug] trace first 5 lines:"
 			head -5 "$TRACEFS/trace" 2>/dev/null | sed 's/^/      | /' || echo "      | (empty or unreadable)"
+			echo "    [debug] tx_start unique skbs: $TX_START_UNIQUE, sample: $(head -3 "$_KP_START_SKBS" 2>/dev/null | tr '\n' ' ')"
+			echo "    [debug] tx_end unique skbs: $TX_END_UNIQUE, sample: $(head -3 "$_KP_END_SKBS" 2>/dev/null | tr '\n' ' ')"
 		fi
 
-		_output "kprobe counts" "tx_start=$TX_START_COUNT tx_end=$TX_END_COUNT"
+		_output "kprobe 统计" "calls: tx_start=$TX_START_COUNT tx_end=$TX_END_COUNT | unique skbs: start=$TX_START_UNIQUE end=$TX_END_UNIQUE | mismatched=$MISMATCHED_N"
 
 		# 清理 kprobe：先停止 tracing + 禁用 kprobes events 再清空，避免 EBUSY
 		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
@@ -2089,22 +2116,47 @@ if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/kprobe_events" ]; then
 
 		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
 
-		# 断言：调用计数比在合理范围
-		# tx_end/tx_start 计数比 ∈ [0.5, 2.0]
-		# - 下界 0.5：容忍纯 ACK 守卫跳过（tx_end 被调用但 start=0 提前返回）
-		# - 上界 2.0：容忍 GSO 分段（一个 tx_start 对应多个 tx_end）
+		# 断言：per-skb 配对（核心强断言）+ 计数比（辅助弱断言）
+		# - 核心断言：错配数 ≤ 阈值（容忍纯 ACK 等 non-data skb）
+		#   kprobe 在函数入口触发，tx_end 内部守卫的早返回不影响 kprobe 捕获。
+		#   纯 ACK / 窗口更新 / FIN 等控制包会经过 tx_end（kprobe 捕获）但不经过
+		#   tx_start（无应用数据发送），这些 skb 不在 tx_start 集合中是预期行为。
+		#   阈值 = max(5, tx_end_unique × 10%)：少量错配容忍 ACK，大量错配说明打点缺陷
+		# - 辅助断言：计数比 ∈ [50%, 200%]（容忍纯 ACK 守卫 + GSO 分段）
+		# 两者都通过才算 PASS；任一失败都 FAIL
 		if [ "$TX_START_COUNT" -gt 0 ] && [ "$TX_END_COUNT" -gt 0 ]; then
 			RATIO=$((TX_END_COUNT * 100 / TX_START_COUNT))
 			_output "计数比" "tx_end/tx_start = $TX_END_COUNT/$TX_START_COUNT = ${RATIO}%"
-			if [ "$RATIO" -ge 50 ] && [ "$RATIO" -le 200 ]; then
-				_pass "tx_start/tx_end count ratio OK: start=$TX_START_COUNT end=$TX_END_COUNT ratio=${RATIO}% (within [50%, 200%])"
+
+			# 计算错配阈值：max(5, tx_end_unique / 10)
+			MISMATCH_THRESHOLD=$((TX_END_UNIQUE / 10))
+			[ "$MISMATCH_THRESHOLD" -ge 5 ] || MISMATCH_THRESHOLD=5
+
+			if [ "$MISMATCHED_N" -le "$MISMATCH_THRESHOLD" ] && [ "$RATIO" -ge 50 ] && [ "$RATIO" -le 200 ]; then
+				_pass "per-skb pairing OK: mismatched=$MISMATCHED_N/$TX_END_UNIQUE (threshold=$MISMATCH_THRESHOLD, ACK-tolerant), start_unique=$TX_START_UNIQUE, ratio=${RATIO}% (within [50%, 200%])"
 			else
-				_fail "count ratio out of range: tx_end/tx_start = ${RATIO}% (expect [50%, 200%])"
+				# 失败诊断：打印错配的 skb 指针（最多 10 个）
+				if [ "$MISMATCHED_N" -gt "$MISMATCH_THRESHOLD" ]; then
+					echo "    +-- mismatched skb pointers (tx_end skbs not in tx_start set, max 10) ---"
+					printf '%s\n' "$MISMATCHED" | head -10 | sed 's/^/    | /'
+					echo "    | total mismatched: $MISMATCHED_N (threshold=$MISMATCH_THRESHOLD, tx_end_unique=$TX_END_UNIQUE)"
+					echo "    | note: small mismatch count is expected (pure ACK/FIN go through tx_end but not tx_start)"
+					echo "    +---------------"
+				fi
+				if [ "$RATIO" -lt 50 ] || [ "$RATIO" -gt 200 ]; then
+					echo "    +-- ratio out of range ---"
+					echo "    | tx_end/tx_start = ${RATIO}% (expect [50%, 200%])"
+					echo "    +---------------"
+				fi
+				_fail "per-skb pairing or ratio check failed: mismatched=$MISMATCHED_N (threshold=$MISMATCH_THRESHOLD) ratio=${RATIO}% (expect mismatched<=threshold, ratio in [50%,200%])"
 			fi
 		else
 			_show_output "kprobe trace (no tx_start/tx_end events)" "" ""
 			_fail "no kprobe events captured: tx_start=$TX_START_COUNT tx_end=$TX_END_COUNT (kprobe registration may have failed)"
 		fi
+
+		# 清理临时文件
+		rm -f "$_KP_START_SKBS" "$_KP_END_SKBS" 2>/dev/null || true
 	else
 		_skip "kprobe events registration failed (net_delayacct_tx_start/tx_end symbols not found)"
 		# 清理
