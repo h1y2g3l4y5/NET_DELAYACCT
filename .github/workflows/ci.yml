@@ -264,6 +264,10 @@ jobs:
       - name: Build initramfs and run QEMU (KVM)
         run: |
           set -e
+          # ERR trap: emit a visible ::error:: annotation (shown in the run's
+          # annotation list) identifying the failing command + line number, so
+          # root cause is diagnosable without downloading the full log.
+          trap 'echo "::error::Initramfs/QEMU step failed at line $LINENO (exit $?) — command: $BASH_COMMAND"' ERR
           cd "$GITHUB_WORKSPACE"
           mkdir -p /tmp/initrd/{bin,sbin,usr/local/bin,etc,proc,sys,dev,tmp,root,lib/x86_64-linux-gnu,lib64}
 
@@ -329,8 +333,13 @@ jobs:
           for bin in tc iptables; do
             b=$(which "$bin" 2>/dev/null) || { echo "WARNING: $bin not found, S7 will SKIP"; continue; }
             rm -f "/tmp/initrd/sbin/$bin" "/tmp/initrd/usr/sbin/$bin"
-            cp "$b" "/tmp/initrd/sbin/$bin"
-            chmod +x "/tmp/initrd/sbin/$bin"
+            # Defensive copy: a failure here must not abort the whole CI step
+            # (it would only cause S7 to SKIP in the guest). Log + continue.
+            if ! cp "$b" "/tmp/initrd/sbin/$bin" 2>/dev/null; then
+              echo "WARNING: failed to copy $bin ($b), S7 will SKIP"
+              continue
+            fi
+            chmod +x "/tmp/initrd/sbin/$bin" 2>/dev/null || true
             for lib in $(ldd "$b" 2>/dev/null | grep -o '/[^ ]*' || true); do
               mkdir -p "/tmp/initrd/$(dirname "$lib")"
               cp "$lib" "/tmp/initrd$lib" 2>/dev/null || true
@@ -398,20 +407,31 @@ jobs:
 
           echo ""
           echo "=== QEMU boot tail (last 30 lines) ==="
-          tail -30 /tmp/qemu.log
+          tail -30 /tmp/qemu.log 2>/dev/null || echo "(qemu.log empty or missing)"
 
-          # Exit with failure if any FAIL found, or if NO tests ran at all
-          PASS_N=$(grep -c '\[PASS\]' /tmp/qemu.log 2>/dev/null || echo 0)
-          FAIL_N=$(grep -c '\[FAIL\]' /tmp/qemu.log 2>/dev/null || echo 0)
-          SKIP_N=$(grep -c '\[SKIP\]' /tmp/qemu.log 2>/dev/null || echo 0)
+          # Exit with failure if any FAIL found, or if NO tests ran at all.
+          # Use `grep -Ec ... || true` + `${VAR:-0}` instead of `grep -c ... || echo 0`:
+          # the latter produces "0\n0" when there are no matches (grep -c prints "0"
+          # AND exits 1, then echo prints another "0"), which breaks the integer
+          # comparisons below. Anchor with `^\s*\[PASS\]` to exclude scenario
+          # status lines like `    [S1 PASS]` (which contain `[PASS]` as a substring
+          # and would inflate the count).
+          PASS_N=$(grep -Ec '^\s*\[PASS\]' /tmp/qemu.log 2>/dev/null || true); PASS_N=${PASS_N:-0}
+          FAIL_N=$(grep -Ec '^\s*\[FAIL\]' /tmp/qemu.log 2>/dev/null || true); FAIL_N=${FAIL_N:-0}
+          SKIP_N=$(grep -Ec '^\s*\[SKIP\]' /tmp/qemu.log 2>/dev/null || true); SKIP_N=${SKIP_N:-0}
+          echo "Test counts: PASS=$PASS_N FAIL=$FAIL_N SKIP=$SKIP_N"
 
           if [ "$FAIL_N" -gt 0 ]; then
-            echo "::error::Tests FAILED (${PASS_N}P/${FAIL_N}F/${SKIP_N}S)"
+            # Surface the failing test lines directly in a ::error:: annotation
+            # so the root cause is visible in the run's annotation list without
+            # downloading the full log.
+            FAIL_LINES=$(grep -E '^\s*\[FAIL\]' /tmp/qemu.log 2>/dev/null | head -10 | tr '\n' '|' | sed 's/|$//')
+            echo "::error::Tests FAILED (${PASS_N}P/${FAIL_N}F/${SKIP_N}S). Failing: ${FAIL_LINES}"
             exit 1
           fi
 
           if [ "$PASS_N" -eq 0 ] && [ "$FAIL_N" -eq 0 ] && [ "$SKIP_N" -eq 0 ]; then
-            echo "::error::No tests executed — QEMU likely failed to boot"
+            echo "::error::No tests executed — QEMU likely failed to boot (see QEMU log tail above)"
             exit 1
           fi
 
