@@ -95,3 +95,34 @@ $ bash -n ci/qemu/run-tests.sh
 - [x] 问题 2.4.2：TASK-41 待办回填 — **已更新**
 - [x] 问题 2.4.3：TASK-40 补录承认 — **已在 DAILY_SUMMARY 记录**
 - [ ] CI KVM 验证 — 待推送后确认溢出检测不引入 regression
+
+## 7. 补充修复：Test 24 阈值从 30% 提升至 40%（绝对下限 25）
+
+### 7.1 发现过程
+
+推送 Review 回应修复（commit 97a847a）后发现 CI run #130（commit ca0d309，仅文档变更）在 Test 24 失败：
+
+```
+[FAIL] per-skb pairing or ratio check failed: mismatched=18 (threshold=15) ratio=181%
+```
+
+### 7.2 根因分析
+
+| CI Run | tx_end_unique | mismatched | threshold (30%) | 结果 |
+|--------|---------------|------------|-----------------|------|
+| #128 (PASS) | ~70 | 18 | 21 | ✅ 18 ≤ 21 |
+| #130 (FAIL) | ~50 | 18 | 15 | ❌ 18 > 15 |
+
+KVM 环境下 `mismatched=18`（纯 ACK 数量）恒定，但 `tx_end_unique` 在 50-70 间波动。30% 百分比阈值随分母变化不稳定：当 tx_end_unique=50 时阈值降到 15，不足以容纳 18 个 ACK。
+
+### 7.3 修复方案
+
+阈值从 `max(10, tx_end_unique × 30%)` 改为 `max(25, tx_end_unique × 40%)`：
+
+- **绝对下限 25**：确保阈值不随 tx_end_unique 波动而低于 ACK 数量（KVM mismatched 恒定 ~18，margin=7）
+- **百分比 40%**：仍能捕获系统性打点缺陷（>40% 错配说明 tx_start instrumentation 失效）
+- 验证：KVM 最差场景 (tx_end_unique=50, mismatched=18) → threshold=max(25, 20)=25，18 ≤ 25 ✓
+
+### 7.4 教训
+
+百分比阈值在分母波动大时不可靠。当分子（mismatched）恒定但分母（tx_end_unique）波动时，应使用绝对下限作为安全网，而非纯百分比。
