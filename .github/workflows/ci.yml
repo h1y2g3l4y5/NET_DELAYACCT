@@ -351,7 +351,7 @@ jobs:
                 mkdir -p "/tmp/initrd/usr/lib/x86_64-linux-gnu/tc"
                 cp "$qso" "/tmp/initrd/usr/lib/x86_64-linux-gnu/tc/" 2>/dev/null || true
               done
-            done
+            fi
             echo "Packed $bin with shared libs"
           done
 
