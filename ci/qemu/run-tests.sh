@@ -2070,6 +2070,17 @@ if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/kprobe_events" ]; then
 		_CLI=$!; sleep 4
 		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
 
+		# trace ring buffer 溢出检测（问题 2.1.1）
+		# trace 头部格式: "# entries-in-buffer: N  entries-written: M"
+		# 当 N < M 时说明 ring buffer 溢出，部分事件已丢失，per-skb 配对结果不可信
+		_BUF_INFO=$(head -5 "$TRACEFS/trace" 2>/dev/null | grep 'entries-in-buffer' || true)
+		_IN_BUF=$(echo "$_BUF_INFO" | sed 's/.*entries-in-buffer: \([0-9]*\).*/\1/' 2>/dev/null || true)
+		_IN_WRITTEN=$(echo "$_BUF_INFO" | sed 's/.*entries-written: \([0-9]*\).*/\1/' 2>/dev/null || true)
+		if [ -n "$_IN_BUF" ] && [ -n "$_IN_WRITTEN" ] && \
+		   [ "$_IN_BUF" -lt "$_IN_WRITTEN" ] 2>/dev/null; then
+			echo "    [warn] trace ring buffer overflow: entries-in-buffer=$_IN_BUF < entries-written=$_IN_WRITTEN (per-skb pairing results may be unreliable)"
+		fi
+
 		# 提取 skb 指针并统计调用次数
 		# trace 行格式: <task>-<pid> [<cpu>] .... <ts>: tx_start: (func+offset) skb=<value>
 		# skb 值格式取决于 kprobe arg 类型（:u64=十进制），awk 解析兼容任意值

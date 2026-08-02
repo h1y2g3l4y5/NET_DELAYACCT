@@ -59,7 +59,7 @@ v6.2.0 CI run 30745609797 全绿（4/4 jobs success），且 v6.3.0 推送后的
 ## 5. 待办/遗留问题
 
 - [x] 确认 ci.yml actions 版本 — **已完成，全部 v4**
-- [ ] v6.3.0 CI run 中确认无 Node.js 20 弃用 warning — 待推送后验证
+- [x] v6.3.0 CI run 中确认 Node.js 20 弃用 warning 状态 — **已验证：warning 仍存在（4 个），原因是 actions/checkout@v4 / actions/cache@v4 等内部仍使用 Node.js 20，属上游问题，无法通过升级 action 版本解决**
 
 ### upload-artifact@v4 兼容性说明
 
