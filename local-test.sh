@@ -252,6 +252,26 @@ step_create_initramfs() {
 		echo "WARNING: host nc not found, falling back to busybox symlink"
 	fi
 
+	# Copy tc + iptables + their shared libs (for Test 23 S7: retransmission via netem/iptables)
+	# tc 需要 netem qdisc 支持 (CONFIG_NET_SCH_NETEM)，iptables 需要 xtables (CONFIG_NETFILTER_XTABLES)
+	for _nettool in tc iptables; do
+		if command -v "$_nettool" >/dev/null 2>&1; then
+			copy_binary_with_libs "$(command -v "$_nettool")" "$INITRD_DIR"
+			# tc 还依赖 netem qdisc 共享对象 (/usr/lib/x86_64-linux-gnu/tc/q_netem.so)
+			if [ "$_nettool" = "tc" ]; then
+				for _qso in /usr/lib/x86_64-linux-gnu/tc/q_netem.so /usr/lib/x86_64-linux-gnu/tc/*.so; do
+					[ -f "$_qso" ] || continue
+					local _qdest="$INITRD_DIR/usr/lib/x86_64-linux-gnu/tc"
+					mkdir -p "$_qdest"
+					cp -L "$_qso" "$_qdest/" 2>/dev/null || true
+				done
+			fi
+			echo "Packed real $_nettool from $(command -v "$_nettool")"
+		else
+			echo "WARNING: host $_nettool not found, Test 23 S7 will SKIP"
+		fi
+	done
+
 	# Copy get_sockdelays binary and its shared libraries
 	local TOOL_BIN="$PROJECT_DIR/userspace/get_sockdelays/get_sockdelays"
 	cp "$TOOL_BIN" "$INITRD_DIR/usr/local/bin/get_sockdelays"

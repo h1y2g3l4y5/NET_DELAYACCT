@@ -21,7 +21,7 @@
 #           delayacct_path_test (辅助程序，路径覆盖测试用) 安装于 /usr/local/bin/
 # 输出格式: 结构化 [PASS]/[FAIL]/[SKIP] + 末尾汇总框
 
-export PATH=/usr/local/bin:/usr/bin:/bin:/sbin
+export PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
 GET_SOCKDELAYS="${GET_SOCKDELAYS:-/usr/local/bin/get_sockdelays}"
 PATH_HELPER="${PATH_HELPER:-/usr/local/bin/delayacct_path_test}"
 
@@ -1611,7 +1611,7 @@ echo "|  第八部分：ftrace 打桩点全量验证 (白盒路径验证)       
 echo "+--------------------------------------------------------------+"
 
 # ---- Test 23: ftrace 打桩点全量验证 ----
-_test_header "ftrace 打桩点全量验证 (13 函数 × 7 场景)"
+_test_header "ftrace 打桩点全量验证 (13 函数 × 8 场景)"
 TRACEFS=/sys/kernel/tracing
 	[ -d "$TRACEFS" ] || TRACEFS=/sys/kernel/debug/tracing
 if [ ! -d "$TRACEFS" ] || [ ! -w "$TRACEFS/set_ftrace_filter" ]; then
@@ -1681,6 +1681,11 @@ else
 
 	TOTAL_SCENARIOS=0
 	PASSED_SCENARIOS=0
+	SKIPPED_SCENARIOS=0
+	# 场景状态追踪（用于末尾汇总，避免 CI success 掩盖场景级 SKIP/FAIL）
+	# 每个场景状态: PASS / FAIL / SKIP / N/A (未执行)
+	SCEN_S1="N/A"; SCEN_S2="N/A"; SCEN_S3="N/A"; SCEN_S4="N/A"
+	SCEN_S5="N/A"; SCEN_S6="N/A"; SCEN_S7="N/A"; SCEN_S8="N/A"
 	# 初始化各场景计数变量（条件场景可能不执行，需默认值避免矩阵解析错误）
 	COUNTS_S1=""
 	COUNTS_S2=""
@@ -1689,6 +1694,15 @@ else
 	COUNTS_S5=""
 	COUNTS_S6=""
 	COUNTS_S7=""
+	COUNTS_S8=""
+
+	# 辅助：记录场景状态并打印独立状态行（TASK-37: S7 可观测性）
+	# 用法: _scenario_status <编号> <PASS|FAIL|SKIP>
+	_scenario_status() {
+		local _num="$1" _status="$2"
+		eval "SCEN_S$_num=\"$_status\""
+		printf "    [S%s %s]\n" "$_num" "$_status"
+	}
 
 	# --- 场景 S1: TCP 单向 (iperf3 client→server) ---
 	_ftrace_start
@@ -1700,15 +1714,21 @@ else
 	COUNTS_S1=$(_ftrace_stop_and_count)
 	_output "S1 TCP 单向 ftrace counts" "$COUNTS_S1"
 	# Debug: 检查 trace 文件内容和 filter 设置（仅 S1 输出，避免重复噪音）
-	echo "    [debug] trace lines: $(wc -l < "$TRACEFS/trace" 2>/dev/null || echo '?')"
-	echo "    [debug] set_ftrace_filter content:"
-	cat "$TRACEFS/set_ftrace_filter" 2>/dev/null | head -15 | sed 's/^/      | /' || echo "      | (unreadable)"
-	echo "    [debug] trace first 5 lines:"
-	head -5 "$TRACEFS/trace" 2>/dev/null | sed 's/^/      | /' || echo "      | (empty or unreadable)"
+	# 诊断信息：仅在 NET_DELAYACCT_DEBUG=1 时打印（含内核地址，不宜在 CI 公开日志暴露）
+	if [ "${NET_DELAYACCT_DEBUG:-0}" = "1" ]; then
+		echo "    [debug] trace lines: $(wc -l < "$TRACEFS/trace" 2>/dev/null || echo '?')"
+		echo "    [debug] set_ftrace_filter content:"
+		cat "$TRACEFS/set_ftrace_filter" 2>/dev/null | head -15 | sed 's/^/      | /' || echo "      | (unreadable)"
+		echo "    [debug] trace first 5 lines:"
+		head -5 "$TRACEFS/trace" 2>/dev/null | sed 's/^/      | /' || echo "      | (empty or unreadable)"
+	fi
 	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 	if _ftrace_assert "S1" "$COUNTS_S1" \
 		__netif_rx tcp_recvmsg_locked __tcp_transmit_skb dev_hard_start_xmit; then
 		PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+		_scenario_status 1 PASS
+	else
+		_scenario_status 1 FAIL
 	fi
 	_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
 
@@ -1725,10 +1745,14 @@ else
 	if _ftrace_assert "S2" "$COUNTS_S2" \
 		__netif_rx udp_recvmsg udp_sendmsg dev_hard_start_xmit; then
 		PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+		_scenario_status 2 PASS
+	else
+		_scenario_status 2 FAIL
 	fi
 	_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
 
 	# --- 场景 S3: TCP splice RX (helper splice-server) ---
+	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 	if _require_helper; then
 		_ftrace_start
 		SPLICE_PORT=21442
@@ -1738,15 +1762,21 @@ else
 		_CLI=$!; sleep 3
 		COUNTS_S3=$(_ftrace_stop_and_count)
 		_output "S3 TCP splice ftrace counts" "$COUNTS_S3"
-		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 		if _ftrace_assert "S3" "$COUNTS_S3" \
 			__netif_rx tcp_read_sock __tcp_transmit_skb dev_hard_start_xmit; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+			_scenario_status 3 PASS
+		else
+			_scenario_status 3 FAIL
 		fi
 		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+	else
+		SKIPPED_SCENARIOS=$((SKIPPED_SCENARIOS + 1))
+		_scenario_status 3 SKIP
 	fi
 
 	# --- 场景 S4: TCP zerocopy RX (helper zerocopy-server) ---
+	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 	if _require_helper; then
 		_ftrace_start
 		ZC_PORT=21443
@@ -1756,15 +1786,21 @@ else
 		_CLI=$!; sleep 3
 		COUNTS_S4=$(_ftrace_stop_and_count)
 		_output "S4 TCP zerocopy ftrace counts" "$COUNTS_S4"
-		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 		if _ftrace_assert "S4" "$COUNTS_S4" \
 			__netif_rx tcp_zerocopy_receive __tcp_transmit_skb dev_hard_start_xmit; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+			_scenario_status 4 PASS
+		else
+			_scenario_status 4 FAIL
 		fi
 		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+	else
+		SKIPPED_SCENARIOS=$((SKIPPED_SCENARIOS + 1))
+		_scenario_status 4 SKIP
 	fi
 
 	# --- 场景 S5: UDP corked TX (helper corked-udp-client) ---
+	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 	if _require_helper; then
 		_ftrace_start
 		CORK_PORT=21444
@@ -1772,15 +1808,21 @@ else
 		_CLI=$!; sleep 2
 		COUNTS_S5=$(_ftrace_stop_and_count)
 		_output "S5 UDP corked ftrace counts" "$COUNTS_S5"
-		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 		if _ftrace_assert "S5" "$COUNTS_S5" \
 			udp_push_pending_frames dev_hard_start_xmit; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+			_scenario_status 5 PASS
+		else
+			_scenario_status 5 FAIL
 		fi
 		_kill "$_CLI" 2>/dev/null || true
+	else
+		SKIPPED_SCENARIOS=$((SKIPPED_SCENARIOS + 1))
+		_scenario_status 5 SKIP
 	fi
 
 	# --- 场景 S6: IPv6 TCP+UDP (iperf3 -c ::1) ---
+	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 	if [ -r /proc/net/if_inet6 ]; then
 		_ftrace_start
 		# 顺序执行 TCP → UDP（共用同一 server 端口），与 Test 22 验证过的模式一致。
@@ -1798,26 +1840,58 @@ else
 		_CLI6_UDP=$!; sleep 3
 		COUNTS_S6=$(_ftrace_stop_and_count)
 		_output "S6 IPv6 TCP+UDP ftrace counts" "$COUNTS_S6"
-		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 		if _ftrace_assert "S6" "$COUNTS_S6" \
 			__netif_rx tcp_recvmsg_locked udpv6_recvmsg udpv6_sendmsg __tcp_transmit_skb dev_hard_start_xmit; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+			_scenario_status 6 PASS
+		else
+			_scenario_status 6 FAIL
 		fi
 		_kill "$_CLI6_UDP" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+	else
+		SKIPPED_SCENARIOS=$((SKIPPED_SCENARIOS + 1))
+		_scenario_status 6 SKIP
+	fi
+
+	# --- 场景 S8: IPv6 UDP corked TX (helper corked-udp6-client) ---
+	# 覆盖 udp_v6_push_pending_frames() — v6.1.0 中唯一全场景为 0 的函数
+	# 需要专门的 IPv6 UDP corked helper，iperf3 无法触发此路径
+	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
+	if _require_helper && [ -r /proc/net/if_inet6 ]; then
+		_ftrace_start
+		CORK6_PORT=21447
+		"$PATH_HELPER" corked-udp6-client ::1 "$CORK6_PORT" 8 >/dev/null 2>&1 &
+		_CLI=$!; sleep 2
+		COUNTS_S8=$(_ftrace_stop_and_count)
+		_output "S8 IPv6 UDP corked ftrace counts" "$COUNTS_S8"
+		if _ftrace_assert "S8" "$COUNTS_S8" \
+			udp_v6_push_pending_frames udpv6_sendmsg dev_hard_start_xmit; then
+			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+			_scenario_status 8 PASS
+		else
+			_scenario_status 8 FAIL
+		fi
+		_kill "$_CLI" 2>/dev/null || true
+	else
+		SKIPPED_SCENARIOS=$((SKIPPED_SCENARIOS + 1))
+		_scenario_status 8 SKIP
 	fi
 
 	# --- 场景 S7: TCP 重传 (tc netem 丢包，双轨备选: netem → iptables) ---
+	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 	NETEM_OK=0
 	IPTABLES_OK=0
 	_ftrace_start
 	IPERF_PORT=21446
+	_NETEM_ERR=""
+	_IPT_ERR=""
 	# 方案 A: tc netem 丢包 (需 CONFIG_NET_SCH_NETEM)
 	if command -v tc >/dev/null 2>&1; then
-		tc qdisc add dev lo root netem loss 10% 2>/dev/null && NETEM_OK=1
+		_NETEM_ERR=$(tc qdisc add dev lo root netem loss 10% 2>&1) && NETEM_OK=1 || _NETEM_ERR="tc: $_NETEM_ERR"
 	fi
 	# 方案 B: iptables statistic 丢包 (需 CONFIG_NETFILTER_XTABLES)
 	if [ "$NETEM_OK" -eq 0 ] && command -v iptables >/dev/null 2>&1; then
-		iptables -I INPUT -p tcp --dport "$IPERF_PORT" -m statistic --mode random --probability 0.1 -j DROP 2>/dev/null && IPTABLES_OK=1
+		_IPT_ERR=$(iptables -I INPUT -p tcp --dport "$IPERF_PORT" -m statistic --mode random --probability 0.1 -j DROP 2>&1) && IPTABLES_OK=1 || _IPT_ERR="iptables: $_IPT_ERR"
 	fi
 	if [ "$NETEM_OK" -eq 1 ] || [ "$IPTABLES_OK" -eq 1 ]; then
 		iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
@@ -1826,17 +1900,30 @@ else
 		_CLI=$!; sleep 4
 		COUNTS_S7=$(_ftrace_stop_and_count)
 		_output "S7 TCP 重传 ftrace counts (netem=$NETEM_OK iptables=$IPTABLES_OK)" "$COUNTS_S7"
-		TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
 		if _ftrace_assert "S7" "$COUNTS_S7" \
 			__tcp_retransmit_skb __tcp_transmit_skb dev_hard_start_xmit; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
+			_scenario_status 7 PASS
+		else
+			_scenario_status 7 FAIL
 		fi
 		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
 		# 清理丢包规则
 		[ "$NETEM_OK" -eq 1 ] && tc qdisc del dev lo root 2>/dev/null || true
 		[ "$IPTABLES_OK" -eq 1 ] && iptables -D INPUT -p tcp --dport "$IPERF_PORT" -m statistic --mode random --probability 0.1 -j DROP 2>/dev/null || true
 	else
-		_skip "S7 TCP retransmission: neither tc netem nor iptables statistic available"
+		SKIPPED_SCENARIOS=$((SKIPPED_SCENARIOS + 1))
+		_scenario_status 7 SKIP
+		echo "    [reason] S7: neither tc netem nor iptables statistic available"
+		# 诊断：打印失败原因，便于排查 initramfs 打包/内核配置问题
+		[ -n "$_NETEM_ERR" ] && echo "    [diag]  $_NETEM_ERR"
+		[ -n "$_IPT_ERR" ] && echo "    [diag]  $_IPT_ERR"
+		# 检查 tc 是否能找到 netem qdisc 共享对象
+		if command -v tc >/dev/null 2>&1; then
+			echo "    [diag]  tc path: $(command -v tc)"
+			ls /usr/lib/x86_64-linux-gnu/tc/q_netem.so 2>/dev/null \
+				|| echo "    [diag]  q_netem.so NOT found at /usr/lib/x86_64-linux-gnu/tc/"
+		fi
 	fi
 
 	# 清理 ftrace 状态
@@ -1853,14 +1940,14 @@ else
 		echo "${_c:-0}"
 	}
 	echo ""
-	echo "  +----------------------------------------------------------+"
-	echo "  |  ftrace 覆盖矩阵 (场景 × 函数调用次数)                   |"
-	echo "  +----------------------------------------------------------+"
-	printf "  | %-26s | %4s | %4s | %4s | %4s | %4s | %4s | %4s |\n" \
-		"函数" "S1" "S2" "S3" "S4" "S5" "S6" "S7"
-	echo "  |----------------------------|------|------|------|------|------|------|------|"
+	echo "  +--------------------------------------------------------------------+"
+	echo "  |  ftrace 覆盖矩阵 (场景 × 函数调用次数)                             |"
+	echo "  +--------------------------------------------------------------------+"
+	printf "  | %-26s | %4s | %4s | %4s | %4s | %4s | %4s | %4s | %4s |\n" \
+		"函数" "S1" "S2" "S3" "S4" "S5" "S6" "S7" "S8"
+	echo "  |----------------------------|------|------|------|------|------|------|------|------|"
 	for _fn in $FTRACE_FUNCS; do
-		printf "  | %-26s | %4s | %4s | %4s | %4s | %4s | %4s | %4s |\n" \
+		printf "  | %-26s | %4s | %4s | %4s | %4s | %4s | %4s | %4s | %4s |\n" \
 			"$_fn" \
 			"$(_ftrace_get_count "$COUNTS_S1" "$_fn")" \
 			"$(_ftrace_get_count "$COUNTS_S2" "$_fn")" \
@@ -1868,19 +1955,235 @@ else
 			"$(_ftrace_get_count "$COUNTS_S4" "$_fn")" \
 			"$(_ftrace_get_count "$COUNTS_S5" "$_fn")" \
 			"$(_ftrace_get_count "$COUNTS_S6" "$_fn")" \
-			"$(_ftrace_get_count "$COUNTS_S7" "$_fn")"
+			"$(_ftrace_get_count "$COUNTS_S7" "$_fn")" \
+			"$(_ftrace_get_count "$COUNTS_S8" "$_fn")"
 	done
-	echo "  +----------------------------------------------------------+"
+	echo "  +--------------------------------------------------------------------+"
 	# 矩阵解读提示
-	echo "  | 解读: 每列(场景)的预期函数应全部非零 → 场景 PASS      |"
-	echo "  | 解读: 每行(函数)至少在一个场景非零 → 打桩点可达        |"
-	echo "  +----------------------------------------------------------+"
+	echo "  | 解读: 每列(场景)的预期函数应全部非零 → 场景 PASS                |"
+	echo "  | 解读: 每行(函数)至少在一个场景非零 → 打桩点可达                  |"
+	echo "  +--------------------------------------------------------------------+"
+
+	# --- 场景级状态汇总（TASK-37: 不打开 QEMU log 也能看到 S7/S8 状态）---
+	echo ""
+	echo "  +--------------------------------------------------------------------+"
+	echo "  |  Test 23 场景状态汇总 (S1-S8)                                      |"
+	echo "  +--------------------------------------------------------------------+"
+	printf "  | S1=%-4s S2=%-4s S3=%-4s S4=%-4s S5=%-4s S6=%-4s S7=%-4s S8=%-4s |\n" \
+		"$SCEN_S1" "$SCEN_S2" "$SCEN_S3" "$SCEN_S4" "$SCEN_S5" "$SCEN_S6" "$SCEN_S7" "$SCEN_S8"
+	echo "  +--------------------------------------------------------------------+"
+	printf "  | 场景通过率: %d/%d PASS, %d SKIP, %d FAIL                          |\n" \
+		"$PASSED_SCENARIOS" "$TOTAL_SCENARIOS" "$SKIPPED_SCENARIOS" \
+		"$((TOTAL_SCENARIOS - PASSED_SCENARIOS - SKIPPED_SCENARIOS))"
+	echo "  +--------------------------------------------------------------------+"
 
 	# --- 汇总 ---
-	if [ "$PASSED_SCENARIOS" -eq "$TOTAL_SCENARIOS" ]; then
-		_pass "all $TOTAL_SCENARIOS ftrace scenarios passed (13 functions verified)"
+	# 区分 SKIP（环境缺失，不阻断 CI）和 FAIL（场景跑了但断言失败，必须阻断）
+	# 与 v6.1.0 共识一致：环境不可用时 _skip 而非 _fail（DLG-20260801-183000 议题1）
+	FAILED_SCENARIOS=$((TOTAL_SCENARIOS - PASSED_SCENARIOS - SKIPPED_SCENARIOS))
+	if [ "$FAILED_SCENARIOS" -gt 0 ]; then
+		_fail "$FAILED_SCENARIOS/$TOTAL_SCENARIOS scenarios failed (PASS=$PASSED_SCENARIOS SKIP=$SKIPPED_SCENARIOS)"
+	elif [ "$SKIPPED_SCENARIOS" -gt 0 ]; then
+		_skip "$SKIPPED_SCENARIOS/$TOTAL_SCENARIOS scenarios skipped (PASS=$PASSED_SCENARIOS, no failures)"
 	else
-		_fail "$((TOTAL_SCENARIOS - PASSED_SCENARIOS))/$TOTAL_SCENARIOS scenarios failed"
+		_pass "all $TOTAL_SCENARIOS ftrace scenarios passed (13 functions verified)"
+	fi
+fi
+
+# ================================================================
+# 第九部分：kprobe events 调用计数比验证 (白盒语义验证)
+# ================================================================
+echo ""
+echo "+--------------------------------------------------------------+"
+echo "|  第九部分：kprobe events 调用计数比验证 (白盒语义验证)       |"
+echo "+--------------------------------------------------------------+"
+
+# ---- Test 24: kprobe events 验证 tx_start/tx_end 调用计数比 ----
+_test_header "kprobe events 验证 tx_start/tx_end 调用计数比"
+# TRACEFS 可能在 Test 23 的 else 分支中未定义，这里确保有默认值
+: "${TRACEFS:=/sys/kernel/tracing}"
+# kprobe events 与 ftrace function tracer 不同：
+# - function tracer 只能记录"函数被调用"，不能抓参数
+# - kprobe events 可以抓取函数参数（如 skb 指针），用于辅助诊断
+#
+# 验证目标（关联 v6.1.0 问题 2.3.1）：
+# 验证 tx_start 和 tx_end 的调用次数比在合理范围内。
+# 注意：本测试验证的是"调用计数比"，不是"per-skb 配对"。
+# per-skb 配对需要解析 trace 中的 skb 指针并做集合匹配，留待后续增强。
+#
+# 技术约束：
+# - rx_start 是 static inline，不可被 kprobe 捕获 → 只验证 tx 路径
+# - tx_end 内部有守卫 `if (!start || !sk) return`，纯 ACK 的 skb (start=0) 会跳过
+#   → tx_end 调用次数可能略少于 tx_start（纯 ACK 不计入）
+# - GSO 分段：一个 parent skb 经 skb_segment() 分成 N 段，每段都继承 delayacct_start
+#   → tx_end 会被调用 N 次，tx_start 只 1 次 → tx_end 可能多于 tx_start
+# 综合两点，断言用比率范围 [0.5, 2.0] 而非严格相等
+if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/kprobe_events" ]; then
+	_desc \
+		"通过 kprobe events 捕获 tx_start/tx_end 调用，验证两函数计数比在合理范围" \
+		"注册 kprobe → 运行 TCP 流量 → 统计两函数调用次数 → 断言计数比在合理范围" \
+		"tx_end/tx_start 计数比 ∈ [0.5, 2.0]（容忍纯 ACK 守卫 + GSO 分段）"
+
+	# 清理之前的 kprobe 状态
+	echo > "$TRACEFS/kprobe_events" 2>/dev/null || true
+	echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+	echo > "$TRACEFS/trace" 2>/dev/null || true
+
+	# 注册 kprobe：抓取 skb 指针
+	# 函数签名: void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb)
+	# x86_64 ABI: arg1=rdi(sk), arg2=rsi(skb)
+	#
+	# 注意：使用 %si:u64 寄存器语法而非 $arg2 BTF 语法。
+	# $argN 需要 CONFIG_DEBUG_INFO_BTF=y（本项目内核未启用 BTF），
+	# %si 寄存器语法只需 CONFIG_KPROBE_EVENTS=y（已启用）。
+	echo 'p:tx_start net_delayacct_tx_start skb=%si:u64' > "$TRACEFS/kprobe_events" 2>/dev/null
+	echo 'p:tx_end net_delayacct_tx_end skb=%si:u64' >> "$TRACEFS/kprobe_events" 2>/dev/null
+
+	# 诊断信息：仅在 kprobe 注册失败或 NET_DELAYACCT_DEBUG=1 时打印
+	# （问题 2.1.2: 避免测试通过时输出 15-20 行噪声 + 内核地址）
+	_kp_debug() {
+		[ "${NET_DELAYACCT_DEBUG:-0}" = "1" ] || return 0
+		echo "    [debug] kprobe_events content:"
+		cat "$TRACEFS/kprobe_events" 2>/dev/null | sed 's/^/      | /' || echo "      | (empty or unreadable)"
+		echo "    [debug] available_filter_functions has net_delayacct_tx_start: $(grep -c 'net_delayacct_tx_start' "$TRACEFS/available_filter_functions" 2>/dev/null || echo 0)"
+	}
+	_kp_debug
+
+	if grep -q 'tx_start' "$TRACEFS/kprobe_events" 2>/dev/null && \
+	   grep -q 'tx_end' "$TRACEFS/kprobe_events" 2>/dev/null; then
+		# 启用 kprobe events（注册≠启用！必须显式 enable，否则 tracing_on=1 也不记录事件）
+		echo 1 > "$TRACEFS/events/kprobes/enable" 2>/dev/null || true
+		# 启用 tracing
+		echo 1 > "$TRACEFS/tracing_on" 2>/dev/null || true
+
+		# 运行 TCP 流量（iperf3，足够长的传输以产生可观的样本量）
+		IPERF_PORT=21447
+		iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+		_SRV=$!; sleep 1
+		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 3 >/dev/null 2>&1 &
+		_CLI=$!; sleep 4
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+
+		# 统计 tx_start 和 tx_end 的调用次数
+		# trace 行格式: <task>-<pid> [<cpu>] .... <ts>: tx_start: (net_delayacct_tx_start+0x0/0x40) skb=0xffff...
+		# 注意：grep -c 找到 0 匹配时返回退出码 1，用 || true 抑制；输出可能含换行，用 $(...) 自动去除尾部换行
+		TX_START_COUNT=$(grep -c 'tx_start:' "$TRACEFS/trace" 2>/dev/null || true)
+		TX_END_COUNT=$(grep -c 'tx_end:' "$TRACEFS/trace" 2>/dev/null || true)
+		TX_START_COUNT=${TX_START_COUNT:-0}
+		TX_END_COUNT=${TX_END_COUNT:-0}
+
+		# 诊断信息：仅在 NET_DELAYACCT_DEBUG=1 时打印 trace 内容（含内核地址，不宜公开）
+		if [ "${NET_DELAYACCT_DEBUG:-0}" = "1" ]; then
+			echo "    [debug] trace lines: $(wc -l < "$TRACEFS/trace" 2>/dev/null || echo '?')"
+			echo "    [debug] trace first 5 lines:"
+			head -5 "$TRACEFS/trace" 2>/dev/null | sed 's/^/      | /' || echo "      | (empty or unreadable)"
+		fi
+
+		_output "kprobe counts" "tx_start=$TX_START_COUNT tx_end=$TX_END_COUNT"
+
+		# 清理 kprobe：先停止 tracing + 禁用 kprobes events 再清空，避免 EBUSY
+		echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || true
+		echo 0 > "$TRACEFS/events/kprobes/enable" 2>/dev/null || true
+		echo > "$TRACEFS/kprobe_events" 2>/dev/null || true
+		echo > "$TRACEFS/trace" 2>/dev/null || true
+
+		_kill "$_CLI" 2>/dev/null || true; _kill "$_SRV" 2>/dev/null || true
+
+		# 断言：调用计数比在合理范围
+		# tx_end/tx_start 计数比 ∈ [0.5, 2.0]
+		# - 下界 0.5：容忍纯 ACK 守卫跳过（tx_end 被调用但 start=0 提前返回）
+		# - 上界 2.0：容忍 GSO 分段（一个 tx_start 对应多个 tx_end）
+		if [ "$TX_START_COUNT" -gt 0 ] && [ "$TX_END_COUNT" -gt 0 ]; then
+			RATIO=$((TX_END_COUNT * 100 / TX_START_COUNT))
+			_output "计数比" "tx_end/tx_start = $TX_END_COUNT/$TX_START_COUNT = ${RATIO}%"
+			if [ "$RATIO" -ge 50 ] && [ "$RATIO" -le 200 ]; then
+				_pass "tx_start/tx_end count ratio OK: start=$TX_START_COUNT end=$TX_END_COUNT ratio=${RATIO}% (within [50%, 200%])"
+			else
+				_fail "count ratio out of range: tx_end/tx_start = ${RATIO}% (expect [50%, 200%])"
+			fi
+		else
+			_show_output "kprobe trace (no tx_start/tx_end events)" "" ""
+			_fail "no kprobe events captured: tx_start=$TX_START_COUNT tx_end=$TX_END_COUNT (kprobe registration may have failed)"
+		fi
+	else
+		_skip "kprobe events registration failed (net_delayacct_tx_start/tx_end symbols not found)"
+		# 清理
+		echo > "$TRACEFS/kprobe_events" 2>/dev/null || true
+	fi
+else
+	_skip "kprobe_events not available (CONFIG_KPROBE_EVENTS disabled or tracefs not writable)"
+fi
+
+# ---- Test 25: 纯 ACK 不计入 TX 守卫验证 ----
+_test_header "纯 ACK 不计入 TX 守卫验证 (纯接收方 TX=0)"
+# 验证目标（关联 v6.1.0 问题 2.3.3）：
+# tx_end 内部有守卫 `if (!start || !sk) return`，纯 ACK 包的 delayacct_start=0
+# → 纯 ACK 不会被计入 TX 统计。
+#
+# 验证方法：
+# 1. iperf3 server 是纯接收方，只发 ACK 不发应用数据
+# 2. 查询 server 的 TX 计数，应为 0（所有 outgoing 都是纯 ACK，被守卫跳过）
+# 3. 同时验证 server 的 RX > 0，确认确实在通信（避免假阳性）
+if _require iperf3; then
+	_desc \
+		"纯接收方（iperf3 server）的 TX 计数应为 0，证明纯 ACK 守卫生效" \
+		"iperf3 client 发送数据 → server 只收不发应用数据 → 查询 server TX 计数" \
+		"server RX > 0（确认通信）∧ server TX = 0（纯 ACK 被守卫跳过）"
+
+	IPERF_PORT=21448
+	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+	_SRV=$!; sleep 1
+	if kill -0 "$_SRV" 2>/dev/null; then
+		# client 发送 TCP 数据，server 纯接收
+		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 3 >/dev/null 2>&1 &
+		_CLI=$!; sleep 2
+		if kill -0 "$_CLI" 2>/dev/null; then
+			OUT=$("$GET_SOCKDELAYS" -p "$_SRV" 2>&1 || true)
+			_output "get_sockdelays -p $_SRV (server, 纯接收方)" "$OUT"
+
+			# iperf3 server 有 3 类 socket：
+			# 1. listen socket: TX=0, RX=0（不传输数据）
+			# 2. control connection: 双向（server 也发测试结果），TX 可能 > 0
+			# 3. data connection: 纯接收，TX 应为 0（所有 outgoing 都是纯 ACK，被守卫跳过）
+			#
+			# 断言：存在至少一个 data socket 满足 RX > 0 ∧ TX = 0
+			# （而非汇总所有 socket 的 TX，因为 control connection 的 TX > 0 是正常的）
+			#
+			# 解析方法：逐 socket 提取 RX/TX 对，找 RX>0 ∧ TX=0 的 socket
+			DATA_SOCK_WITH_TX0=$(echo "$OUT" | awk '
+				/^proto=tcp/ { inode=$0; next }
+				/RX  count=/ { split($2,a,"="); rx=a[2]; next }
+				/TX  count=/ { split($2,a,"="); tx=a[2];
+					if (rx+0 > 0 && tx+0 == 0) count++
+				}
+				END { print count+0 }
+			')
+			# 同时统计总 RX（确认有流量）
+			SRV_RX=$(echo "$OUT" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
+			# 统计 RX>0 的 socket 数（数据 socket）
+			SOCKS_WITH_RX=$(echo "$OUT" | awk '
+				/^proto=tcp/ { inode=$0; next }
+				/RX  count=/ { split($2,a,"="); rx=a[2]; next }
+				/TX  count=/ { if (rx+0 > 0) count++ }
+				END { print count+0 }
+			')
+
+			if [ "$SRV_RX" -gt 0 ] && [ "$DATA_SOCK_WITH_TX0" -ge 1 ]; then
+				_pass "pure receiver TX guard: $DATA_SOCK_WITH_TX0/$SOCKS_WITH_RX data socket(s) have RX>0 ∧ TX=0 (ACK guard effective)"
+			elif [ "$SRV_RX" -gt 0 ] && [ "$DATA_SOCK_WITH_TX0" -eq 0 ]; then
+				_show_output "all data sockets have TX>0 (ACK guard may be broken)" "$OUT" "$_SRV"
+				_fail "no data socket with TX=0 found (RX>0 sockets=$SOCKS_WITH_RX, all have TX>0)"
+			else
+				_show_output "server RX=0 (no traffic observed)" "$OUT" "$_SRV"
+				_fail "server RX=$SRV_RX (RX=0 inconclusive, traffic may not have started)"
+			fi
+			_kill "$_CLI" 2>/dev/null || true
+		else
+			_fail "iperf3 client exited before query"
+		fi
+		_kill "$_SRV" 2>/dev/null || true
+	else
+		_fail "iperf3 server failed to start"
 	fi
 fi
 

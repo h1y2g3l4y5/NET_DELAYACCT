@@ -235,7 +235,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio
+          sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio iproute2 iptables
 
       - name: Setup KVM acceleration
         run: |
@@ -322,6 +322,28 @@ jobs:
               mkdir -p "/tmp/initrd/$(dirname "$lib")"
               cp "$lib" "/tmp/initrd$lib" 2>/dev/null || true
             done
+          done
+
+          # Copy tc + iptables + their shared libs (for Test 23 S7: retransmission via netem/iptables)
+          # tc 需要 netem qdisc 支持 (CONFIG_NET_SCH_NETEM)，iptables 需要 xtables (CONFIG_NETFILTER_XTABLES)
+          for bin in tc iptables; do
+            b=$(which "$bin" 2>/dev/null) || { echo "WARNING: $bin not found, S7 will SKIP"; continue; }
+            rm -f "/tmp/initrd/sbin/$bin" "/tmp/initrd/usr/sbin/$bin"
+            cp "$b" "/tmp/initrd/sbin/$bin"
+            chmod +x "/tmp/initrd/sbin/$bin"
+            for lib in $(ldd "$b" 2>/dev/null | grep -o '/[^ ]*' || true); do
+              mkdir -p "/tmp/initrd/$(dirname "$lib")"
+              cp "$lib" "/tmp/initrd$lib" 2>/dev/null || true
+            done
+            # tc 还依赖 netem qdisc 共享对象 (/usr/lib/x86_64-linux-gnu/tc/q_netem.so)
+            if [ "$bin" = "tc" ]; then
+              for qso in /usr/lib/x86_64-linux-gnu/tc/q_netem.so /usr/lib/x86_64-linux-gnu/tc/*.so; do
+                [ -f "$qso" ] || continue
+                mkdir -p "/tmp/initrd/usr/lib/x86_64-linux-gnu/tc"
+                cp "$qso" "/tmp/initrd/usr/lib/x86_64-linux-gnu/tc/" 2>/dev/null || true
+              done
+            done
+            echo "Packed $bin with shared libs"
           done
 
           # Copy get_sockdelays shared libs + dynamic linker
@@ -412,10 +434,16 @@ jobs:
             tail -1000 /tmp/qemu.log 2>/dev/null || true
             echo '```'
             echo ""
-            PASS=$(grep -c '\[PASS\]' /tmp/qemu.log 2>/dev/null || true)
-            FAIL=$(grep -c '\[FAIL\]' /tmp/qemu.log 2>/dev/null || true)
-            SKIP=$(grep -c '\[SKIP\]' /tmp/qemu.log 2>/dev/null || true)
+            PASS=$(grep -E '^\s*\[PASS\]' /tmp/qemu.log 2>/dev/null | wc -l || true)
+            FAIL=$(grep -E '^\s*\[FAIL\]' /tmp/qemu.log 2>/dev/null | wc -l || true)
+            SKIP=$(grep -E '^\s*\[SKIP\]' /tmp/qemu.log 2>/dev/null | wc -l || true)
             echo "**Result: ${PASS} PASS, ${FAIL} FAIL, ${SKIP} SKIP**"
+            echo ""
+            # 提取 Test 23 场景状态汇总行（TASK-37: 不打开 artifact 也能看到 S7/S8 状态）
+            echo "### Test 23 Scenario Status"
+            echo '```'
+            grep -E '场景通过率|S[1-8]=' /tmp/qemu.log 2>/dev/null || echo "(Test 23 not run or no scenario summary)"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           tail -1000 /tmp/qemu.log > /tmp/test-summary.txt 2>/dev/null || true
           echo "Step summary updated"
