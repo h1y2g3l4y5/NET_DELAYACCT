@@ -44,11 +44,14 @@
 | bash -n run-tests.sh | 通过 | 语法校验 |
 | helper 编译（static linked） | 通过 | `make -B -C tests/helper` 无 warning |
 | 本地 QEMU (TCG) | 25 PASS / 0 FAIL / 0 SKIP | 与 TASK-39 同次验证 |
-| CI checkpatch | 待验证 | 推送后触发 |
-| CI QEMU (KVM) | 待验证 | 推送后触发 |
+| CI checkpatch (run #127) | 通过 | ✅ |
+| CI build-kernel (run #127) | 通过 | ✅ |
+| CI build-tool (run #127) | 通过 | ✅ |
+| CI QEMU (KVM) (run #127) | **失败** | Test 24 mismatched=18 超阈值 7（KVM ACK 占比高于 TCG） |
+| CI QEMU (KVM) (run #128) | 待验证 | 已修复阈值至 30%，待重新验证 |
 
 ## 明日计划
 
-- [ ] 确认 v6.3.0 CI run 全绿
+- [ ] 确认 v6.3.0 CI run 全绿（阈值修复后）
 - [ ] 提请 Reviewer 启动 v6.3.0 正式 Review
 - [ ] 根据 Review 反馈进行修复（如有）

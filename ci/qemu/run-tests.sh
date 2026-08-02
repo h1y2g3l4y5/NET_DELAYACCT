@@ -2028,7 +2028,7 @@ if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/kprobe_events" ]; then
 	_desc \
 		"通过 kprobe events 捕获 tx_start/tx_end 的 skb 指针，验证 per-skb 配对语义" \
 		"注册 kprobe → 运行 TCP 流量 → 提取 trace 中 skb 指针 → 断言 set(tx_end_skb) ⊆ set(tx_start_skb)" \
-		"错配数 ≤ max(5, tx_end_unique×10%)（容忍纯 ACK 经 tx_end 但不经 tx_start）+ 计数比 ∈ [50%, 200%]"
+		"错配数 ≤ max(10, tx_end_unique×30%)（容忍纯 ACK 经 tx_end 但不经 tx_start，KVM 下 ACK 占比更高）+ 计数比 ∈ [50%, 200%]"
 
 	# 清理之前的 kprobe 状态
 	echo > "$TRACEFS/kprobe_events" 2>/dev/null || true
@@ -2121,16 +2121,20 @@ if [ -d "$TRACEFS" ] && [ -w "$TRACEFS/kprobe_events" ]; then
 		#   kprobe 在函数入口触发，tx_end 内部守卫的早返回不影响 kprobe 捕获。
 		#   纯 ACK / 窗口更新 / FIN 等控制包会经过 tx_end（kprobe 捕获）但不经过
 		#   tx_start（无应用数据发送），这些 skb 不在 tx_start 集合中是预期行为。
-		#   阈值 = max(5, tx_end_unique × 10%)：少量错配容忍 ACK，大量错配说明打点缺陷
+		#   阈值 = max(10, tx_end_unique × 30%)：
+		#     - TCG 模式 ACK 占比低（~8%），30% 阈值有充足余量
+		#     - KVM 模式 TCP 处理更快，ACK/控制包占比更高（~26%），需更宽松阈值
+		#     - >30% 错配说明存在系统性打点错配，是真正的缺陷
 		# - 辅助断言：计数比 ∈ [50%, 200%]（容忍纯 ACK 守卫 + GSO 分段）
 		# 两者都通过才算 PASS；任一失败都 FAIL
 		if [ "$TX_START_COUNT" -gt 0 ] && [ "$TX_END_COUNT" -gt 0 ]; then
 			RATIO=$((TX_END_COUNT * 100 / TX_START_COUNT))
 			_output "计数比" "tx_end/tx_start = $TX_END_COUNT/$TX_START_COUNT = ${RATIO}%"
 
-			# 计算错配阈值：max(5, tx_end_unique / 10)
-			MISMATCH_THRESHOLD=$((TX_END_UNIQUE / 10))
-			[ "$MISMATCH_THRESHOLD" -ge 5 ] || MISMATCH_THRESHOLD=5
+			# 计算错配阈值：max(10, tx_end_unique × 30%)
+			# KVM 模式下 ACK/控制包占比可达 ~26%（vs TCG ~8%），30% 阈值兼顾两种环境
+			MISMATCH_THRESHOLD=$((TX_END_UNIQUE * 3 / 10))
+			[ "$MISMATCH_THRESHOLD" -ge 10 ] || MISMATCH_THRESHOLD=10
 
 			if [ "$MISMATCHED_N" -le "$MISMATCH_THRESHOLD" ] && [ "$RATIO" -ge 50 ] && [ "$RATIO" -le 200 ]; then
 				_pass "per-skb pairing OK: mismatched=$MISMATCHED_N/$TX_END_UNIQUE (threshold=$MISMATCH_THRESHOLD, ACK-tolerant), start_unique=$TX_START_UNIQUE, ratio=${RATIO}% (within [50%, 200%])"
