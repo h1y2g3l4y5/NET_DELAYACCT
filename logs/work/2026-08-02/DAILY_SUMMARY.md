@@ -8,6 +8,7 @@
 | TASK-35 | IPv6 UDP corked 触发 udp_v6_push_pending_frames (Test 23 S8) | 完成 | `udp_v6_push_pending_frames=1026` |
 | TASK-36 | 纯 ACK 不计入 TX 守卫验证 (Test 25) | 完成 | 数据 socket RX>0 ∧ TX=0 |
 | TASK-37 | S7/S8 场景级状态可观测性 | 完成 | 8/8 场景全部 PASS |
+| TASK-38 | 修复 CI QEMU 步骤 bash 语法错误 (done/fi 误用) | 完成 | CI run 30745609797 全绿 |
 
 ## 关键决策
 - **kprobe 参数语法选择 `%si:u64` 而非 `$arg2`**：`$argN` 依赖 BTF（CONFIG_DEBUG_INFO_BTF），项目内核未启用 BTF 且 CI 未安装 pahole/dwarves；`%si` 寄存器语法只需 CONFIG_KPROBE_EVENTS=y（已有），x86_64 下 arg2=RSI。Reviewer 在问题 2.1.1 中正确指出了此阻断性缺陷。
@@ -22,6 +23,7 @@
 - 坑4：run-tests.sh PATH 覆盖导致 tc/iptables 不可达 → **避免方法**：脚本中重新 export PATH 时保留完整路径
 - 坑5：TOTAL_SCENARIOS 计数在 SKIP 时不递增导致 -1 FAIL → **避免方法**：计数器递增在分支判断之前完成
 - 坑6：kprobe_events 清空时报 EBUSY → **避免方法**：ftrace/kprobe 资源清理按"先禁用再清空"顺序
+- 坑7：ci.yml 内联 `run: |` 脚本 `done` 误用为 `fi` 导致 bash 语法错误 (exit 2)，本地 (local-test.sh 正确) 一直通过、仅 CI 失败 → **避免方法**：修改 ci.yml 内联脚本后用 `bash -n` 校验语法；CI 失败时先看 exit code (1=测试失败, 2=语法/脚本错误) 和 qemu.log 是否生成
 
 ## 本地测试结果
 ```
@@ -32,6 +34,17 @@ RESULT: ALL PASS
 - Test 24: kprobe 计数比 PASS（tx_start=4653 tx_end=6025 ratio=129%）
 - Test 25: 纯 ACK 守卫 PASS（数据 socket RX>0 ∧ TX=0）
 - S7 重传: `__tcp_retransmit_skb=46`（tc netem 10% 丢包生效）
+
+## CI 验证结果 (run 30745609797, commit 7d3ed90)
+```
+checkpatch on kernel patches:              success
+Build userspace get_sockdelays:            success
+Build kernel with CONFIG_NET_DELAYACCT:    success
+QEMU runtime test (KVM):                   success  (6m 5s)
+```
+- 总时长 19m 6s，0 error 注解（仅 Node.js 20 弃用 warning）
+- `qemu-log` (22.5KB) + `test-summary` (14.8KB) 均生成，确认 QEMU 运行 + 测试执行
+- 修复历程：v6.2.0 推送后 CI exit 2 (语法错误) → 加诊断 (commit 9068ad3) → bash -n 定位 done/fi → 修复 (commit 7d3ed90) → CI 全绿
 
 ## Review 响应
 - v6.2.0 Review 提出 7 条问题，**全部接受并修复**：
@@ -44,6 +57,6 @@ RESULT: ALL PASS
   - 2.4.1 (低) 缺 DAILY_SUMMARY → 已创建
 
 ## 明日计划
-- 推送代码并监控 CI 结果
-- CI 验证 KVM 环境下 tc netem 是否可用
-- 如 CI 通过，提请 Reviewer 闭环 v6.2.0
+- 提请 Reviewer 闭环 v6.2.0（本地 25/25 PASS + CI 全绿均已验证）
+- 后续可优化：ci.yml actions 版本升级 (Node.js 20 弃用 warning)
+- v6.3.0 规划：Test 24 per-skb 配对验证（当前为计数比）
