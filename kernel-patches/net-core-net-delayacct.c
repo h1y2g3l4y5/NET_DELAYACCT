@@ -769,7 +769,7 @@ void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb)
 	skb->delayacct_start = 0;
 
 	n = &sk->sk_net_delayacct;
-	spin_lock(&n->lock);
+	spin_lock_bh(&n->lock);
 	if (n->stats.rx_total_ns > U64_MAX - delta)
 		pr_warn_once("net_delayacct: RX total_ns overflow on socket %p\n", sk);
 	n->stats.rx_total_ns += delta;
@@ -778,7 +778,7 @@ void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb)
 		n->stats.rx_min_ns = delta;
 	if (delta > n->stats.rx_max_ns)
 		n->stats.rx_max_ns = delta;
-	spin_unlock(&n->lock);
+	spin_unlock_bh(&n->lock);
 }
 
 void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb)
@@ -817,7 +817,7 @@ void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
 	skb->delayacct_start = 0;
 
 	n = &sk->sk_net_delayacct;
-	spin_lock(&n->lock);
+	spin_lock_bh(&n->lock);
 	if (n->stats.tx_total_ns > U64_MAX - delta)
 		pr_warn_once("net_delayacct: TX total_ns overflow on socket %p\n", sk);
 	n->stats.tx_total_ns += delta;
@@ -826,7 +826,7 @@ void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
 		n->stats.tx_min_ns = delta;
 	if (delta > n->stats.tx_max_ns)
 		n->stats.tx_max_ns = delta;
-	spin_unlock(&n->lock);
+	spin_unlock_bh(&n->lock);
 
 	/* No sock_put() here: see the note in net_delayacct_tx_start().
 	 * skb->sk lifetime is managed by skb->destructor (sock_wfree),
@@ -839,23 +839,23 @@ void net_delayacct_get_stats(struct sock *sk,
 {
 	struct net_delayacct *n = &sk->sk_net_delayacct;
 
-	spin_lock(&n->lock);
+	spin_lock_bh(&n->lock);
 	*out = n->stats;
-	spin_unlock(&n->lock);
+	spin_unlock_bh(&n->lock);
 }
 
 void net_delayacct_reset(struct sock *sk)
 {
 	struct net_delayacct *n = &sk->sk_net_delayacct;
 
-	spin_lock(&n->lock);
+	spin_lock_bh(&n->lock);
 	memset(&n->stats, 0, sizeof(n->stats));
 	/* min_ns must be U64_MAX so that the first sample is always smaller;
 	 * max_ns starts at 0 so the first sample is always larger.
 	 */
 	n->stats.rx_min_ns = U64_MAX;
 	n->stats.tx_min_ns = U64_MAX;
-	spin_unlock(&n->lock);
+	spin_unlock_bh(&n->lock);
 }
 
 static int __init net_delayacct_mod_init(void)

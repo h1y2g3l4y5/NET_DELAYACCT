@@ -84,6 +84,7 @@ test-results/
 # QEMU local state (not committed)
 .qemu_last_tested
 ci/qemu/local-initrd.img
+ci/qemu/perf-initrd.img
 
 # Patch artifacts / 补丁中间产物
 *.patch.rej
