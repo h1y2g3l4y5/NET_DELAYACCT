@@ -140,4 +140,11 @@ OFF kernel mode: OFF
 - **本任务无阻断性遗留**：内存测量修复 + 显示 bug 修复 + 文档同步均完成并验证。
 - **64 vs 72 推测待验证**：差异原因（struct sock 对齐空洞被复用）为推测，v6.5.0 可用 `pahole` 确认 `struct sock` 实际布局。
 - **CI 验证**：本次仅本地 TCG 验证。perf-test.sh 的 \r 修复和 run-perf-tests.sh 的 TCP slab 修复需在 CI KVM 环境复验（KVM 下 /proc/slabinfo 同样可读，预期无差异）。
-- **perf-test.sh 对比表格式化**：verdict 逻辑只输出 2/5 指标判定（tcp_throughput + udp_pps），其余 3 项漏判，不影响数据正确性，待后续完善。
+
+### 勘误（2026-08-06，v6.4.0 实现复审问题 #4）：verdict 覆盖率误判
+
+> 原文（已删除）：「verdict 逻辑只输出 2/5 指标判定（tcp_throughput + udp_pps），其余 3 项漏判」
+
+**勘误**：此判断有误。verdict 实际覆盖 **3/5**：`tcp_throughput_mbps` + `udp_pps`（循环判定）+ `sock_objsize_bytes`（独立判定块，perf-test.sh L421-L430）。我观察到"2/5"是因为 22:07:18 run 受 `\r` bug 影响，`on_sock='2304\r'` 未通过 `^[0-9]+$` 校验，sock verdict 分支被跳过 —— 我把"被 \r bug 掩盖的 sock verdict"误诊为"verdict 逻辑未覆盖 sock"。真正的缺口是 `tcp_latency_us` 与 `cpu_util_pct` 共 2 项未判定（已在 TASK-47 补齐，并将 verdict 升级为三态 PASS/FAIL/INVALID）。
+
+**教训**：观察到的"缺失"需区分"逻辑未实现"与"逻辑被上游 bug 掩盖"两种成因；修完上游 bug 后应复测确认观察值变化，再下归因结论。

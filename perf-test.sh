@@ -28,11 +28,13 @@ QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
 QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-300}"
 QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-600}"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# 用 $'...' ANSI-C quoting 让变量值为实际转义字符（而非字面 \033），
+# 这样 echo（无 -e）与 printf 均能正确输出颜色，日志不再出现 \033[0;31m 字面量
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
 
 mkdir -p "$LOG_DIR"
 
@@ -50,6 +52,27 @@ BZIMAGE_OFF="$LINUX_SRC/arch/x86/boot/bzImage-off"
 log_section() {
     echo ""
     echo "--- [$1] $(date '+%H:%M:%S') ---"
+}
+
+# 计算中位数（空格分隔的数值列表）；空列表返回空串
+_median() {
+    echo "$1" | tr ' ' '\n' | sort -n | \
+        awk '{a[NR]=$1} END {if(NR==0){print ""; exit} if(NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2}'
+}
+
+# 三态判定，回显状态字 PASS / FAIL / INVALID，由调用方计数与打印
+# degradation: 正值=ON 更差（预期方向，工具加开销）；负值=ON 更优（噪声主导→INVALID）；
+#              超过 threshold=FAIL，否则 PASS。用 INVALID 而非 FAIL：噪声不是回归，
+#              FAIL 会误报回归方向；INVALID 表达"本次测量不可信，建议重跑"。
+_verdict3() {
+    local degradation="$1" threshold="$2"
+    if awk "BEGIN {exit !(${degradation} < 0)}"; then
+        echo INVALID
+    elif awk "BEGIN {exit !(${degradation} > ${threshold})}"; then
+        echo FAIL
+    else
+        echo PASS
+    fi
 }
 
 # 复制二进制及其依赖的共享库到 initramfs 目录
@@ -361,8 +384,8 @@ compare_and_report() {
 
         # 取中位数
         local on_med off_med
-        on_med=$(echo "$on_vals" | tr ' ' '\n' | sort -n | awk '{a[NR]=$1} END {if(NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2}')
-        off_med=$(echo "$off_vals" | tr ' ' '\n' | sort -n | awk '{a[NR]=$1} END {if(NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2}')
+        on_med=$(_median "$on_vals")
+        off_med=$(_median "$off_vals")
 
         # 计算变化百分比
         local delta
@@ -371,7 +394,8 @@ compare_and_report() {
             delta=$(awk "BEGIN {if(${off_med}>0) printf \"%.1f%%\", (${off_med}-${on_med})/${off_med}*100; else print \"N/A\"}")
         elif [ "$metric" = "tcp_latency_us" ] || [ "$metric" = "cpu_util_pct" ]; then
             # 延迟/CPU：增加百分比 = (ON - OFF) / OFF * 100
-            delta=$(awk "BEGIN {if(${off_med}>0) printf \"+%.1f%%\", (${on_med}-${off_med})/${off_med}*100; else print \"N/A\"}")
+            # 用 %+.1f%% 让符号随正负自动（+5.0% / -17.8%），避免 "+%.1f%%" 对负值产生 "+-17.8%" 双符号
+            delta=$(awk "BEGIN {if(${off_med}>0) printf \"%+.1f%%\", (${on_med}-${off_med})/${off_med}*100; else print \"N/A\"}")
         fi
 
         printf "| %-28s | %12s | %12s | %8s |\n" "$metric" "$on_med" "$off_med" "$delta"
@@ -396,46 +420,84 @@ compare_and_report() {
     echo "  Perf-5 CPU util increase:    < 10% (relative)"
     echo ""
 
-    # 自动判定
+    # ---- 自动判定（三态：PASS / FAIL / INVALID）----
+    # net_delayacct 是加开销工具，ON 合法优于 OFF 不可能；若 ON 反超 OFF
+    # （degradation<0）说明测量被噪声主导 → INVALID（非 FAIL，避免误报回归方向）。
+    # degradation 统一约定：正值=ON 更差（预期方向），负值=ON 更优（噪声）。
     echo "Verdict:"
-    local verdict_all_pass=true
+    local verdict_fail=0 verdict_invalid=0 status
+    local v_on v_off v_onm v_offm v_drop v_lat v_cpu v_mem v_entry v_m v_t
 
-    for metric in tcp_throughput_mbps udp_pps; do
-        local on_vals="${on_values[${metric}_vals]:-}"
-        local off_vals="${off_values[${metric}_vals]:-}"
-        if [ -n "$on_vals" ] && [ -n "$off_vals" ]; then
-            local on_med off_med drop_pct
-            on_med=$(echo "$on_vals" | tr ' ' '\n' | sort -n | awk '{a[NR]=$1} END {if(NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2}')
-            off_med=$(echo "$off_vals" | tr ' ' '\n' | sort -n | awk '{a[NR]=$1} END {if(NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2}')
-            drop_pct=$(awk "BEGIN {printf \"%.1f\", (${off_med}-${on_med})/${off_med}*100}")
-            local threshold=5
-            [ "$metric" = "udp_pps" ] && threshold=15
-            if awk "BEGIN {exit !(${drop_pct} > ${threshold})}"; then
-                echo "  ${RED}FAIL${NC} $metric: drop ${drop_pct}% > ${threshold}% threshold"
-                verdict_all_pass=false
-            else
-                echo "  ${GREEN}PASS${NC} $metric: drop ${drop_pct}% <= ${threshold}% threshold"
-            fi
+    # Perf-1/2 吞吐与 PPS：degradation = (OFF-ON)/OFF*100，阈值 5% / 15%
+    for v_entry in "tcp_throughput_mbps:5" "udp_pps:15"; do
+        v_m="${v_entry%:*}"; v_t="${v_entry##*:}"
+        v_on="${on_values[${v_m}_vals]:-}"; v_off="${off_values[${v_m}_vals]:-}"
+        if [ -n "$v_on" ] && [ -n "$v_off" ]; then
+            v_onm=$(_median "$v_on"); v_offm=$(_median "$v_off")
+            v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_offm}-${v_onm})/${v_offm}*100}")
+            status=$(_verdict3 "$v_drop" "$v_t")
+            case "$status" in
+                PASS)    echo "  ${GREEN}PASS${NC} $v_m: drop ${v_drop}% <= ${v_t}% threshold";;
+                FAIL)    echo "  ${RED}FAIL${NC} $v_m: drop ${v_drop}% > ${v_t}% threshold"; verdict_fail=$((verdict_fail+1));;
+                INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: ON>OFF by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
+            esac
+        else
+            echo "  ${YELLOW}SKIP${NC} $v_m: no data"
         fi
     done
 
-    if [ -n "$on_sock" ] && [ -n "$off_sock" ] && \
-       echo "$on_sock" | grep -qE '^[0-9]+$' && echo "$off_sock" | grep -qE '^[0-9]+$'; then
-        local mem_delta=$((on_sock - off_sock))
-        if [ "$mem_delta" -le 80 ]; then
-            echo "  ${GREEN}PASS${NC} sock_objsize: +${mem_delta} bytes <= 80 threshold"
-        else
-            echo "  ${RED}FAIL${NC} sock_objsize: +${mem_delta} bytes > 80 threshold"
-            verdict_all_pass=false
-        fi
+    # Perf-3 TCP 延迟：degradation = ON-OFF (绝对 μs)，阈值 10μs
+    v_on="${on_values[tcp_latency_us_vals]:-}"; v_off="${off_values[tcp_latency_us_vals]:-}"
+    if [ -n "$v_on" ] && [ -n "$v_off" ]; then
+        v_onm=$(_median "$v_on"); v_offm=$(_median "$v_off")
+        v_lat=$(awk "BEGIN {printf \"%.1f\", ${v_onm}-${v_offm}}")
+        status=$(_verdict3 "$v_lat" 10)
+        case "$status" in
+            PASS)    echo "  ${GREEN}PASS${NC} tcp_latency_us: +${v_lat}us <= 10us threshold";;
+            FAIL)    echo "  ${RED}FAIL${NC} tcp_latency_us: +${v_lat}us > 10us threshold"; verdict_fail=$((verdict_fail+1));;
+            INVALID) echo "  ${YELLOW}INVALID${NC} tcp_latency_us: ON<OFF (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
+        esac
+    else
+        echo "  ${YELLOW}SKIP${NC} tcp_latency_us: no data"
     fi
 
-    if $verdict_all_pass; then
-        echo ""
-        echo "${GREEN}=== ALL PERFORMANCE TESTS PASSED ===${NC}"
+    # Perf-5 CPU 利用率：degradation = (ON-OFF)/OFF*100 (相对 %)，阈值 10%
+    v_on="${on_values[cpu_util_pct_vals]:-}"; v_off="${off_values[cpu_util_pct_vals]:-}"
+    if [ -n "$v_on" ] && [ -n "$v_off" ]; then
+        v_onm=$(_median "$v_on"); v_offm=$(_median "$v_off")
+        v_cpu=$(awk "BEGIN {printf \"%.1f\", (${v_onm}-${v_offm})/${v_offm}*100}")
+        status=$(_verdict3 "$v_cpu" 10)
+        case "$status" in
+            PASS)    echo "  ${GREEN}PASS${NC} cpu_util_pct: +${v_cpu}% <= 10% threshold";;
+            FAIL)    echo "  ${RED}FAIL${NC} cpu_util_pct: +${v_cpu}% > 10% threshold"; verdict_fail=$((verdict_fail+1));;
+            INVALID) echo "  ${YELLOW}INVALID${NC} cpu_util_pct: ON<OFF (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
+        esac
     else
-        echo ""
-        echo "${YELLOW}=== SOME TESTS NEED ATTENTION (see above) ===${NC}"
+        echo "  ${YELLOW}SKIP${NC} cpu_util_pct: no data"
+    fi
+
+    # Perf-4 每 socket 内存：degradation = ON-OFF (bytes)，阈值 80
+    if [ -n "$on_sock" ] && [ -n "$off_sock" ] && \
+       echo "$on_sock" | grep -qE '^[0-9]+$' && echo "$off_sock" | grep -qE '^[0-9]+$'; then
+        v_mem=$((on_sock - off_sock))
+        status=$(_verdict3 "$v_mem" 80)
+        case "$status" in
+            PASS)    echo "  ${GREEN}PASS${NC} sock_objsize: +${v_mem} bytes <= 80 threshold";;
+            FAIL)    echo "  ${RED}FAIL${NC} sock_objsize: +${v_mem} bytes > 80 threshold"; verdict_fail=$((verdict_fail+1));;
+            INVALID) echo "  ${YELLOW}INVALID${NC} sock_objsize: ON<OFF (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
+        esac
+    else
+        echo "  ${YELLOW}SKIP${NC} sock_objsize: no data"
+    fi
+
+    # 总结论（三态优先级：FAIL > INVALID > PASS）
+    echo ""
+    if [ "$verdict_fail" -gt 0 ]; then
+        echo "${RED}=== ${verdict_fail} TEST(S) FAILED (see above) ===${NC}"
+    elif [ "$verdict_invalid" -gt 0 ]; then
+        echo "${YELLOW}=== INCONCLUSIVE: ${verdict_invalid} measurement(s) noise-dominated (rerun recommended) ===${NC}"
+    else
+        echo "${GREEN}=== ALL PERFORMANCE TESTS PASSED ===${NC}"
     fi
 
     echo ""

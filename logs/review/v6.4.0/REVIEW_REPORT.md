@@ -1,10 +1,11 @@
-# 审查报告 - v6.4.0（性能影响测试专项 · 规划阶段）
+# 审查报告 - v6.4.0（性能影响测试专项）
 
-- **审查日期**: 2026-08-03
-- **审查范围**: v6.3.0 闭环后，用户提出的测试覆盖盲区 —— 工具引入后对系统（内存/网络/CPU）性能影响无量化手段
+- **初始审查日期**: 2026-08-03（规划阶段）
+- **实现复审日期**: 2026-08-06（TASK-43/44/45/46 代码复审）
+- **审查范围**: v6.3.0 闭环后，用户提出的测试覆盖盲区 —— 工具引入后对系统（内存/网络/CPU）性能影响无量化手段；及 Review 调查中发现的 per-socket 锁 `_bh` 隐患
 - **审查人**: Reviewer
-- **状态**: [规划阶段] — 尚无 Worker 代码可评分，本报告为下版本测试设计的输入
-- **总体评分**: 暂不评分（规划文档，待 Worker 实现 + Review 后再打分）
+- **状态**: [复审中] — 规划阶段 2 条议题已闭环（共识）；实现复审 5 条问题 Worker 已全部接受并修复（TASK-47，2026-08-06），待 Reviewer 复审确认闭环
+- **总体评分**: 7.5/10（实现质量良好，spin_lock_bh 修复扎实且经 CI KVM 验证；但 perf-test.sh 自动判定逻辑存在"噪声假 PASS"高危缺陷，会给出虚假达标结论）
 
 ---
 
@@ -196,3 +197,115 @@ QEMU + virtio-net 的吞吐和延迟不能代表物理网卡。测试结果**只
 - 问题 2.1.1 是否在性能测试中复现，修复后是否回归
 - CI 编排如何支持"同内核开关 Kconfig"的对比构建
 - 性能报告文档是否清晰区分 QEMU 相对值与物理机绝对值
+
+---
+
+# 九、实现复审（2026-08-06）
+
+规划阶段 2 条议题（性能测试盲区、spin_lock_bh）经 [DLG-20260803-101200](file:///home/lai/Code/NET_DELAYACCT/logs/dialogue/DLG-20260803-101200.md) 已达成共识并闭环。Worker 随后实现 TASK-43/44/45/46 并提交 `cc9c80e`。本节是对**实际代码**的首次复审。
+
+## 9.1 交付物概览
+
+| 任务 | 交付物 | CI 验证 |
+|------|--------|---------|
+| TASK-44 | 4 处 `spin_lock` → `spin_lock_bh`（[net-core-net-delayacct.c#L772/L781/L820/L829/L842/L844/L851/L858](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/net-core-net-delayacct.c#L772)）+ 同步 [0007 patch](file:///home/lai/Code/NET_DELAYACCT/kernel-patches/0007-net-core-add-module.patch) | ✅ CI run #135 (KVM) 4/4 jobs success |
+| TASK-43 | `perf-test.sh` + [run-perf-tests.sh](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-perf-tests.sh) + `guest-init-perf.sh`（双内核 ON/OFF 对比） | 本地 TCG（CI 不接入 perf，符合方案 C） |
+| TASK-45 | [docs/PERFORMANCE.md](file:///home/lai/Code/NET_DELAYACCT/docs/PERFORMANCE.md)（原始数据 + 分析 + TCG 局限性） | — |
+| TASK-46 | 内存测量改用 TCP slab + `\r` 显示 bug 修复 + 文档同步 | 本地 TCG |
+
+## 9.2 评分
+
+| 审查项 | 评分 | 说明 |
+|--------|------|------|
+| 代码质量 | 7/10 | spin_lock_bh 修复精准；perf-test.sh verdict 逻辑有"噪声假 PASS"高危缺陷 |
+| 设计合理性 | 9/10 | 双内核 ON/OFF 对比隔离变量、方案 C 分阶段接入 CI、内存改查 TCP slab 根因分析到位 |
+| 测试覆盖 | 7/10 | 5 项指标齐全，但 verdict 自动判定只覆盖 3/5 且对噪声无防御 |
+| 文档/日志质量 | 8/10 | 根因分析详实（struct sock 无独立 slab）、踩坑记录充分；但 TASK-46 对 verdict 覆盖率误判（称 2/5，实为 3/5） |
+| **综合评分** | **7.5/10** | 实现质量良好，核心锁修复扎实且经 KVM 验证；perf-test.sh 判定逻辑缺陷是主要扣分项 |
+
+## 9.3 优点
+
+1. **spin_lock_bh 修复范围完整、论证扎实**：4 处持锁点全部修复（含 Worker 补充的 get_stats 与 Reviewer 补充的 reset），patch 同步，`files->file_lock` 正确排除在外（fd 表锁，非本次范围）。CI run #135 KVM 4/4 jobs success 证实 KVM 下 softirq 调度更频繁的环境无回归 —— 填补了 v6.3.0 "本地 TCG 通过 ≠ CI KVM 通过" 的验证缺口。这是本周期最硬的交付。
+
+2. **内存测量根因分析深入**：[run-perf-tests.sh#L175-L195](file:///home/lai/Code/NET_DELAYACCT/ci/qemu/run-perf-tests.sh#L175-L195) 正确识别 `struct sock` 是基类、无独立 slab，改查 `TCP` slab 的 `/proc/slabinfo` 第 4 列；并正确排除 `sock_inode_cache`（socketfs inode，非 struct sock）和 sysfs 方案（需 `CONFIG_SLUB_DEBUG_ON=y`）。从源码 `sk_prot_alloc()` → `prot->slab` → `prot->name` 的链路论证清晰。
+
+3. **`\r` 规范化方案正确**：[perf-test.sh#L279](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L279) 在保存时 `tr -d '\r'` 统一规范化，下游所有 parse 受益；[#L350-L351](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L350-L351) 提取时再加 `tr -d '\r'` 兜底，双保险。踩坑记录（`${#var}` 长度检测、`cat -A` 显示 `^M`）有方法论价值。
+
+4. **方案 C 决策合理**：perf 测试本地落地、CI 暂不接入，待阈值稳定后 v6.5.0 再接入。理由（QEMU+virtio-net 噪声大、KVM 可用性波动）符合 v6.3.0 "单次数据不可靠" 教训。
+
+## 9.4 问题追踪表（实现复审）
+
+| # | 严重度 | 问题描述 | 建议 | Worker反馈 |
+|---|--------|----------|------|-------------|
+| 3 | 高 | 见下文「问题 9.4.1 — verdict 对噪声数据假 PASS」 | 增加负 drop / 异向判定为 INVALID 并降级结论 | 接受 — TASK-47 重写 verdict 为三态（PASS/FAIL/INVALID），5 指标全覆盖，总结论区分 FAIL/INCONCLUSIVE/PASS |
+| 4 | 中 | 见下文「问题 9.4.2 — verdict 覆盖率误判（实 3/5 非 2/5）」 | 修正工作日志误判；补齐 tcp_latency/cpu_util verdict | 接受 — TASK-46 日志已勘误（3/5 非 2/5）；TASK-47 补齐 tcp_latency/cpu_util verdict，覆盖率 3/5→5/5 |
+| 5 | 中 | 见下文「问题 9.4.3 — 两处修复未做端到端联合验证」 | 应用两处修复后重跑一次，产出干净的最终报告 | 接受 — TASK-47 应用全部修复后端到端重跑 perf-test.sh --skip-build，确认 sock delta=+64、sock verdict 出现 |
+| 6 | 低 | latency/cpu delta 显示双符号 `+-17.8%`（`printf "+%.1f%%"` 硬编码 `+`） | 改用 `%+.1f%%` 让符号随正负自动 | 接受 — TASK-47 改 `"+%.1f%%"`→`"%+.1f%%"` |
+| 7 | 低 | PERFORMANCE.md 混用两次运行数据（19:29:50 吞吐 + 22:07:18 内存）未显著标注来源 | 在 4.2 表格脚注标注各行数据来源 run | 接受 — TASK-47 在 4.2 表格后加数据来源脚注 + 三态 verdict 说明 |
+
+### 问题 9.4.1 — verdict 对噪声数据假 PASS，给出虚假达标结论
+
+| 段落 | 内容 |
+|------|------|
+| **现象** | [perf-test.sh#L409-L417](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L409-L417) 的 verdict 计算 `drop_pct = (off_med - on_med) / off_med * 100`，判定条件为 `drop_pct > threshold` 则 FAIL 否则 PASS。当 ON 性能**高于** OFF 时（TCG 噪声主导），`drop_pct` 为负，`-17.3 > 5` 为假 → 输出 PASS。实测 [perf-test-20260803_220718.log#L85-L89](file:///home/lai/Code/NET_DELAYACCT/tests/reports/perf/perf-test-20260803_220718.log#L85) 中 TCP drop=-17.3%、UDP drop=-38.1% 均判 PASS，脚本最终打印 `=== ALL PERFORMANCE TESTS PASSED ===`。 |
+| **为什么是问题** | net_delayacct 是**加开销**的工具，ON 性能绝不可能合法地高于 OFF 17%~38%。出现负 drop 只能说明测量被 TCG 噪声主导、数据无效。但 verdict 逻辑把"负 drop"等价于"小 drop"判 PASS，等于用无效数据给出"达标"结论。这直接违反 project_memory 中「测试名实一致原则」—— 给开发者/用户虚假信心。若 v6.5.0 按计划接入 CI，噪声运行的假 PASS 会掩盖真实回归。 |
+| **触发条件** | (1) TCG 模式下 ON/OFF 运行间噪声 > 工具实际开销（已实测发生：22:07:18 run ON 吞吐 870 > OFF 742）；(2) 任何单次运行 ON 恰好优于 OFF 的随机情形；(3) 未来 CI 共享 runner 负载波动时。 |
+| **后果** | 脚本对一次 ON 反超 OFF 38% 的噪声运行报 "ALL PASSED"。用户据此认为"工具开销可接受"，实际数据毫无意义。更坏情况：真实回归使 ON 跌 3%（< 5% 阈值），但因噪声基线漂移被判 PASS，回归被掩盖。 |
+| **修法** | verdict 增加异向检测：当 `drop_pct < 0`（ON 优于 OFF）时不判 PASS，而是判 `INVALID (noise-dominated, ON>OFF)`，并将 `verdict_all_pass` 置 false 或引入第三态 `inconclusive`。同理 latency/cpu 的 `delta < 0` 也应判 INVALID。建议输出类似：`INVALID tcp_throughput: ON>OFF by 17.3% (noise-dominated, measurement invalid)`。 |
+| **为什么这么修** | 性能对比测试的判定不是"是否超过阈值"二值问题，而是三值：达标 / 超标 / 无效。把无效当达标是逻辑漏洞。对比内核 `tools/testing/selftests/` 框架：selftest 对异常结果返回 SKIP/FAIL 而非 PASS，正是为了不混淆"没测出来"和"通过了"。本工具的 perf 测试应当同等要求。 |
+
+**严重度：高**（不修则 verdict 输出不可信，性能测试"达标"结论失去意义）
+
+### 问题 9.4.2 — verdict 覆盖率误判：实为 3/5，工作日志误称 2/5
+
+| 段落 | 内容 |
+|------|------|
+| **现象** | [perf-test.sh#L402](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L402) 的循环覆盖 `tcp_throughput_mbps udp_pps`（2 项），[#L421-L430](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L421-L430) 单独覆盖 `sock_objsize_bytes`（第 3 项）。故 verdict 实际覆盖 **3/5**。但 [TASK-46 日志#L142](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-04/TASK-46_perf-memory-fix.md#L142) 写"verdict 逻辑只输出 2/5 指标判定（tcp_throughput + udp_pps），其余 3 项漏判"。 |
+| **为什么是问题** | Worker 观察到 2/5 是因为 22:07:18 run 受 `\r` bug 影响，`on_sock='2304\r'` 未通过 `^[0-9]+$` 校验，sock verdict 分支被跳过。Worker 把"被 \r bug 掩盖的 sock verdict"误诊为"verdict 逻辑根本没覆盖 sock"，归因错误。这会导致修完 \r bug 后误以为 verdict 仍是 2/5，而漏掉真正的 2 项缺口（tcp_latency_us、cpu_util_pct）。 |
+| **触发条件** | 阅读 22:07:18 受 \r bug 影响的输出做判断时。 |
+| **后果** | verdict 真实缺口（latency/cpu 未判定）被误判的"sock 未判定"掩盖，补齐工作可能修错对象。 |
+| **修法** | (1) 修正 TASK-46 日志为"verdict 覆盖 3/5（tcp/udp/sock），缺 tcp_latency_us + cpu_util_pct 共 2 项"；(2) 补齐 latency/cpu verdict（latency 用绝对阈值 < 10μs，cpu 用相对阈值 < 10%）。 |
+| **为什么这么修** | 准确归因是修复前提。\r bug 修完后 sock verdict 会自动出现，Worker 应重跑确认 3/5，再补剩余 2/5。 |
+
+**严重度：中**（归因错误会误导后续补齐方向）
+
+### 问题 9.4.3 — 两处修复未做端到端联合验证
+
+| 段落 | 内容 |
+|------|------|
+| **现象** | TASK-46 的两处修复（run-perf-tests.sh TCP slab + perf-test.sh `\r`）分别验证：TCP slab 经 22:07:18 run 验证（PERF 行采集到 2304/2240）；`\r` 修复经"旧日志 + 新提取逻辑"手工验证（[TASK-46#L126-L130](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-04/TASK-46_perf-memory-fix.md#L126)）。但**没有一次 run 同时应用两处修复**产出干净报告：22:07:18 run 的对比表 sock delta 仍显示 `-`、verdict 无 sock 行（[\r bug 未修时的输出](file:///home/lai/Code/NET_DELAYACCT/tests/reports/perf/perf-test-20260803_220718.log#L75)）。 |
+| **为什么是问题** | 两处修复有交互：`\r` 修复让 sock 值通过 `^[0-9]+$` 校验 → 触发 sock verdict 分支（问题 9.4.2 提到的第 3 项判定）。只有端到端 run 才能确认表格 delta 列显示 `+64`、verdict 出现 sock PASS 行。手工分项验证不能证明组合后的端到端行为。 |
+| **触发条件** | 任何依赖"两修复组合效果"的输出（对比表 delta、sock verdict）。 |
+| **后果** | 文档引用的 22:07:18 run 其表格/verdict 实际是 broken 状态，与 PERFORMANCE.md 宣称的"+64 bytes PASS"不自洽。若有人复现该 run 会看到矛盾输出。 |
+| **修法** | 应用两处修复后执行一次 `./perf-test.sh --skip-build`，产出干净日志，确认：(1) 表格 sock delta = `+64`；(2) verdict 出现 `PASS sock_objsize: +64 bytes`；(3) 用新日志更新 PERFORMANCE.md 的数据来源引用。 |
+| **为什么这么修** | 端到端验证是证明"修复完整"的唯一方式，分项验证只能证明"单点有效"。这与 v6.3.0 "本地通过 ≠ CI 通过" 同理 —— 局部有效 ≠ 组合有效。 |
+
+**严重度：中**（不影响数据正确性，但交付物自洽性有缺口）
+
+## 9.5 CI 验证确认
+
+CI run #135（commit `cc9c80e`）4/4 jobs success：
+
+| Job | 结论 | 验证内容 |
+|-----|------|----------|
+| checkpatch on kernel patches | success | 0007 patch 格式合规（含 spin_lock_bh 改动） |
+| Build kernel with CONFIG_NET_DELAYACCT | success | spin_lock_bh 改动编译通过 |
+| Build userspace get_sockdelays | success | 用户态工具构建正常 |
+| QEMU runtime test (KVM) | success | S1–S25 功能测试 KVM 模式全过，spin_lock_bh 在更频繁 softirq 调度下无回归 |
+
+**关键意义**：v6.3.0 教训"本地 TCG 通过 ≠ CI KVM 通过"在本次得到正面验证 —— TASK-44 的锁修复同时通过 TCG 本地 + KVM CI，是本项目首次在 KVM 环境验证 softirq 锁安全性。
+
+## 9.6 总体评价
+
+本周期交付质量**整体良好**。spin_lock_bh 修复（议题 2）是全周期的硬核成果：4 处持锁点完整覆盖、patch 同步、TCG+KVM 双环境验证，且 Worker + Reviewer 互补排查（Worker 找到 get_stats、Reviewer 找到 reset）的合作模式值得固化。性能测试基础设施（议题 1）填补了"工具到底多贵"的盲区，内存测量的根因分析（struct sock 无独立 slab）尤其深入。
+
+主要扣分点集中在 perf-test.sh 的**自动判定逻辑**：verdict 对噪声数据假 PASS（问题 9.4.1）是高危缺陷 —— 它让"达标"结论失去可信度，恰好与引入性能测试的初衷（给出可信的开销证据）相悖。这本质是"名实不符"问题：脚本说 PASS，实际数据无效。Worker 在 TASK-46 中已意识到本次 run 噪声主导（"ON 吞吐反而高于 OFF，不具代表性"），但脚本本身没有这个判断力，必须靠人盯 —— 这不可持续，尤其 v6.5.0 接入 CI 后。
+
+建议 Worker 优先处理问题 9.4.1（让 verdict 能识别噪声/无效数据），其次 9.4.3（端到端重跑产出自洽报告），9.4.2 及问题 #6/#7 可一并修。
+
+## 9.7 下版本（v6.5.0）关注点更新
+
+- verdict 三态判定（PASS/FAIL/INVALID）落实后再考虑 CI 接入
+- KVM 环境补齐 TCP 延迟等 TCG 噪声敏感指标的多轮数据
+- `pahole` 验证 struct sock 实际布局，确认 64 vs 72 差异根因（当前为推测）
+- 补齐 tcp_latency_us / cpu_util_pct 的 verdict 判定（覆盖率 3/5 → 5/5）
