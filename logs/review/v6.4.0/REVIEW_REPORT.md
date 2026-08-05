@@ -4,8 +4,8 @@
 - **实现复审日期**: 2026-08-06（TASK-43/44/45/46 代码复审）
 - **审查范围**: v6.3.0 闭环后，用户提出的测试覆盖盲区 —— 工具引入后对系统（内存/网络/CPU）性能影响无量化手段；及 Review 调查中发现的 per-socket 锁 `_bh` 隐患
 - **审查人**: Reviewer
-- **状态**: [复审中] — 规划阶段 2 条议题已闭环（共识）；实现复审 5 条问题 Worker 已全部接受并修复（TASK-47，2026-08-06），待 Reviewer 复审确认闭环
-- **总体评分**: 7.5/10（实现质量良好，spin_lock_bh 修复扎实且经 CI KVM 验证；但 perf-test.sh 自动判定逻辑存在"噪声假 PASS"高危缺陷，会给出虚假达标结论）
+- **状态**: [闭环完成] — 规划阶段 2 条议题已闭环（共识）；实现复审 5 条问题 Worker 已全部接受并修复（TASK-47，commit 253ef7a，2026-08-06），Reviewer 独立验证通过并闭环
+- **总体评分**: 8.5/10（verdict 三态判定修复了"噪声假 PASS"高危缺陷，5/5 指标全覆盖，3 次端到端验证三态全触发；附加颜色码修复；spin_lock_bh 经 KVM CI 验证）
 
 ---
 
@@ -215,13 +215,13 @@ QEMU + virtio-net 的吞吐和延迟不能代表物理网卡。测试结果**只
 
 ## 9.2 评分
 
-| 审查项 | 评分 | 说明 |
-|--------|------|------|
-| 代码质量 | 7/10 | spin_lock_bh 修复精准；perf-test.sh verdict 逻辑有"噪声假 PASS"高危缺陷 |
-| 设计合理性 | 9/10 | 双内核 ON/OFF 对比隔离变量、方案 C 分阶段接入 CI、内存改查 TCP slab 根因分析到位 |
-| 测试覆盖 | 7/10 | 5 项指标齐全，但 verdict 自动判定只覆盖 3/5 且对噪声无防御 |
-| 文档/日志质量 | 8/10 | 根因分析详实（struct sock 无独立 slab）、踩坑记录充分；但 TASK-46 对 verdict 覆盖率误判（称 2/5，实为 3/5） |
-| **综合评分** | **7.5/10** | 实现质量良好，核心锁修复扎实且经 KVM 验证；perf-test.sh 判定逻辑缺陷是主要扣分项 |
+| 审查项 | 初始评分 | 复审评分 | 说明 |
+|--------|----------|----------|------|
+| 代码质量 | 7/10 | 8.5/10 | spin_lock_bh 修复精准；verdict 三态判定修复"噪声假 PASS"高危缺陷；附加颜色码字面量修复（Worker 自检） |
+| 设计合理性 | 9/10 | 9/10 | 双内核 ON/OFF 对比隔离变量、方案 C 分阶段接入 CI、内存改查 TCP slab 根因分析到位 |
+| 测试覆盖 | 7/10 | 9/10 | verdict 覆盖率 3/5→5/5；三态全触发验证（Run A 4 INVALID / Run C 1 FAIL+4 PASS）；3 次端到端 run |
+| 文档/日志质量 | 8/10 | 9/10 | 根因分析详实；TASK-46 勘误到位；PERFORMANCE.md 数据来源脚注；踩坑记录 3 条均有方法论价值 |
+| **综合评分** | **7.5/10** | **8.5/10** | 初始：verdict 假 PASS 高危缺陷是主要扣分项；复审：高危缺陷已修复且三态全验证，质量显著提升 |
 
 ## 9.3 优点
 
@@ -308,4 +308,51 @@ CI run #135（commit `cc9c80e`）4/4 jobs success：
 - verdict 三态判定（PASS/FAIL/INVALID）落实后再考虑 CI 接入
 - KVM 环境补齐 TCP 延迟等 TCG 噪声敏感指标的多轮数据
 - `pahole` 验证 struct sock 实际布局，确认 64 vs 72 差异根因（当前为推测）
-- 补齐 tcp_latency_us / cpu_util_pct 的 verdict 判定（覆盖率 3/5 → 5/5）
+- ~~补齐 tcp_latency_us / cpu_util_pct 的 verdict 判定（覆盖率 3/5 → 5/5）~~ ✅ 已在 TASK-47 完成
+
+---
+
+# 十、复审闭环确认（2026-08-06）
+
+Worker 提交 TASK-47（commit `253ef7a`）回应实现复审 5 条问题，并自检追加颜色码修复。Reviewer 独立验证代码与端到端日志，确认闭环。
+
+## 10.1 逐条验证结果
+
+| # | 严重度 | 问题 | Worker 处置 | Reviewer 独立验证 | 结论 |
+|---|--------|------|-------------|-------------------|------|
+| 3 | 高 | verdict 对噪声数据假 PASS | 重写三态 PASS/FAIL/INVALID | [perf-test.sh#L421-L499](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L421-L499) 三态逻辑落地；Run A 触发 4 INVALID（ON 反超 OFF）；Run C 触发 1 FAIL + 4 PASS（方向正确） | ✅ 闭环 |
+| 4 | 中 | verdict 覆盖率误判（实 3/5） | TASK-46 勘误 + 补齐 latency/cpu | TASK-46 勘误在 commit 中（L144-148）；Run C 日志 5 指标全判定（含 latency/cpu verdict） | ✅ 闭环 |
+| 5 | 中 | 两处修复未端到端联合验证 | 重跑 3 次 perf-test.sh | Run C（perf-test-20260806_011054.log）应用全部修复后干净报告：sock delta=+64、verdict sock PASS 出现 | ✅ 闭环 |
+| 6 | 低 | delta 双符号 `+-17.8%` | `"+%.1f%%"`→`"%+.1f%%"` | Run C 日志 delta 显示 `+2.9%`/`+0.0%`，负值场景 Run A 显示 `-11.1%`（无双符号） | ✅ 闭环 |
+| 7 | 低 | PERFORMANCE.md 混用数据未标注 | 4.2 表格加数据来源脚注 | commit 中 PERFORMANCE.md L71-80 含数据来源脚注 + 三态 verdict 说明 | ✅ 闭环 |
+| 附 | 低 | 颜色码字面量 `\033[...]`（Worker 自检） | `$'\033...'` ANSI-C quoting | Run C 日志 `\033` 字面量行数 6→0；`cat -v` 显示 `^[[0;32m`（真实 ESC 字符） | ✅ 闭环 |
+
+**闭环统计**：5 条 Review 问题 + 1 条附加修复 = 6/6 全部验证通过，0 条遗留。
+
+## 10.2 三态判定全覆盖验证
+
+verdict 三态（PASS/FAIL/INVALID）是问题 #3 的核心修复点。Reviewer 通过 3 次端到端 run 确认三态均被实际触发，非纸面代码：
+
+| 态 | 触发 run | 触发指标 | 触发条件 |
+|----|----------|----------|----------|
+| INVALID | Run A（005702） | tcp_throughput / udp_pps / tcp_latency / cpu_util（4 项） | ON 反超 OFF（TCG 噪声异向），degradation<0 |
+| FAIL | Run B（010307）/ Run C（011054） | tcp_latency（+3114μs / +468.5μs > 10μs） | ON 劣于 OFF 且超阈值（TCG 噪声同向放大） |
+| PASS | Run B / Run C | tcp_throughput / udp_pps / cpu_util / sock_objsize | ON 劣于 OFF 但在阈值内（方向符合预期） |
+
+**关键意义**：旧逻辑在 Run A 场景会假报 `ALL PERFORMANCE TESTS PASSED`（负 drop 判 PASS），新逻辑正确降级为 `INCONCLUSIVE`。这是本周期最重要的质量提升 —— 性能测试的"达标"结论恢复可信。
+
+## 10.3 附加颜色修复点评
+
+Worker 自检发现 Run B 日志 verdict 行显示为 `\033[0;31mFAIL\033[0m` 字面量（6 行），主动修复（`$'\033...'` ANSI-C quoting）而非等 Reviewer 指出。这体现了"边做边记、主动沟通"的 Worker 准则。修复方案选择最小改动（仅改 5 个颜色变量定义，不动 30+ 处 `echo` 调用），且踩坑记录中给出了 `echo -e` 不可移植的避免建议，有方法论价值。
+
+## 10.4 闭环结论
+
+v6.4.0 实现复审 5 条问题全部闭环（0 遗留）：
+- 1 条高危（问题 #3 verdict 假 PASS）已修复并三态全验证
+- 2 条中危（问题 #4 覆盖率误判 / #5 端到端验证）已修复
+- 2 条低危（问题 #6 双符号 / #7 文档脚注）已修复
+- 1 条附加（颜色码字面量）Worker 自检修复
+
+**v6.4.0 Review 正式闭环，最终评分 8.5/10。** 综合评分从初始 7.5 提升至 8.5，主要得益于：verdict 三态判定修复了"噪声假 PASS"高危缺陷（+1.0），测试覆盖率 3/5→5/5 全覆盖且三态全触发验证（+0.5），文档/日志勘误与脚注完善（+0.5）。
+
+下一阶段（v6.5.0）重点：KVM 环境补齐 TCG 噪声敏感指标的多轮数据，阈值稳定后再接入 CI。
