@@ -133,6 +133,31 @@ struct net_delayacct {           // 72 bytes (含对齐填充)
 正好填入该空洞，只有 64 bytes 的 `stats` 字段是净增。实测增量 ≤ 理论值
 符合预期，说明编译器复用了已有 padding。
 
+#### pahole 验证（v6.5.0 TASK-53）
+
+使用 pahole（DWARF4 调试信息）验证 struct 实际布局，确认理论计算：
+
+```
+$ pahole -C net_delayacct net/core/net-delayacct.o
+struct net_delayacct {
+        spinlock_t                 lock;                 /*     0     4 */
+        /* XXX 4 bytes hole, try to pack */
+        struct net_delayacct_stats stats;                /*     8    64 */
+        /* size: 72, cachelines: 2, members: 2 */
+        /* sum members: 68, holes: 1, sum holes: 4 */
+        /* last cacheline: 8 bytes */
+};
+```
+
+**pahole 确认**: struct net_delayacct = **72 bytes**（4B spinlock + 4B hole + 64B stats），跨 2 cachelines，与理论计算完全一致。
+
+`sk_net_delayacct` 在 `struct sock` 中位于 **offset 296**（紧接 `sk_filter` 之后），struct sock 总大小 832 bytes（13 cachelines）。
+
+**slab delta 数学验证**（CI KVM 数据）:
+- OFF TCP slab = 2240 bytes = 35 × 64（恰好 35 cachelines）
+- ON: 2240 + 72 = 2312 → SLAB_HWCACHE_ALIGN 对齐 → 37 × 64 = 2368
+- Delta = 2368 - 2240 = **128 bytes**（72 struct + 56 对齐填充）✓
+
 ## 五、结果分析
 
 ### 5.1 TCP 吞吐 (-4.7%)
