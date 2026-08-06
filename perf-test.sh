@@ -28,6 +28,11 @@ QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
 QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-300}"
 QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-600}"
 
+# --strict 模式控制 INVALID 的判定行为（参数解析可覆盖）：
+#   warn（默认）：INVALID 告警不阻断，但 INVALID>50%(≥3/5) 时 exit 2（数据不可信）
+#   fail：INVALID 视作 FAIL 阻断（exit 1），用于 CI 严格回归
+STRICT_MODE="warn"
+
 # 用 $'...' ANSI-C quoting 让变量值为实际转义字符（而非字面 \033），
 # 这样 echo（无 -e）与 printf 均能正确输出颜色，日志不再出现 \033[0;31m 字面量
 RED=$'\033[0;31m'
@@ -41,9 +46,13 @@ mkdir -p "$LOG_DIR"
 # perf initramfs 路径
 PERF_INITRD="$PROJECT_DIR/ci/qemu/perf-initrd.img"
 
-# 保存的内核镜像
+# 保存的内核镜像（可被 --bzimage-on/off 参数覆盖，CI 用）
 BZIMAGE_ON="$LINUX_SRC/arch/x86/boot/bzImage-on"
 BZIMAGE_OFF="$LINUX_SRC/arch/x86/boot/bzImage-off"
+
+# verdict exit code 通过临时文件传递（{ ... } | tee 的子 shell 变量不传递到父 shell）
+PERF_EXIT_FILE=$(mktemp)
+trap 'rm -f "$PERF_EXIT_FILE"' EXIT
 
 # ============================================================================
 # 辅助函数
@@ -425,7 +434,10 @@ compare_and_report() {
     # （degradation<0）说明测量被噪声主导 → INVALID（非 FAIL，避免误报回归方向）。
     # degradation 统一约定：正值=ON 更差（预期方向），负值=ON 更优（噪声）。
     echo "Verdict:"
-    local verdict_fail=0 verdict_invalid=0 status
+    # verdict_pass 用于区分"全部 PASS"与"全部 SKIP(无数据)"：
+    # 若 evaluated=pass+fail+invalid=0 说明无任何指标被评估（QEMU 启动但 perf 测试
+    # 未产出数据，如内核 panic / guest init 失败），不应报 ALL PASSED（假绿），应 exit 2。
+    local verdict_pass=0 verdict_fail=0 verdict_invalid=0 status
     local v_on v_off v_onm v_offm v_drop v_lat v_cpu v_mem v_entry v_m v_t
 
     # Perf-1/2 吞吐与 PPS：degradation = (OFF-ON)/OFF*100，阈值 5% / 15%
@@ -437,7 +449,7 @@ compare_and_report() {
             v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_offm}-${v_onm})/${v_offm}*100}")
             status=$(_verdict3 "$v_drop" "$v_t")
             case "$status" in
-                PASS)    echo "  ${GREEN}PASS${NC} $v_m: drop ${v_drop}% <= ${v_t}% threshold";;
+                PASS)    echo "  ${GREEN}PASS${NC} $v_m: drop ${v_drop}% <= ${v_t}% threshold"; verdict_pass=$((verdict_pass+1));;
                 FAIL)    echo "  ${RED}FAIL${NC} $v_m: drop ${v_drop}% > ${v_t}% threshold"; verdict_fail=$((verdict_fail+1));;
                 INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: ON>OFF by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
             esac
@@ -453,7 +465,7 @@ compare_and_report() {
         v_lat=$(awk "BEGIN {printf \"%.1f\", ${v_onm}-${v_offm}}")
         status=$(_verdict3 "$v_lat" 10)
         case "$status" in
-            PASS)    echo "  ${GREEN}PASS${NC} tcp_latency_us: +${v_lat}us <= 10us threshold";;
+            PASS)    echo "  ${GREEN}PASS${NC} tcp_latency_us: +${v_lat}us <= 10us threshold"; verdict_pass=$((verdict_pass+1));;
             FAIL)    echo "  ${RED}FAIL${NC} tcp_latency_us: +${v_lat}us > 10us threshold"; verdict_fail=$((verdict_fail+1));;
             INVALID) echo "  ${YELLOW}INVALID${NC} tcp_latency_us: ON<OFF (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
         esac
@@ -468,7 +480,7 @@ compare_and_report() {
         v_cpu=$(awk "BEGIN {printf \"%.1f\", (${v_onm}-${v_offm})/${v_offm}*100}")
         status=$(_verdict3 "$v_cpu" 10)
         case "$status" in
-            PASS)    echo "  ${GREEN}PASS${NC} cpu_util_pct: +${v_cpu}% <= 10% threshold";;
+            PASS)    echo "  ${GREEN}PASS${NC} cpu_util_pct: +${v_cpu}% <= 10% threshold"; verdict_pass=$((verdict_pass+1));;
             FAIL)    echo "  ${RED}FAIL${NC} cpu_util_pct: +${v_cpu}% > 10% threshold"; verdict_fail=$((verdict_fail+1));;
             INVALID) echo "  ${YELLOW}INVALID${NC} cpu_util_pct: ON<OFF (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
         esac
@@ -482,7 +494,7 @@ compare_and_report() {
         v_mem=$((on_sock - off_sock))
         status=$(_verdict3 "$v_mem" 80)
         case "$status" in
-            PASS)    echo "  ${GREEN}PASS${NC} sock_objsize: +${v_mem} bytes <= 80 threshold";;
+            PASS)    echo "  ${GREEN}PASS${NC} sock_objsize: +${v_mem} bytes <= 80 threshold"; verdict_pass=$((verdict_pass+1));;
             FAIL)    echo "  ${RED}FAIL${NC} sock_objsize: +${v_mem} bytes > 80 threshold"; verdict_fail=$((verdict_fail+1));;
             INVALID) echo "  ${YELLOW}INVALID${NC} sock_objsize: ON<OFF (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
         esac
@@ -490,14 +502,42 @@ compare_and_report() {
         echo "  ${YELLOW}SKIP${NC} sock_objsize: no data"
     fi
 
-    # 总结论（三态优先级：FAIL > INVALID > PASS）
+    # 总结论（优先级：FAIL > INVALID(视strict) > NO-DATA > PASS）
+    # exit code: 0=PASS/warn通过, 1=FAIL/strict-fail, 2=数据不可信(全SKIP或INVALID>50%)
     echo ""
     if [ "$verdict_fail" -gt 0 ]; then
         echo "${RED}=== ${verdict_fail} TEST(S) FAILED (see above) ===${NC}"
+        PERF_EXIT=1
     elif [ "$verdict_invalid" -gt 0 ]; then
-        echo "${YELLOW}=== INCONCLUSIVE: ${verdict_invalid} measurement(s) noise-dominated (rerun recommended) ===${NC}"
+        case "$STRICT_MODE" in
+            fail)
+                echo "${RED}=== ${verdict_invalid} measurement(s) INVALID (strict=fail) ===${NC}"
+                PERF_EXIT=1
+                ;;
+            warn|"")
+                echo "${YELLOW}=== INCONCLUSIVE: ${verdict_invalid} measurement(s) noise-dominated (rerun recommended) ===${NC}"
+                # INVALID > 50%（≥3/5）视为数据不可信，exit 2 区别于测试失败 exit 1
+                if [ "$verdict_invalid" -ge 3 ]; then
+                    echo "${RED}=== INVALID ratio > 50%, data unreliable (exit 2) ===${NC}"
+                    PERF_EXIT=2
+                else
+                    PERF_EXIT=0
+                fi
+                ;;
+            *)
+                echo "${RED}ERROR: unknown STRICT_MODE='$STRICT_MODE'${NC}" >&2
+                PERF_EXIT=2
+                ;;
+        esac
+    elif [ "$verdict_pass" -eq 0 ]; then
+        # 所有指标均 SKIP（无数据）：QEMU 启动了但 perf 测试未产出数据
+        # （内核 panic / guest init 失败 / run-perf-tests.sh 异常）。
+        # 不可报 ALL PASSED（假绿），exit 2 提示数据缺失。
+        echo "${RED}=== NO DATA: all metrics SKIP (QEMU booted but no PERF: lines) — check guest logs ===${NC}"
+        PERF_EXIT=2
     else
         echo "${GREEN}=== ALL PERFORMANCE TESTS PASSED ===${NC}"
+        PERF_EXIT=0
     fi
 
     echo ""
@@ -511,9 +551,48 @@ compare_and_report() {
 # ============================================================================
 
 SKIP_BUILD=false
-if [ "${1:-}" = "--skip-build" ]; then
-    SKIP_BUILD=true
-fi
+# 参数解析：--skip-build / --strict[=warn|fail] / --bzimage-on=PATH / --bzimage-off=PATH
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip-build)
+            SKIP_BUILD=true
+            ;;
+        --strict)
+            # 无参数 = fail（严格回归，INVALID 阻断）
+            STRICT_MODE="fail"
+            ;;
+        --strict=*)
+            STRICT_MODE="${1#--strict=}"
+            case "$STRICT_MODE" in
+                warn|fail) ;;
+                *) echo "${RED}ERROR: --strict=$STRICT_MODE invalid (use warn|fail)${NC}" >&2; exit 2 ;;
+            esac
+            ;;
+        --bzimage-on=*)
+            BZIMAGE_ON="${1#--bzimage-on=}"
+            ;;
+        --bzimage-off=*)
+            BZIMAGE_OFF="${1#--bzimage-off=}"
+            ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--skip-build] [--strict[=warn|fail]] [--bzimage-on=PATH] [--bzimage-off=PATH]
+  --skip-build          复用已有 bzImage-on/off（不重新构建内核）
+  --strict              INVALID 视作 FAIL 阻断（等同 --strict=fail）
+  --strict=warn         INVALID 告警不阻断，但 >50% 时 exit 2（默认）
+  --strict=fail         INVALID 阻断 exit 1（CI 严格回归）
+  --bzimage-on=PATH     指定 ON 内核路径（CI 中 artifact 下载后用）
+  --bzimage-off=PATH    指定 OFF 内核路径
+EOF
+            exit 0
+            ;;
+        *)
+            echo "${RED}Unknown option: $1${NC}" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
 
 {
     echo "=== NET_DELAYACCT Performance Test $(date) ==="
@@ -551,7 +630,14 @@ fi
     # Step 5: 对比报告
     compare_and_report
 
+    # 将 verdict exit code 写入临时文件（pipe 子 shell 变量不传递到父 shell）
+    echo "${PERF_EXIT:-0}" > "$PERF_EXIT_FILE"
+
 } 2>&1 | tee "$LOG_DIR/perf-test-${TIMESTAMP}.log"
+
+# 从临时文件读取 verdict exit code（pipe 子 shell 传递）
+PERF_EXIT=$(cat "$PERF_EXIT_FILE" 2>/dev/null || echo 0)
 
 echo ""
 echo "Full report: $LOG_DIR/perf-test-${TIMESTAMP}.log"
+exit "${PERF_EXIT:-0}"

@@ -69,8 +69,11 @@ jobs:
           exit "$fail"
 
   build-kernel:
-    name: Build kernel with CONFIG_NET_DELAYACCT
+    name: Build kernel (${{ matrix.mode }})
     runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        mode: [on, off]
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -142,13 +145,20 @@ jobs:
         run: |
           cd "$LINUX_SRC"
           make defconfig
-          # Merge both fragments:
-          #   - ci/kernel.config.fragment: NET_DELAYACCT core config
-          #   - ci/qemu/kernel-qemu.config: QEMU boot + ftrace (Test 23) + netem (Test 23 S7)
-          #     Without this, Test 23 is SKIPped (no FUNCTION_TRACER) and S7 lacks netem.
-          scripts/kconfig/merge_config.sh -m .config \
-            "$GITHUB_WORKSPACE/ci/kernel.config.fragment" \
-            "$GITHUB_WORKSPACE/ci/qemu/kernel-qemu.config"
+          if [ "${{ matrix.mode }}" = "on" ]; then
+            # ON: 合并 NET_DELAYACCT core config + QEMU boot config
+            #   - ci/kernel.config.fragment: NET_DELAYACCT core config
+            #   - ci/qemu/kernel-qemu.config: QEMU boot + ftrace (Test 23) + netem (Test 23 S7)
+            scripts/kconfig/merge_config.sh -m .config \
+              "$GITHUB_WORKSPACE/ci/kernel.config.fragment" \
+              "$GITHUB_WORKSPACE/ci/qemu/kernel-qemu.config"
+          else
+            # OFF: 仅 QEMU boot config（ftrace/netem 仍需，功能测试 S1-S25 不受 NET_DELAYACCT 开关影响）
+            # 显式关闭 NET_DELAYACCT，用于 perf-test 双内核对比的 OFF 基线
+            scripts/kconfig/merge_config.sh -m .config \
+              "$GITHUB_WORKSPACE/ci/qemu/kernel-qemu.config"
+            sed -i 's/CONFIG_NET_DELAYACCT=y/# CONFIG_NET_DELAYACCT is not set/' .config
+          fi
           make olddefconfig
           grep -E 'CONFIG_(NET|NET_DELAYACCT|FTRACE|FUNCTION_TRACER|NET_SCH_NETEM)=' .config || true
 
@@ -160,7 +170,7 @@ jobs:
       - name: Upload bzImage artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bzImage
+          name: bzImage-${{ matrix.mode }}
           path: ${{ env.LINUX_SRC }}/arch/x86/boot/bzImage
           retention-days: 1
 
@@ -243,10 +253,10 @@ jobs:
           ls -la /dev/kvm 2>/dev/null && echo "  /dev/kvm: exists" || echo "  /dev/kvm: not found"
           grep -Ec 'vmx|svm' /proc/cpuinfo 2>/dev/null && echo "  CPU: hardware virtualization supported" || echo "  CPU: no vmx/svm (nested virt disabled)"
 
-      - name: Download bzImage artifact
+      - name: Download bzImage artifact (ON kernel)
         uses: actions/download-artifact@v4
         with:
-          name: bzImage
+          name: bzImage-on
           path: /tmp/artifacts
 
       - name: Download get_sockdelays artifact
@@ -475,3 +485,82 @@ jobs:
           name: test-summary
           path: /tmp/test-summary.txt
           retention-days: 30
+
+  perf-test:
+    name: Performance test (KVM, ON vs OFF)
+    runs-on: ubuntu-22.04
+    needs: [build-kernel]
+    if: github.event_name == 'push'
+    timeout-minutes: 10
+    # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
+    # perf-test 用于趋势监控，非功能正确性门禁。
+    # continue-on-error: job 失败时 workflow 仍 success，但 CI 界面显示 ⚠️
+    continue-on-error: true
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio iproute2
+
+      - name: Download bzImage-on
+        uses: actions/download-artifact@v4
+        with:
+          name: bzImage-on
+          # 分目录下载：upload 时 path=.../bzImage，下载后文件名为 bzImage
+          # ON/OFF 分目录避免同名文件冲突
+          path: /tmp/artifacts/on
+
+      - name: Download bzImage-off
+        uses: actions/download-artifact@v4
+        with:
+          name: bzImage-off
+          path: /tmp/artifacts/off
+
+      - name: Run perf-test (KVM, --strict=warn)
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          test -f /tmp/artifacts/on/bzImage || { echo "ERROR: bzImage-on not found"; exit 1; }
+          test -f /tmp/artifacts/off/bzImage || { echo "ERROR: bzImage-off not found"; exit 1; }
+          echo "=== KVM availability ==="
+          ls -la /dev/kvm 2>/dev/null && echo "  /dev/kvm: exists" || echo "  /dev/kvm: not found (will fallback to TCG)"
+          echo ""
+          # --strict=warn: INVALID 告警不阻断，但 >50% 时 exit 2（数据不可信）
+          # --bzimage-on/off: 指定 CI artifact 路径（非默认 LINUX_SRC 树）
+          # exit code: 0=PASS/warn通过, 1=FAIL/strict-fail, 2=数据不可信
+          #   continue-on-error 保证任何 exit code 都不阻断 workflow
+          ./perf-test.sh --skip-build --strict=warn \
+            --bzimage-on=/tmp/artifacts/on/bzImage \
+            --bzimage-off=/tmp/artifacts/off/bzImage
+
+      - name: Upload perf report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: tests/reports/perf/perf-test-*.log
+          retention-days: 30
+
+      - name: Generate perf summary
+        if: always()
+        run: |
+          PERF_LOG=$(ls -t tests/reports/perf/perf-test-*.log 2>/dev/null | head -1)
+          if [ -n "$PERF_LOG" ]; then
+            {
+              echo "## Performance Test Results (ON vs OFF)"
+              echo ""
+              echo "### Verdict Summary"
+              echo '```'
+              sed -n '/Verdict:/,/===.*===/p' "$PERF_LOG" | head -20
+              echo '```'
+              echo ""
+              echo "Full log: download perf-report artifact"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Performance Test: no log found" >> "$GITHUB_STEP_SUMMARY"
+          fi
