@@ -1,12 +1,14 @@
 # [TASK-55] Test 24 共享 runner flakiness 调查与修复
 
 - **日期**: 2026-08-06
-- **关联 Review**: v6.5.0 收尾议题（TASK-48 补遗发现，非 v6.5.0 规划议题）
-- **状态**: [已完成-已验证]
+- **关联 Review**: v6.5.0 收尾议题（TASK-48 补遗发现，非 v6.5.0 规划议题）；v6.5.1 审查 3 条问题已回应（接受）
+- **状态**: [已完成-已Review-已修订]
 
 ## 1. 任务描述
 
-TASK-48 补遗分析 5 轮 CI KVM workflow verdict 时发现：Test 24（per-skb 配对 + 计数比）在共享 runner 上 flaky —— 2/4 轮失败（#141 ratio=209%, #142 ratio=203%），失败原因均为 `tx_end/tx_start` 计数比超过 200% 阈值（仅超 3-9%）。这是当前 CI workflow failure 的主要根因（perf-test 已通过 FAIL→warn 设计不阻断）。
+TASK-48 补遗分析 CI KVM workflow verdict 时发现：Test 24（per-skb 配对 + 计数比）在共享 runner 上 flaky —— 修复前 7 轮中 2 轮失败（#141 ratio=209%, #142 ratio=203%，失败率 28.6%），失败原因均为 `tx_end/tx_start` 计数比超过 200% 阈值（仅超 3-9%）。这是当前 CI workflow failure 的主要根因（perf-test 已通过 FAIL→warn 设计不阻断）。
+
+> 注：初版基于 5 轮数据（#137/#140-#143）统计"2/4 轮失败 50%"，v6.5.1 审查补回原遗漏的 #144（修复前 success）后修正为"2/7 轮失败 28.6%"，flakiness 实际比初版呈现的更轻。
 
 本任务调查根因并提出修复方案。
 
@@ -122,20 +124,23 @@ push 后通过 GitHub check-runs API（公开只读）轮询 run #145 至所有 
 | Build kernel (on) | ✅ success | 582s | 共享 runner 较慢 |
 | Build kernel (off) | ✅ success | 753s | #ifdef 守卫修复生效 |
 | QEMU runtime test (KVM) | ✅ success | 353s | **Test 24 PASS — ratio 未超 250%** |
-| Performance test (KVM, ON vs OFF) | ✅ exit 0 | 167s | perf-test FAIL→warn 设计生效 |
+| Performance test (KVM, ON vs OFF) | ✅ exit 0 (warn) | 167s | `--strict=warn` 模式：FAIL→exit 0 告警，非"全 PASS" |
 
-**关键结论**：QEMU runtime test conclusion=success，annotations 仅 1 条 Node.js 20 弃用警告（与 Test 24 无关），**无任何 Test 24 失败 annotation** → Test 24 flakiness 修复**验证通过**。
+**关键结论**：QEMU runtime test conclusion=success，annotations 仅 1 条 Node.js 20 弃用警告（与 Test 24 无关），**无任何 Test 24 失败 annotation** → Test 24 flakiness 修复**首轮验证通过**（待长期监控最终确认，见下方间歇性说明）。
 
-对照修复前 5 轮 KVM verdict：
+对照修复前 7 轮 KVM verdict（v6.5.1 补遗：含原遗漏的 #144）：
 
 | Run | Commit | 修复前/后 | Test 24 | workflow |
 |-----|--------|-----------|---------|----------|
 | #141 (bfe86eb) | 修复前 | ❌ ratio=209% > 200% | failure |
 | #142 (6ab8fa8) | 修复前 | ❌ ratio=203% > 200% | failure |
 | #143 (f407807) | 修复前 | ✅（噪声退去） | success |
+| #144 (055c89e) | 修复前 | ✅（噪声退去） | success |
 | **#145 (bf58488)** | **修复后** | ✅ **PASS** | **success** |
 
-修复后首轮即全绿，250% 阈值覆盖了共享 runner 调度噪声（203-209% 区间）。
+修复后首轮 #145 未触发 flakiness，250% 阈值**初步表明**覆盖共享 runner 调度噪声（203-209% 区间）。
+
+> **单轮验证的局限性（v6.5.1 审查问题 2.4.1）**：Test 24 flakiness 是间歇性的 — 修复前 7 轮中 5 轮 success（含 #143/#144 噪声退去），2 轮失败（#141/#142）。单轮 #145 success 无法区分"250% 阈值生效"与"恰好本轮噪声低"。"首轮验证通过"不等于"flakiness 已消除"，需 10+ 轮长期监控（见 §6 待办）最终确认。本任务措辞据此弱化：用"首轮验证通过/初步表明"替代"验证通过/确认覆盖"。
 
 ### 5.3 回归保护
 
@@ -148,7 +153,7 @@ push 后通过 GitHub check-runs API（公开只读）轮询 run #145 至所有 
 - [x] 根因分析：ratio = tx_end/tx_start，纯 ACK/窗口更新使 ratio 偶尔超 200%
 - [x] 修复方案：ratio 上限 200% → 250%（方案 A）
 - [x] 代码修改 + 语法校验
-- [x] CI 验证：run #145 (bf58488) QEMU runtime test success，Test 24 不再 flaky
+- [x] CI 验证：run #145 (bf58488) QEMU runtime test success，Test 24 首轮未触发 flakiness（待长期监控确认）
 - [ ] 长期监控：观察 10+ 轮 CI run，确认 250% 阈值稳定；若仍 flaky，考虑方案 D（flaky retries）
 
 ## 7. 关联文档

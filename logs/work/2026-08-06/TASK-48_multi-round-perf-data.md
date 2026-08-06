@@ -2,11 +2,11 @@
 
 - **日期**: 2026-08-06（初版）/ 2026-08-06（补遗：5 轮 CI KVM workflow verdict 分析）
 - **关联 Review**: v6.5.0 议题1（KVM 数据收集 + 阈值校准）
-- **状态**: [已完成-补遗] 新增 4 轮 CI KVM workflow 级 verdict（#140-#143），原"仅单轮 KVM"限制已解除
+- **状态**: [已完成-补遗] 新增 5 轮 CI KVM workflow 级 verdict（#140-#144，含 v6.5.1 补回的 #144），原"仅单轮 KVM"限制已解除
 
 ## 1. 任务描述
 
-收集多轮性能测试数据，计算变异系数（CV）确认阈值稳定性。原计划因 CI 日志/artifact 下载需 admin 权限仅完成 3 轮本地 TCG + 1 轮 CI KVM（run #137）；补遗阶段通过 GitHub check-runs annotations API（公开只读）补齐 4 轮 CI KVM workflow 级 verdict（#140-#143），共 5 轮 CI KVM 数据点，满足 v6.5.0 验收标准"至少 5 轮 KVM 数据"。
+收集多轮性能测试数据，计算变异系数（CV）确认阈值稳定性。原计划因 CI 日志/artifact 下载需 admin 权限仅完成 3 轮本地 TCG + 1 轮 CI KVM（run #137）；补遗阶段通过 GitHub check-runs annotations API（公开只读）补齐 5 轮 CI KVM workflow 级 verdict（#140-#144，含 v6.5.1 补回的 #144），共 7 轮 CI KVM 数据点，满足 v6.5.0 验收标准"至少 5 轮 KVM 数据"。
 
 ## 2. 数据收集
 
@@ -106,12 +106,12 @@ TCG 软件仿真引入 ~10× 噪声放大，使 throughput/PPS/latency 指标的
 - [x] 3 轮本地 TCG 数据收集完成
 - [x] CV 计算与稳定性分析完成
 - [x] 阈值合理性确认（无需调整）
-- [x] **CI KVM 多轮数据收集（补遗）**：通过 check-runs annotations API 公开只读接口获取 4 轮 CI KVM workflow verdict，无需 admin 权限
-- [x] FAIL→warn 设计验证（3 轮 TCG 全部 exit 0；4 轮 CI KVM 仅 1 轮 exit 2，continue-on-error 不阻断）
+- [x] **CI KVM 多轮数据收集（补遗）**：通过 check-runs annotations API 公开只读接口获取 5 轮 CI KVM workflow verdict（#140-#144），无需 admin 权限
+- [x] FAIL→warn 设计验证（3 轮 TCG 全部 exit 0；5 轮 CI KVM（#140-#144）仅 1 轮 exit 2，continue-on-error 不阻断）
 
 ---
 
-## 7. 补遗：5 轮 CI KVM workflow 级 verdict 分析（2026-08-06 下午）
+## 7. 补遗：7 轮 CI KVM workflow 级 verdict 分析（2026-08-06 下午）
 
 ### 7.1 数据来源与方法论
 
@@ -121,22 +121,25 @@ TCG 软件仿真引入 ~10× 噪声放大，使 throughput/PPS/latency 指标的
 
 **限制**：annotations 仅含失败摘要（如 "Process completed with exit code 2."），不包含 Step Summary 中的完整 PERF: 数据行（需 admin 下载 artifact）。但 workflow/job conclusion + failure annotation 足以判定"是否阻断"和"失败类型"。
 
-### 7.2 5 轮 CI KVM 数据汇总（+ TASK-55 修复后验证轮 #145）
+### 7.2 CI KVM 数据汇总（7 轮修复前 + 1 轮修复后验证 #145）
 
 | Run | Commit | 修复前/后 | Workflow | Perf-test | QEMU test (S1-S25) | Perf 持续 | 失败摘要 |
 |-----|--------|-----------|----------|-----------|---------------------|-----------|----------|
 | #137 (6e3193c) | "fix: OFF 内核构建..." | 修复前 | failure | ❌ exit 1 | ✅ | 3m6s | verdict FAIL（sock +128>80, latency +115μs>10μs）— TASK-54 已分析 |
 | #139 (93d77b2) | "fix: 阈值校准..." | 修复前 | success | ❌ exit 1 (continue-on-error) | ✅ | — | 推测 cpu_util +7.9% 接近 10% 被噪声推过（TASK-54 推测） |
-| #140 (c720aa6) | "fix: --strict=warn FAIL→exit 0" | 修复前 | **success** | ✅ exit 0 | ✅ | — | FAIL→warn 设计生效 |
-| #141 (bfe86eb) | "docs: TASK-54 工作日志" | 修复前 | **failure** | ✅ exit 0 | ❌ Test 24 ratio=209% | — | Test 24 计数比 209% > 200% 阈值 |
+| #140 (c720aa6) | "fix: --strict=warn FAIL→exit 0" | 修复前 | **success** | ✅ exit 0 (warn) | ✅ | — | FAIL→warn 设计生效 |
+| #141 (bfe86eb) | "docs: TASK-54 工作日志" | 修复前 | **failure** | ✅ exit 0 (warn) | ❌ Test 24 ratio=209% | — | Test 24 计数比 209% > 200% 阈值 |
 | #142 (6ab8fa8) | "docs: TASK-54 完成 #140" | 修复前 | **failure** | ❌ exit 2 | ❌ Test 24 ratio=203% | 2m48s | perf-test exit 2 (NO-DATA 或 INVALID>50%) + Test 24 ratio=203% |
-| #143 (f407807) | "feat: TASK-53 pahole" | 修复前 | **success** | ✅ exit 0 | ✅ | 3m6s | 全绿，噪声退去 |
-| **#145 (bf58488)** | **"feat: v6.5.0 闭环"** | **修复后** | **✅ success** | **✅ exit 0 (167s)** | **✅ success (353s)** | **2m47s** | **6/6 全绿，Test 24 不再 flaky（TASK-55 验证）** |
+| #143 (f407807) | "feat: TASK-53 pahole" | 修复前 | **success** | ✅ exit 0 (warn) | ✅ | 3m6s | 全绿，噪声退去 |
+| #144 (055c89e) | "feat: TASK-48/49/53 完成" | 修复前 | **success** | ✅ exit 0 (warn) | ✅ | 2m43s | 6/6 全绿，噪声退去（v6.5.1 补遗：原遗漏，修复前 success 数据点） |
+| **#145 (bf58488)** | **"feat: v6.5.0 闭环"** | **修复后** | **✅ success** | **✅ exit 0 (warn, 167s)** | **✅ success (353s)** | **2m47s** | **6/6 全绿，Test 24 首轮未触发 flakiness（待长期监控确认）** |
 
-**5 轮 CI KVM verdict（#140-#143 + #137 历史）+ 1 轮修复后验证（#145）**：
-- perf-test job：4 ✅ + 2 ❌（exit 1 × 1, exit 2 × 1）= 67% pass rate；修复后 #145 ✅
-- QEMU test (Test 24)：3 ✅ + 2 ❌ = 60% pass rate（Test 24 是唯一失败点）；修复后 #145 ✅
-- workflow 整体：3 ✅ + 3 ❌ = 50% pass rate；修复后 #145 ✅ 6/6 全绿
+**7 轮修复前 verdict（#137/#139/#140/#141/#142/#143/#144）+ 1 轮修复后验证（#145）**：
+- perf-test job（修复前 7 轮）：4 ✅ + 3 ❌（exit 1 × 2, exit 2 × 1）= 57% pass rate；修复后 #145 ✅ (warn)
+- QEMU test / Test 24（修复前 7 轮）：5 ✅ + 2 ❌ = 71% pass rate（Test 24 是唯一失败点，失败率 28.6%）；修复后 #145 ✅
+- workflow 整体（修复前 7 轮）：4 ✅ + 3 ❌ = 57% pass rate；修复后 #145 ✅ 6/6 全绿
+
+> **#144 补遗说明（v6.5.1 审查问题 2.3.1）**：#144 (055c89e) 是修复前代码（run-tests.sh 仍为 200% 阈值）但 6/6 success，初版表格遗漏。补回后修复前 Test 24 失败率由"4 轮 2 失败 50%"修正为"7 轮 2 失败 28.6%"，flakiness 实际比初版呈现的更轻。#143/#144 两轮修复前 success 证明 Test 24 flakiness 是间歇性的，单轮 #145 success 不足以确认 flakiness 消除（见 TASK-55 §5.2）。
 
 ### 7.3 关键发现 1：FAIL→warn 设计验证
 
@@ -151,7 +154,7 @@ TCG 软件仿真引入 ~10× 噪声放大，使 throughput/PPS/latency 指标的
 
 ### 7.4 关键发现 2：Test 24 在共享 runner 上 flaky（新议题）
 
-**2/4 轮 CI KVM Test 24 失败**（#141 ratio=209%, #142 ratio=203%），失败原因相同：
+**2/7 轮 CI KVM Test 24 失败**（#141 ratio=209%, #142 ratio=203%；v6.5.1 补回 #144 后由 2/4 修正为 2/7），失败原因相同：
 - `ratio = tx_end_count / tx_start_count > 200%`
 - `mismatched=17 ≤ threshold=25`（OK），但 ratio 超 200% 阈值 3-9%
 - 200% 阈值是为容忍纯 ACK 守卫 + GSO 分段设计，但共享 runner 噪声使 ACK/data 比偶尔超 2x
@@ -165,18 +168,18 @@ TCG 软件仿真引入 ~10× 噪声放大，使 throughput/PPS/latency 指标的
 
 | 维度 | 观测 | CV 推断 |
 |------|------|---------|
-| perf-test exit code 稳定性 | 4 ✅ + 2 ❌（exit 1/2） | ~33% 失败率，CV 高（共享 runner 噪声主导） |
-| Test 24 ratio 稳定性 | 2/4 超阈（203-209%） | ratio CV ~5%（接近阈值的临界噪声） |
+| perf-test exit code 稳定性 | 4 ✅ + 3 ❌（exit 1×2/exit 2×1） | ~43% 失败率，CV 高（共享 runner 噪声主导） |
+| Test 24 ratio 稳定性 | 2/7 超阈（203-209%） | ratio CV ~5%（接近阈值的临界噪声） |
 | sock_objsize（静态值） | #137=+128, 后续推测同 | CV=0%（不受运行影响） |
 
-**与 TCG 对比**：TCG CV 55-217%（throughput/PPS/latency），KVM verdict 失败率 33%。KVM 比 TCG 稳定（无 INVALID 主导场景），但共享 runner 仍有显著噪声。
+**与 TCG 对比**：TCG CV 55-217%（throughput/PPS/latency），KVM perf-test verdict 失败率 43%（7 轮中 3 轮 exit 1/2）。KVM 比 TCG 稳定（无 INVALID 主导场景），但共享 runner 仍有显著噪声。
 
 ### 7.6 验收标准达成情况
 
 | v6.5.0 验收标准 | 达成 | 说明 |
 |----------------|------|------|
-| 至少 5 轮 KVM 数据 | ✅ | 5 轮（#137 + #140-#143）+ 1 轮进行中（#144） |
-| 每个指标 CV < 15% | ⚠️ 部分 | sock_objsize CV=0%；其他指标 CV 无法精确计算（无完整 PERF: 数据），但 verdict 失败率 33% 提示 CV 可能 > 15% |
+| 至少 5 轮 KVM 数据 | ✅ | 7 轮（#137 + #139 + #140-#144，含 v6.5.1 补回的 #144） |
+| 每个指标 CV < 15% | ⚠️ 部分 | sock_objsize CV=0%；其他指标 CV 无法精确计算（无完整 PERF: 数据），但 perf-test verdict 失败率 43% 提示 CV 可能 > 15% |
 | latency KVM 中位 < 100μs | ✅ | #137 实测 3863μs（绝对值，含 connect 上下文切换），相对增幅 3.1% PASS |
 | INVALID 触发率 < 10% | ⚠️ | #137 INVALID 1/5=20%（UDP PPS）；多轮无法精确统计 |
 | docs/PERFORMANCE.md 新增 KVM 数据章节 | ✅ | 已有，本补遗进一步补充多轮 verdict |
@@ -190,7 +193,7 @@ TCG 软件仿真引入 ~10× 噪声放大，使 throughput/PPS/latency 指标的
 
 ### 7.8 补遗结论
 
-1. **TASK-48 验收达成**：5 轮 CI KVM 数据已收集（#137 + #140-#143），原"需 admin 权限"障碍通过 annotations API 绕过
-2. **TASK-49 阈值无需调整**：5 轮数据进一步确认 —— perf-test FAIL→warn 设计正确处理共享 runner 噪声；sock_objsize/cpu_util 阈值有充足余量；throughput/PPS/latency 阈值在 KVM 下未观测到 FAIL（除 #137 阈值修复前）
+1. **TASK-48 验收达成**：7 轮 CI KVM 数据已收集（#137 + #139 + #140-#144，含 v6.5.1 补回的 #144），原"需 admin 权限"障碍通过 annotations API 绕过
+2. **TASK-49 阈值无需调整**：7 轮数据进一步确认 —— perf-test FAIL→warn 设计正确处理共享 runner 噪声；sock_objsize/cpu_util 阈值有充足余量；throughput/PPS/latency 阈值在 KVM 下未观测到 FAIL（除 #137 阈值修复前）
 3. **新议题**：Test 24 flakiness（ratio=203-209%）是 CI 红色主因，需 TASK-55 处理
-4. **后续**：等待 #144 完成可补 6 轮数据点；多轮完整 PERF: 数据仍需 admin 协助
+4. **后续**：多轮完整 PERF: 数据行仍需 admin 协助下载 artifact，计算精确 CV

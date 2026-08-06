@@ -9,9 +9,9 @@
 | TASK-52 | ci.yml 新增 perf-test job + NO-DATA 假 PASS 修复 | [已Review-已修订] | v6.5.0 议题2/5；continue-on-error + --strict=warn + artifact 分目录；验证中发现全 SKIP 假 PASS 隐患并修复（verdict_pass 计数）；实现复审 10.3.1 修复（timeout 15min+env 240/360）+ 10.3.3 修复（set -euo pipefail） |
 | TASK-54 | CI 验证 perf-test job（push + 监控运行结果） | [已完成-已验证] | run #136 发现 OFF 构建 bug（#ifdef 守卫）→ run #137 perf-test FAIL（阈值过紧）→ run #139 阈值修复后仍 FAIL（cpu_util 噪声）→ run #140 FAIL→warn 设计生效 |
 | TASK-53 | pahole 验证 struct net_delayacct 实际大小 | [已完成] | pahole (DWARF4) 确认 struct = 72 bytes（spinlock 4B + hole 4B + stats 64B）；slab delta 128B = 72B struct + 56B SLAB_HWCACHE_ALIGN padding，数学验证通过 |
-| TASK-48 | 多轮性能数据收集与阈值稳定性分析 | [已完成-补遗] | 初版：3 轮本地 TCG + 1 轮 CI KVM；补遗：通过 check-runs annotations API（公开只读）补齐 5 轮 CI KVM workflow verdict（#137+#140-#143），验收标准"5+ 轮"达成 |
-| TASK-49 | 基于多轮数据微调阈值 | [已完成-补遗] | perf-test 阈值无需调整（5 轮 KVM 无 FAIL）；Test 24 ratio 阈值 200%→250%（TASK-55）|
-| TASK-55 | Test 24 ratio 阈值 200%→250%（共享 runner flakiness 修复） | [已完成-已验证] | TASK-48 补遗发现 2/4 轮 Test 24 ratio=203-209% 超 200% 阈值；run #141/#142 workflow failure 主因；1 行代码修改 + 注释/失败信息同步；run #145 (bf58488) QEMU test success 验证 Test 24 不再 flaky |
+| TASK-48 | 多轮性能数据收集与阈值稳定性分析 | [已完成-补遗] | 初版：3 轮本地 TCG + 1 轮 CI KVM；补遗：通过 check-runs annotations API（公开只读）补齐 7 轮 CI KVM workflow verdict（#137+#139+#140-#144，含 v6.5.1 补回的 #144），验收标准"5+ 轮"达成 |
+| TASK-49 | 基于多轮数据微调阈值 | [已完成-补遗] | perf-test 阈值无需调整（阈值修复后 5 轮 #140-#144 KVM 无 FAIL）；Test 24 ratio 阈值 200%→250%（TASK-55）|
+| TASK-55 | Test 24 ratio 阈值 200%→250%（共享 runner flakiness 修复） | [已完成-已Review-已修订] | TASK-48 补遗发现修复前 7 轮中 2 轮 Test 24 ratio=203-209% 超 200% 阈值；run #141/#142 workflow failure 主因；1 行代码修改 + 注释/失败信息同步；run #145 (bf58488) QEMU test success 首轮验证通过（待长期监控）；v6.5.1 审查 3 条问题（#144 补遗 + 措辞弱化 + 标注 warn）已回应接受 |
 
 ### v6.4.0 阶段说明
 TASK-47 是 v6.4.0 实现复审（2026-08-06 Reviewer 首次代码复审）的回应。Reviewer 对 TASK-43/44/45/46 实现提出 5 条问题（1 高 / 2 中 / 2 低），核心是 perf-test.sh verdict 逻辑对噪声数据假 PASS（问题 #3，高）。本任务将 verdict 升级为三态（PASS/FAIL/**INVALID**），5 指标全覆盖，并端到端验证两处修复（TCP slab + \r）联合生效。5 条全部接受，无对话。
@@ -51,10 +51,10 @@ TASK-50/51/52 是 v6.5.0 规划阶段 Reviewer 议题的实现。Reviewer 提出
 - **验证**：run #140 (commit c720aa6) perf-test job ✅ success，6/6 jobs 全绿；5 轮 KVM verdict 中 4 轮 exit 0 + 1 轮 exit 2（#142 INVALID>50%）
 
 ### 决策6（TASK-55）：Test 24 ratio 阈值 200% → 250%
-- **背景**：5 轮 CI KVM workflow verdict 分析发现 Test 24 ratio=203-209% 超 200% 阈值（2/4 轮失败），是 workflow failure 主因
+- **背景**：CI KVM workflow verdict 分析发现 Test 24 ratio=203-209% 超 200% 阈值（修复前 7 轮 2 轮失败，失败率 28.6%；v6.5.1 补回 #144 后修正，初版误为 2/4 = 50%），是 workflow failure 主因
 - **决策**：ratio 上限 200% → 250%（1 行代码），保留 ratio 下限 50% 和 mismatched 阈值不变
 - **理由**：最小变更；250% 给 ~20% 余量覆盖共享 runner 调度噪声；> 250% 仍 FAIL 捕获真正多打点 bug；方案 C（continue-on-error）掩盖真实回归，方案 D（flaky retries）增加 CI 时间不解决根因
-- **验证**：run #145 (bf58488) 6/6 jobs 全绿，QEMU runtime test success（353s），无 Test 24 失败 annotation → 250% 阈值覆盖 203-209% 噪声区间，flakiness 修复确认
+- **验证**：run #145 (bf58488) 6/6 jobs 全绿，QEMU runtime test success（353s），无 Test 24 失败 annotation → 250% 阈值初步表明覆盖 203-209% 噪声区间，flakiness 修复首轮验证通过（待 10+ 轮长期监控最终确认 — 修复前 #143/#144 也曾 success，单轮不足以下定论）
 
 ## 踩坑总结
 
@@ -97,7 +97,7 @@ TASK-50/51/52 是 v6.5.0 规划阶段 Reviewer 议题的实现。Reviewer 提出
 ### 坑7（TASK-55）：TASK-49 任务边界导致 Test 24 阈值未审查
 - **问题**：TASK-49 初版仅评估 perf-test 5 项指标阈值，未触及 Test 24 功能测试阈值，导致 Test 24 ratio 阈值 200% 在共享 runner 上偏紧未及时发现
 - **根因**：TASK-49 任务范围限定为"性能阈值校准"，Test 24 是功能测试不在评估范围
-- **触发**：补遗分析 5 轮 CI KVM workflow verdict 时发现 Test 24 ratio=203-209% 超 200% 阈值（2/4 轮失败），是 workflow failure 主因
+- **触发**：补遗分析 7 轮 CI KVM workflow verdict 时发现 Test 24 ratio=203-209% 超 200% 阈值（2/7 轮失败，失败率 28.6%），是 workflow failure 主因
 - **解决**：开 TASK-55 调整 Test 24 ratio 阈值 200%→250%
 - **教训**：CI 多轮数据分析时应同时审查性能测试和功能测试的阈值稳定性，不能因任务边界而忽略同源问题（Test 24 ratio 阈值过紧同样是"共享 runner 噪声"导致的阈值问题）
 
@@ -113,8 +113,8 @@ TASK-50/51/52 是 v6.5.0 规划阶段 Reviewer 议题的实现。Reviewer 提出
 | 端到端 Run A (TCG) --skip-build | INCONCLUSIVE (4 INVALID + 1 PASS) | ON 反超 OFF→噪声识别；sock +64 PASS；首次暴露坑1（TASK-47） |
 | 端到端 Run B (TCG) --skip-build | 2 FAILED + 3 PASS | 坑1 修复后报告；sock +64 稳定 PASS；自检发现坑3 颜色字面量（TASK-47） |
 | 端到端 Run C (TCG) --skip-build | 1 FAILED + 4 PASS | 坑3 颜色修复后最终干净报告；颜色字面量 6→0；供 Reviewer 复审（TASK-47） |
-| CI KVM 多轮 verdict（5 轮） | 3 ✅ + 2 ❌ workflow | #137/#140/#143 success；#141/#142 failure（Test 24 flakiness，TASK-55 修复）；perf-test 5 轮 3 ✅ + 2 ❌（exit 1/2），FAIL→warn 设计验证 |
-| CI KVM run #145 (bf58488) TASK-55 验证 | 6/6 ✅ success | 修复后首轮全绿；QEMU test 353s success（Test 24 PASS，无失败 annotation）；perf-test 167s exit 0；仅 Node.js 20 弃用警告 |
+| CI KVM 多轮 verdict（7 轮修复前） | QEMU test 5 ✅ + 2 ❌ | #137/#139/#140/#143/#144 QEMU ✅；#141/#142 Test 24 ❌（flakiness，TASK-55 修复）；perf-test 4 ✅(warn) + 3 ❌（exit 1×2/exit 2×1），FAIL→warn 设计验证 |
+| CI KVM run #145 (bf58488) TASK-55 验证 | 6/6 ✅ success | 修复后首轮全绿；QEMU test 353s success（Test 24 首轮未触发 flakiness，无失败 annotation）；perf-test 167s exit 0 (warn)；仅 Node.js 20 弃用警告。单轮验证，待 10+ 轮长期监控确认 |
 | pahole 验证（DWARF4） | 通过 | struct net_delayacct = 72 bytes（spinlock 4B + hole 4B + stats 64B）；slab delta 128B = 72B + 56B 对齐填充 |
 
 ### v6.4.0 verdict 三态验证（两次 run 互补）
@@ -136,7 +136,7 @@ TASK-50/51/52 是 v6.5.0 规划阶段 Reviewer 议题的实现。Reviewer 提出
 - [x] 等待 Reviewer 确认议题1 + 议题7 — 已确认（8/8 全部解决）
 - [x] push 验证 CI perf-test job 实际运行（TASK-54）— 已完成（run #140 验证 FAIL→warn 设计）
 - [x] **perf-test verdict 详情分析**：用户提供 run #137 verdict，2 个 FAIL 根因分析并修复（sock 阈值 + latency 阈值）
-- [x] CI 中收集 KVM perf 数据（TASK-48）— 3 轮本地 TCG + 5 轮 CI KVM workflow verdict（补遗通过 annotations API）
+- [x] CI 中收集 KVM perf 数据（TASK-48）— 3 轮本地 TCG + 7 轮 CI KVM workflow verdict（补遗通过 annotations API，含 v6.5.1 补回的 #144）
 - [x] 基于 KVM 数据确定稳定阈值 + 更新 PERFORMANCE.md（TASK-49）— perf-test 阈值无需调整；Test 24 ratio 200%→250%
 - [x] pahole 验证 struct net_delayacct 布局（TASK-53）— 确认 72 bytes，slab delta 数学验证通过
 - [x] 本地 linux-6.6 树同步 0010 patch 的 #ifdef 修复 — 已确认（L2179-2181 有守卫）
@@ -149,7 +149,7 @@ TASK-50/51/52 是 v6.5.0 规划阶段 Reviewer 议题的实现。Reviewer 提出
 - [x] v6.4.0 已正式闭环（FINAL_REPORT 已生成）
 
 ### v6.6.0 待办（下一版本预告）
-- [x] TASK-55 CI 验证：run #145 (bf58488) QEMU test success，Test 24 ratio 不再 flaky
+- [x] TASK-55 CI 验证：run #145 (bf58488) QEMU test success，Test 24 ratio 首轮未触发 flakiness（待长期监控确认）
 - [ ] Test 24 长期监控：观察 10+ 轮 CI run 确认 250% 阈值稳定；若仍 flaky 考虑 flaky retries
 - [ ] CI KVM 完整 PERF: 数据行（需 admin 协助下载 artifact，计算精确 CV）
 - [ ] 物理硬件验证（沙箱环境无物理硬件访问权限）

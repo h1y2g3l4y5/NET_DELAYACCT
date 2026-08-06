@@ -279,7 +279,7 @@ PERF_RUNS=5 ./perf-test.sh --skip-build
 ### v6.5.0 完成情况
 
 1. ✅ **KVM 环境数据收集**: CI KVM run #137 获取 5 项指标数据，验证阈值合理性
-2. ✅ **多轮运行**: 3 轮本地 TCG + 5 轮 CI KVM workflow verdict（#137 + #140-#143），
+2. ✅ **多轮运行**: 3 轮本地 TCG + 7 轮 CI KVM workflow verdict（#137 + #139 + #140-#144），
    CV 分析确认 TCG 不适合阈值验证；CI KVM 多轮验证 FAIL→warn 设计正确
 3. ✅ **CI 接入**: perf-test job 已接入 CI，`--strict=warn` + `continue-on-error`
 4. ✅ **阈值校准**: latency 10μs→10% relative, sock 80→192 bytes, FAIL→warn 设计
@@ -288,22 +288,24 @@ PERF_RUNS=5 ./perf-test.sh --skip-build
 
 ### 多轮 CI KVM verdict 汇总（v6.5.0 TASK-48 补遗 + TASK-55 验证）
 
-通过 GitHub check-runs annotations API（公开只读）收集 5 轮 CI KVM workflow verdict，并补充 TASK-55 修复后验证轮：
+通过 GitHub check-runs annotations API（公开只读）收集 7 轮修复前 CI KVM workflow verdict，并补充 TASK-55 修复后验证轮：
 
 | Run | Commit | 修复前/后 | Workflow | Perf-test | QEMU test | 失败摘要 |
 |-----|--------|-----------|----------|-----------|-----------|----------|
 | #137 (6e3193c) | "fix: OFF 构建" | 修复前 | failure | ❌ exit 1 | ✅ | sock +128>80, latency +115μs>10μs（阈值修复前） |
-| #140 (c720aa6) | "fix: FAIL→warn" | 修复前 | success | ✅ exit 0 | ✅ | FAIL→warn 设计生效 |
-| #141 (bfe86eb) | "docs" | 修复前 | failure | ✅ exit 0 | ❌ Test 24 ratio=209% | Test 24 计数比超 200% |
+| #139 (93d77b2) | "fix: 阈值校准" | 修复前 | success | ❌ exit 1 (co-error) | ✅ | cpu_util 噪声推过阈值（continue-on-error 不阻断） |
+| #140 (c720aa6) | "fix: FAIL→warn" | 修复前 | success | ✅ exit 0 (warn) | ✅ | FAIL→warn 设计生效 |
+| #141 (bfe86eb) | "docs" | 修复前 | failure | ✅ exit 0 (warn) | ❌ Test 24 ratio=209% | Test 24 计数比超 200% |
 | #142 (6ab8fa8) | "docs" | 修复前 | failure | ❌ exit 2 | ❌ Test 24 ratio=203% | perf exit 2 + Test 24 ratio=203% |
-| #143 (f407807) | "feat: pahole" | 修复前 | success | ✅ exit 0 | ✅ | 全绿，噪声退去 |
-| **#145 (bf58488)** | **"feat: v6.5.0 闭环"** | **修复后** | **✅ success** | **✅ exit 0 (167s)** | **✅ success (353s)** | **6/6 全绿，Test 24 不再 flaky** |
+| #143 (f407807) | "feat: pahole" | 修复前 | success | ✅ exit 0 (warn) | ✅ | 全绿，噪声退去 |
+| #144 (055c89e) | "feat: TASK-48/49/53" | 修复前 | success | ✅ exit 0 (warn) | ✅ | 全绿，噪声退去（v6.5.1 补遗：原遗漏） |
+| **#145 (bf58488)** | **"feat: v6.5.0 闭环"** | **修复后** | **✅ success** | **✅ exit 0 (warn, 167s)** | **✅ success (353s)** | **6/6 全绿，Test 24 首轮未触发 flakiness** |
 
 **关键发现**：
-- perf-test job 5 轮中 3 ✅ + 2 ❌（exit 1 × 1, exit 2 × 1）；阈值修复后无 FAIL（exit 1）
-- Test 24 ratio 4 轮中 2 ❌（203-209% > 200% 阈值）→ TASK-55 调整为 250%
+- perf-test job（修复前 7 轮）：4 ✅ + 3 ❌（exit 1 × 2, exit 2 × 1）；阈值修复后无 FAIL（exit 1）
+- Test 24 ratio（修复前 7 轮）：5 ✅ + 2 ❌（203-209% > 200% 阈值，失败率 28.6%）→ TASK-55 调整为 250%
 - FAIL→warn 设计验证：perf-test exit 2 在 continue-on-error 下不阻断 workflow；workflow failure 主因是 Test 24（功能测试无 continue-on-error）
-- **TASK-55 修复验证**：run #145 (bf58488) 修复后首轮即 6/6 全绿，QEMU test success 无 Test 24 失败 annotation，确认 250% 阈值覆盖 203-209% 噪声区间
+- **TASK-55 修复首轮验证**：run #145 (bf58488) 修复后首轮 6/6 全绿，QEMU test success 无 Test 24 失败 annotation，初步表明 250% 阈值覆盖 203-209% 噪声区间。单轮验证不足以下定论（修复前 #143/#144 也曾 success），待 10+ 轮长期监控最终确认。
 
 ### 后续计划
 
@@ -325,8 +327,8 @@ PERF_RUNS=5 ./perf-test.sh --skip-build
 - **TCP 延迟增加 3.1%** (CI KVM) — 在 10% 相对阈值内，PASS
 
 **多轮验证**（v6.5.0 TASK-48/49 补遗）：
-- 3 轮本地 TCG + 5 轮 CI KVM workflow verdict 对比分析确认：TCG 噪声使 CV 达 55-217%，
-  KVM 数据稳定且全指标 PASS/INVALID（5 轮 KVM 无 FAIL，仅 1 轮 exit 2 噪声主导）
+- 3 轮本地 TCG + 7 轮 CI KVM workflow verdict 对比分析确认：TCG 噪声使 CV 达 55-217%，
+  KVM 数据稳定且全指标 PASS/INVALID（阈值修复后 5 轮 #140-#144 KVM 无 FAIL（exit 1），仅 1 轮 exit 2 噪声主导）
 - pahole (DWARF4) 验证 struct net_delayacct = 72 bytes（TASK-53）
 - perf-test 阈值无需调整，FAIL→warn 设计确保偶发 FAIL 不阻断 CI
 - Test 24 ratio 阈值 200% → 250%（TASK-55），修复共享 runner flakiness

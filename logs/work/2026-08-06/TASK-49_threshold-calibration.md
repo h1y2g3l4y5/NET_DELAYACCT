@@ -65,29 +65,29 @@ pahole 确认 struct net_delayacct = 72 bytes：
 - [x] 阈值评估完成：无需调整
 - [x] 多轮数据验证：3 轮 TCG + 1 轮 KVM
 - [x] pahole 验证补充：struct 72B 确认
-- [x] **CI KVM 多轮数据收集（补遗）**：5 轮 CI KVM workflow verdict 已分析（见 [TASK-48 补遗](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-06/TASK-48_multi-round-perf-data.md#L112)），perf-test 阈值无需调整
-- [x] **Test 24 ratio 阈值调整（新议题）**：5 轮数据揭示 Test 24 ratio 阈值 200% 在共享 runner 上偏紧（2/4 超阈），开 TASK-55 调整为 250%
+- [x] **CI KVM 多轮数据收集（补遗）**：7 轮 CI KVM workflow verdict 已分析（见 [TASK-48 补遗](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-06/TASK-48_multi-round-perf-data.md#L112)），perf-test 阈值无需调整
+- [x] **Test 24 ratio 阈值调整（新议题）**：7 轮数据揭示 Test 24 ratio 阈值 200% 在共享 runner 上偏紧（2/7 超阈），开 TASK-55 调整为 250%
 
 ---
 
-## 6. 补遗：5 轮 CI KVM 数据再确认（2026-08-06 下午）
+## 6. 补遗：7 轮 CI KVM 数据再确认（2026-08-06 下午）
 
 ### 6.1 数据基础
 
-基于 [TASK-48 补遗](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-06/TASK-48_multi-round-perf-data.md#L112) 收集的 5 轮 CI KVM workflow verdict（#137 + #140-#143），重新评估 perf-test 阈值。
+基于 [TASK-48 补遗](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-06/TASK-48_multi-round-perf-data.md#L112) 收集的 7 轮 CI KVM workflow verdict（#137 + #139 + #140-#144，含 v6.5.1 补回的 #144），重新评估 perf-test 阈值。
 
 ### 6.2 perf-test 阈值再评估
 
-| 指标 | 阈值 | #137 | #140 | #141 | #142 | #143 | 阈值合理性 |
-|------|------|------|------|------|------|------|-----------|
-| tcp_throughput | <5% | 3.3% PASS | exit 0 | exit 0 | exit 2 | exit 0 | ✅ KVM 无 FAIL |
-| udp_pps | <15% | -7.5% INVALID | exit 0 | exit 0 | exit 2 | exit 0 | ✅ KVM 无 FAIL |
-| tcp_latency | <10% | 3.1% PASS | exit 0 | exit 0 | exit 2 | exit 0 | ✅ KVM 无 FAIL |
-| cpu_util | <10% | 7.9% PASS | exit 0 | exit 0 | exit 2 | exit 0 | ✅ KVM 无 FAIL |
-| sock_objsize | ≤192 | +128 PASS | exit 0 | exit 0 | exit 2 | exit 0 | ✅ KVM 无 FAIL |
+| 指标 | 阈值 | #137 | #140 | #141 | #142 | #143 | #144 | 阈值合理性 |
+|------|------|------|------|------|------|------|------|-----------|
+| tcp_throughput | <5% | 3.3% PASS | exit 0 | exit 0 | exit 2 | exit 0 | exit 0 | ✅ KVM 无 FAIL |
+| udp_pps | <15% | -7.5% INVALID | exit 0 | exit 0 | exit 2 | exit 0 | exit 0 | ✅ KVM 无 FAIL |
+| tcp_latency | <10% | 3.1% PASS | exit 0 | exit 0 | exit 2 | exit 0 | exit 0 | ✅ KVM 无 FAIL |
+| cpu_util | <10% | 7.9% PASS | exit 0 | exit 0 | exit 2 | exit 0 | exit 0 | ✅ KVM 无 FAIL |
+| sock_objsize | ≤192 | +128 PASS | exit 0 | exit 0 | exit 2 | exit 0 | exit 0 | ✅ KVM 无 FAIL |
 
 **关键观察**：
-- #140-#143 的 perf-test job 4 轮中 3 轮 exit 0（PASS/warn）、1 轮 exit 2（INVALID>50% 或 NO-DATA）
+- #140-#144 的 perf-test job 5 轮中 4 轮 exit 0（PASS/warn）、1 轮 exit 2（INVALID>50% 或 NO-DATA）
 - exit 2 的 #142 是设计预期：当数据不可信时仍阻断（continue-on-error 兜底）
 - **无 FAIL**（exit 1）：阈值修复后（TASK-54）KVM 环境下未再观测到 FAIL
 
@@ -101,16 +101,17 @@ pahole 确认 struct net_delayacct = 72 bytes：
 | #141 | ❌ | 209% | 超 9% |
 | #142 | ❌ | 203% | 超 3% |
 | #143 | ✅ | — | — |
+| #144 | ✅ | — | — |
 
-**结论**：Test 24 ratio 上限 200% 在共享 runner 上偏紧（2/4 超阈），需调整为 250%。详见 [TASK-55](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-06/TASK-55_test24-flakiness.md)。
+**结论**：Test 24 ratio 上限 200% 在共享 runner 上偏紧（修复前 7 轮中 2/7 超阈，失败率 28.6%），需调整为 250%。详见 [TASK-55](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-06/TASK-55_test24-flakiness.md)。
 
 ### 6.4 综合结论
 
 | 类别 | 阈值 | 决策 | 依据 |
 |------|------|------|------|
-| perf-test（5 项指标） | 当前值 | **不调整** | 5 轮 KVM 无 FAIL，exit 2 是设计预期 |
-| Test 24 mismatched | max(25, ×40%) | **不调整** | v6.3.0 已校准，2/4 轮均 ≤ 25 PASS |
-| Test 24 ratio 上限 | 200% → **250%** | **调整**（TASK-55） | 2/4 轮超 200%（203-209%），250% 给 ~20% 余量 |
+| perf-test（5 项指标） | 当前值 | **不调整** | 阈值修复后 5 轮（#140-#144）KVM 无 FAIL（exit 1），exit 2 是设计预期 |
+| Test 24 mismatched | max(25, ×40%) | **不调整** | v6.3.0 已校准，7 轮 mismatched 均 ≤ 25 PASS |
+| Test 24 ratio 上限 | 200% → **250%** | **调整**（TASK-55） | 2/7 轮超 200%（203-209%），250% 给 ~20% 余量 |
 
 ### 6.5 补遗坑：性能阈值与功能阈值需分别评估
 
