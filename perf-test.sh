@@ -28,9 +28,10 @@ QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
 QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-300}"
 QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-600}"
 
-# --strict 模式控制 INVALID 的判定行为（参数解析可覆盖）：
-#   warn（默认）：INVALID 告警不阻断，但 INVALID>50%(≥3/5) 时 exit 2（数据不可信）
-#   fail：INVALID 视作 FAIL 阻断（exit 1），用于 CI 严格回归
+# --strict 模式控制 FAIL/INVALID 的判定行为（参数解析可覆盖）：
+#   warn（默认）：FAIL/INVALID 均为告警（exit 0），不阻断。共享 runner 噪声大，
+#     单次 FAIL 可能是噪声非回归；仅 NO-DATA(全SKIP) 或 INVALID>50%(≥3/5) 时 exit 2（数据不可信）
+#   fail：FAIL/INVALID 均阻断（exit 1），用于本地严格回归测试
 STRICT_MODE="warn"
 
 # 用 $'...' ANSI-C quoting 让变量值为实际转义字符（而非字面 \033），
@@ -510,11 +511,28 @@ compare_and_report() {
     fi
 
     # 总结论（优先级：FAIL > INVALID(视strict) > NO-DATA > PASS）
-    # exit code: 0=PASS/warn通过, 1=FAIL/strict-fail, 2=数据不可信(全SKIP或INVALID>50%)
+    # exit code: 0=PASS/warn通过, 1=FAIL(strict=fail)/INVALID(strict=fail), 2=数据不可信(全SKIP或INVALID>50%)
+    #
+    # strict=warn（CI 默认）：FAIL → exit 0（告警，不阻断）。共享 runner 噪声大，
+    #   单次 FAIL 可能是噪声非真实回归；FAIL 详情已在上方 Verdict 区 + Step Summary
+    #   输出供趋势分析。NO-DATA / INVALID>50% 仍 exit 2（这些是真实问题非噪声）。
+    # strict=fail（本地回归）：FAIL → exit 1（阻断），用于严格回归测试。
     echo ""
     if [ "$verdict_fail" -gt 0 ]; then
-        echo "${RED}=== ${verdict_fail} TEST(S) FAILED (see above) ===${NC}"
-        PERF_EXIT=1
+        case "$STRICT_MODE" in
+            fail)
+                echo "${RED}=== ${verdict_fail} TEST(S) FAILED (strict=fail, blocking) ===${NC}"
+                PERF_EXIT=1
+                ;;
+            warn|"")
+                echo "${YELLOW}=== ${verdict_fail} TEST(S) EXCEEDED THRESHOLD (strict=warn, non-blocking — see summary for trend analysis) ===${NC}"
+                PERF_EXIT=0
+                ;;
+            *)
+                echo "${RED}ERROR: unknown STRICT_MODE='$STRICT_MODE'${NC}" >&2
+                PERF_EXIT=2
+                ;;
+        esac
     elif [ "$verdict_invalid" -gt 0 ]; then
         case "$STRICT_MODE" in
             fail)
@@ -565,7 +583,7 @@ while [[ $# -gt 0 ]]; do
             SKIP_BUILD=true
             ;;
         --strict)
-            # 无参数 = fail（严格回归，INVALID 阻断）
+            # 无参数 = fail（严格回归，FAIL/INVALID 阻断）
             STRICT_MODE="fail"
             ;;
         --strict=*)

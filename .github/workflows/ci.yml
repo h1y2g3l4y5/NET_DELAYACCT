@@ -496,7 +496,8 @@ jobs:
     timeout-minutes: 15
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
-    # continue-on-error: job 失败时 workflow 仍 success，但 CI 界面显示 ⚠️
+    # --strict=warn 下 FAIL → exit 0（告警），仅 NO-DATA/INVALID>50% → exit 2（job 失败）。
+    # continue-on-error: exit 2 时 workflow 仍 success，CI 界面显示 ⚠️
     continue-on-error: true
     env:
       # CI 专用 QEMU timeout（短于本地默认 300/600s），确保 job 在 15min 内完成
@@ -538,10 +539,12 @@ jobs:
           echo "=== KVM availability ==="
           ls -la /dev/kvm 2>/dev/null && echo "  /dev/kvm: exists" || echo "  /dev/kvm: not found (will fallback to TCG)"
           echo ""
-          # --strict=warn: INVALID 告警不阻断，但 >50% 时 exit 2（数据不可信）
+          # --strict=warn（CI 默认）：FAIL/INVALID 均为告警（exit 0），不阻断；
+          #   仅 NO-DATA（全 SKIP）或 INVALID>50%（数据不可信）才 exit 2。
+          #   共享 runner 噪声大，单次 FAIL 可能是噪声非回归，FAIL 详情在 Step Summary 供趋势分析。
           # --bzimage-on/off: 指定 CI artifact 路径（非默认 LINUX_SRC 树）
-          # exit code: 0=PASS/warn通过, 1=FAIL/strict-fail, 2=数据不可信
-          #   continue-on-error 保证任何 exit code 都不阻断 workflow
+          # exit code: 0=PASS/warn通过, 2=数据不可信(NO-DATA/INVALID>50%)
+          #   continue-on-error 保证 exit 2 也不阻断 workflow
           ./perf-test.sh --skip-build --strict=warn \
             --bzimage-on=/tmp/artifacts/on/bzImage \
             --bzimage-off=/tmp/artifacts/off/bzImage
