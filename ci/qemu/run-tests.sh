@@ -1712,6 +1712,18 @@ else
 	}
 
 	# --- 场景 S1: TCP 单向 (iperf3 client→server) ---
+	# v6.6.0: 额外用 kprobe 验证 rx_start 的父函数 __netif_receive_skb_core 被调用。
+	# net_delayacct_rx_start 是 static inline（内联到 __netif_receive_skb_core 中），
+	# ftrace 无法直接追踪；但 kprobe 可以 hook __netif_receive_skb_core 入口。
+	# 注意：需要 CONFIG_KALLSYMS_ALL 使 static 函数出现在 /proc/kallsyms。
+	_RX_KPROBE_OK=0
+	if grep -q '__netif_receive_skb_core' /proc/kallsyms 2>/dev/null; then
+		echo 'p:delayacct_rx_start_probe __netif_receive_skb_core' \
+			>> "$TRACEFS/kprobe_events" 2>/dev/null && \
+		echo 1 > "$TRACEFS/events/kprobes/delayacct_rx_start_probe/enable" 2>/dev/null && \
+		_RX_KPROBE_OK=1
+	fi
+
 	_ftrace_start
 	IPERF_PORT=21440
 	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
@@ -1719,6 +1731,15 @@ else
 	iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 3 >/dev/null 2>&1 &
 	_CLI=$!; sleep 2
 	COUNTS_S1=$(_ftrace_stop_and_count)
+
+	# 停止 kprobe 并读取命中次数（kprobe_profile 格式: <name> <hit> <miss>）
+	if [ "$_RX_KPROBE_OK" -eq 1 ]; then
+		echo 0 > "$TRACEFS/events/kprobes/delayacct_rx_start_probe/enable" 2>/dev/null || true
+		_RX_START_COUNT=$(grep 'delayacct_rx_start_probe' "$TRACEFS/kprobe_profile" 2>/dev/null | awk '{print $2}')
+		_RX_START_COUNT=${_RX_START_COUNT:-0}
+		echo '-:delayacct_rx_start_probe' >> "$TRACEFS/kprobe_events" 2>/dev/null || true
+	fi
+
 	_output "[TCP] ftrace counts" "$COUNTS_S1"
 	# Debug: 检查 trace 文件内容和 filter 设置（仅 S1 输出，避免重复噪音）
 	# 诊断信息：仅在 NET_DELAYACCT_DEBUG=1 时打印（含内核地址，不宜在 CI 公开日志暴露）
@@ -1729,10 +1750,27 @@ else
 		echo "    [debug] trace first 5 lines:"
 		head -5 "$TRACEFS/trace" 2>/dev/null | sed 's/^/      | /' || echo "      | (empty or unreadable)"
 	fi
+
 	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
+	_FTRACE_PASS=0
 	if _ftrace_assert "TCP" "$COUNTS_S1" \
 		__netif_rx tcp_recvmsg_locked __tcp_transmit_skb dev_hard_start_xmit \
 		net_delayacct_rx_end net_delayacct_tx_start net_delayacct_tx_end; then
+		_FTRACE_PASS=1
+	fi
+
+	# kprobe 验证 rx_start（kprobe 可用时生效，不可用时不影响判定）
+	if [ "$_RX_KPROBE_OK" -eq 1 ]; then
+		if [ "$_RX_START_COUNT" -gt 0 ]; then
+			echo "    [OK] rx_start kprobe: __netif_receive_skb_core=$_RX_START_COUNT → rx_start executed"
+		else
+			echo "    [MISS] rx_start kprobe: __netif_receive_skb_core NOT triggered"
+		fi
+	fi
+
+	# kprobe 可用但计数为 0 → FAIL；kprobe 不可用 → 不影响判定
+	if [ "$_FTRACE_PASS" -eq 1 ] && \
+	   ( [ "$_RX_KPROBE_OK" -eq 0 ] || [ "${_RX_START_COUNT:-0}" -gt 0 ] ); then
 		PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 		_scenario_status 1 PASS
 	else
