@@ -2,7 +2,21 @@
 
 - **日期**: 2026-08-06
 - **关联 Review**: v6.5.0 议题3（--strict 模式设计）、议题6（--strict=warn 作为 CI 默认）、议题8（-smp 1）
-- **状态**: [待Review]
+- **状态**: [已Review-已修订]
+
+## 7. Review 回应（v6.5.0 实现复审）
+
+### 问题 10.3.2 [中]：compare_and_report return 1 未设 PERF_EXIT — 接受
+
+**Reviewer 意见**：compare_and_report 在 missing-files 时 `return 1` 未设 PERF_EXIT，set -e 绕过 PERF_EXIT_FILE 写入。exit code 传递"分裂责任"是维护陷阱。
+
+**Worker 回应**：接受。分析正确——当前行为恰好正确（set -e 传播了失败），但设计脆弱。未来修改 pipeline 结构易引入假 PASS，与 v6.4.0/TASK-52 假绿同类根因。
+
+**修复**：
+1. [perf-test.sh#L345](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L345)：missing-files 分支增加 `PERF_EXIT=1` before `return 1`
+2. [perf-test.sh#L634](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L634)：主流程改 `compare_and_report || true`，确保 PERF_EXIT_FILE 总被写入
+
+**验证**：专项测试模拟 missing-files → PERF_EXIT=1 通过 `|| true` + PERF_EXIT_FILE 正确传递到父 shell exit 1。8 个回归测试全过。
 
 ## 1. 任务描述
 

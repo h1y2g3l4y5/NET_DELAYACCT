@@ -4,9 +4,9 @@
 | 编号 | 任务 | 状态 | 备注 |
 |------|------|------|------|
 | TASK-47 | perf-test.sh verdict 三态判定 + 5 指标全覆盖 + 端到端验证 | 完成 | v6.4.0 实现复审 5 条问题（#3-#7）全部修复；3 次端到端跑证实不再有假 ALL PASSED；自检追加颜色码字面量修复（坑3） |
-| TASK-50 | perf-test.sh --strict 模式 + --bzimage-on/off 参数 + exit code 传递 | [待Review] | v6.5.0 议题3/6/8；warn/fail 分级 + INVALID>50% exit 2 + PERF_EXIT_FILE 子 shell 传值；15 单元测试全过 |
-| TASK-51 | ci.yml build-kernel matrix 化（ON/OFF 并行） | [待Review] | v6.5.0 议题2；matrix [on,off] + OFF 显式关闭 NET_DELAYACCT + qemu-test artifact 下载同步改 bzImage-on |
-| TASK-52 | ci.yml 新增 perf-test job + NO-DATA 假 PASS 修复 | [待Review] | v6.5.0 议题2/5；continue-on-error + --strict=warn + artifact 分目录；验证中发现全 SKIP 假 PASS 隐患并修复（verdict_pass 计数） |
+| TASK-50 | perf-test.sh --strict 模式 + --bzimage-on/off 参数 + exit code 传递 | [已Review-已修订] | v6.5.0 议题3/6/8；warn/fail 分级 + INVALID>50% exit 2 + PERF_EXIT_FILE 子 shell 传值；15 单元测试全过；实现复审 10.3.2 修复（PERF_EXIT=1 + \|\|true） |
+| TASK-51 | ci.yml build-kernel matrix 化（ON/OFF 并行） | [已Review-已修订] | v6.5.0 议题2；matrix [on,off] + OFF 显式关闭 NET_DELAYACCT + qemu-test artifact 下载同步改 bzImage-on；实现复审无问题 |
+| TASK-52 | ci.yml 新增 perf-test job + NO-DATA 假 PASS 修复 | [已Review-已修订] | v6.5.0 议题2/5；continue-on-error + --strict=warn + artifact 分目录；验证中发现全 SKIP 假 PASS 隐患并修复（verdict_pass 计数）；实现复审 10.3.1 修复（timeout 15min+env 240/360）+ 10.3.3 修复（set -euo pipefail） |
 
 ### v6.4.0 阶段说明
 TASK-47 是 v6.4.0 实现复审（2026-08-06 Reviewer 首次代码复审）的回应。Reviewer 对 TASK-43/44/45/46 实现提出 5 条问题（1 高 / 2 中 / 2 低），核心是 perf-test.sh verdict 逻辑对噪声数据假 PASS（问题 #3，高）。本任务将 verdict 升级为三态（PASS/FAIL/**INVALID**），5 指标全覆盖，并端到端验证两处修复（TCP slab + \r）联合生效。5 条全部接受，无对话。

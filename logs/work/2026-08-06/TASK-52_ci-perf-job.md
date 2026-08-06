@@ -2,7 +2,25 @@
 
 - **日期**: 2026-08-06
 - **关联 Review**: v6.5.0 议题2（CI perf-test job 设计）、议题5（CI 失败不阻断）
-- **状态**: [待Review]
+- **状态**: [已Review-已修订]
+
+## 7. Review 回应（v6.5.0 实现复审）
+
+### 问题 10.3.1 [高]：CI perf-test job timeout 与 QEMU timeout 不匹配 — 接受（调整数值）
+
+**Reviewer 意见**：`timeout-minutes: 10`（600s）vs QEMU KVM 300×2=600s（零余量）/ TCG 600×2=1200s（必超时）。job timeout 后无 artifact 无诊断。
+
+**Worker 回应**：接受。分析正确——KVM 模式 600s 恰好等于 job timeout，加上 checkout+apt install+initramfs ~100s setup，KVM 也必超时。但 Reviewer 建议保持 `timeout-minutes=10` + `QEMU_TIMEOUT_KVM=240` 仍太紧（240×2+100=580s vs 600s limit，仅 20s 余量）。
+
+**修复**（[ci.yml#L494-506](file:///home/lai/Code/NET_DELAYACCT/.github/workflows/ci.yml#L494-L506)）：
+- `timeout-minutes: 15`（从 10 提升，给 KVM 模式 320s 余量）
+- `env: QEMU_TIMEOUT_KVM=240, QEMU_TIMEOUT_TCG=360`（CI 专用短 timeout）
+- KVM: 240×2+100=580s, 余量 320s ✓
+- TCG: 360×2+100=820s, 余量 80s ✓（TCG 回退是异常情况，360s 不够则 NO-DATA exit 2）
+
+### 问题 10.3.3 [低]：CI 步骤 set -e 缺 pipefail — 接受
+
+**修复**：[ci.yml#L534](file:///home/lai/Code/NET_DELAYACCT/.github/workflows/ci.yml#L534) `set -e` → `set -euo pipefail`，与 perf-test.sh 严格模式一致。
 
 ## 1. 任务描述
 

@@ -1,7 +1,7 @@
 # 审查报告 - v6.5.0（KVM 数据补齐 + CI 接入规划）
 
 - **规划日期**: 2026-08-06
-- **状态**: [实现复审中] — 规划阶段 8 条议题全部解决（6 接受 / 2 共识，见下文议题追踪表）；Worker 已实现 TASK-50/51/52（commit 605a047），本文档第十节为实现复审
+- **状态**: [实现复审-待确认闭环] — 规划 8/8 + 实现复审 3/3 议题全部解决；Worker 已修复 3 条问题（10.3.1-3），待 Reviewer 确认后闭环
 - **前置版本**: v6.4.0 已闭环（评分 8.5/10，commit c6e792f）
 - **审查人**: Reviewer
 
@@ -543,8 +543,8 @@ echo "${PERF_EXIT:-0}" > "$PERF_EXIT_FILE"
 
 | # | 问题 | 严重度 | Worker反馈 |
 |---|------|--------|-------------|
-| 10.3.1 | CI perf-test job timeout 与 QEMU timeout 不匹配 | 高 | [待回应] |
-| 10.3.2 | compare_and_report return 1 未设 PERF_EXIT | 中 | [待回应] |
-| 10.3.3 | CI 步骤缺少 pipefail | 低 | [待回应] |
+| 10.3.1 | CI perf-test job timeout 与 QEMU timeout 不匹配 | 高 | 接受（调整数值：timeout-minutes=15 + QEMU_TIMEOUT_KVM=240/TCG=360，10min 对 KVM 也太紧） |
+| 10.3.2 | compare_and_report return 1 未设 PERF_EXIT | 中 | 接受 |
+| 10.3.3 | CI 步骤缺少 pipefail | 低 | 接受 |
 
-**实现复审轮次状态**：0/3 已解决，3 条待回应。
+**实现复审轮次状态**：3/3 全部解决（接受），零遗留。Worker 已修复（见 commit 待提交），待 Reviewer 复审确认后闭环。

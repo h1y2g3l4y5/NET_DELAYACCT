@@ -342,6 +342,7 @@ compare_and_report() {
 
     if [ ! -f "$on_file" ] || [ ! -f "$off_file" ]; then
         echo "${RED}Missing result files${NC}"
+        PERF_EXIT=1
         return 1
     fi
 
@@ -628,7 +629,9 @@ done
     run_perf_in_qemu "$BZIMAGE_OFF" "OFF"
 
     # Step 5: 对比报告
-    compare_and_report
+    # || true: compare_and_report 在 missing-files 时 return 1，不让 set -e 绕过
+    # PERF_EXIT_FILE 写入（PERF_EXIT 已在 return 前显式设置为 1）
+    compare_and_report || true
 
     # 将 verdict exit code 写入临时文件（pipe 子 shell 变量不传递到父 shell）
     echo "${PERF_EXIT:-0}" > "$PERF_EXIT_FILE"

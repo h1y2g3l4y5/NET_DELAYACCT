@@ -491,11 +491,19 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [build-kernel]
     if: github.event_name == 'push'
-    timeout-minutes: 10
+    # timeout-minutes=15: KVM 模式 ~580s（240×2 + 100s setup），余量 320s；
+    #   TCG 回退 ~820s（360×2 + 100s），余量 80s（v6.5.0 问题 10.3.1 修复）
+    timeout-minutes: 15
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
     # continue-on-error: job 失败时 workflow 仍 success，但 CI 界面显示 ⚠️
     continue-on-error: true
+    env:
+      # CI 专用 QEMU timeout（短于本地默认 300/600s），确保 job 在 15min 内完成
+      # KVM 240s: 内核 boot ~10s + perf 测试 ~200s，足够；缩短 timeout 反而能更快发现 QEMU hang
+      # TCG 360s: TCG 回退是异常情况（CI 应有 KVM），360s 仍超 KVM 但在 job timeout 内
+      QEMU_TIMEOUT_KVM: 240
+      QEMU_TIMEOUT_TCG: 360
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -523,7 +531,7 @@ jobs:
 
       - name: Run perf-test (KVM, --strict=warn)
         run: |
-          set -e
+          set -euo pipefail
           cd "$GITHUB_WORKSPACE"
           test -f /tmp/artifacts/on/bzImage || { echo "ERROR: bzImage-on not found"; exit 1; }
           test -f /tmp/artifacts/off/bzImage || { echo "ERROR: bzImage-off not found"; exit 1; }
