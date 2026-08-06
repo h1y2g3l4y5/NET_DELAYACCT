@@ -90,3 +90,4 @@ ci/qemu/perf-initrd.img
 *.patch.rej
 *.patch.orig
 .d
+tests/helper/delayacct_io_uring_send

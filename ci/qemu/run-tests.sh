@@ -1615,25 +1615,28 @@ echo "|  第八部分：ftrace 打桩点全量验证 (白盒路径验证)       
 echo "+--------------------------------------------------------------+"
 
 # ---- Test 23: ftrace 打桩点全量验证 ----
-_test_header "ftrace 打桩点全量验证 (13 函数 × 8 场景)"
+_test_header "ftrace 打桩点全量验证 (16 函数 × 8 场景)"
 TRACEFS=/sys/kernel/tracing
 	[ -d "$TRACEFS" ] || TRACEFS=/sys/kernel/debug/tracing
 if [ ! -d "$TRACEFS" ] || [ ! -w "$TRACEFS/set_ftrace_filter" ]; then
 	_skip "ftrace not available (CONFIG_FTRACE disabled or tracefs not writable)"
 else
 	_desc \
-		"通过 ftrace function tracer 验证 13 个内核打桩函数在每个测试场景下被真实触发" \
+		"通过 ftrace function tracer 验证 16 个内核打桩函数（13个父函数 + 3个 start/end 直接追踪）在每个测试场景下被真实触发" \
 		"对每个场景启用 ftrace filter → 运行场景 → 统计函数调用次数 → 断言预期函数 > 0" \
-		"每个场景的预期函数调用次数 > 0，且 start/end 函数成对出现（路径可达性验证）"
+		"v6.6.0: 新增 net_delayacct_{rx_end,tx_start,tx_end} 直接追踪，验证 start/end 内部逻辑被精确执行"
 
-	# 13 个 ftrace 函数：覆盖全部 12 个打桩点（rx_start×1, rx_end×5, tx_end×1, tx_start×5）
+	# 16 个 ftrace 函数：13 个父函数（覆盖全部 12 个打桩点的调用上下文）
+	# + 3 个 start/end 直接追踪函数（验证 net_delayacct_{rx_end,tx_start,tx_end} 内部逻辑被执行）
 	# 注意：rx_start 打桩在 __netif_receive_skb_core（static），不可被 ftrace 追踪。
 	# 测试流量全部走 loopback（127.0.0.1 / ::1），loopback_xmit() 调用 __netif_rx()
 	# 而非 netif_receive_skb()（后者是 NAPI 驱动入口，loopback 不用）。
 	# 调用链：loopback_xmit → __netif_rx → netif_rx_internal → backlog
 	#         → process_backlog → __netif_receive_skb → __netif_receive_skb_core（rx_start 打桩）
 	# __netif_rx 是 EXPORT_SYMBOL 全局函数，可被 ftrace 追踪。
-	FTRACE_FUNCS="__netif_rx tcp_recvmsg_locked tcp_read_sock tcp_zerocopy_receive udp_recvmsg udpv6_recvmsg dev_hard_start_xmit __tcp_transmit_skb __tcp_retransmit_skb udp_sendmsg udp_push_pending_frames udpv6_sendmsg udp_v6_push_pending_frames"
+	# v6.6.0: 加入 net_delayacct_{rx_end,tx_start,tx_end} 直接追踪，
+	# 验证 start/end 函数内部逻辑被真实执行（不只是父函数被调用）
+	FTRACE_FUNCS="__netif_rx tcp_recvmsg_locked tcp_read_sock tcp_zerocopy_receive udp_recvmsg udpv6_recvmsg dev_hard_start_xmit __tcp_transmit_skb __tcp_retransmit_skb udp_sendmsg udp_push_pending_frames udpv6_sendmsg udp_v6_push_pending_frames net_delayacct_rx_end net_delayacct_tx_start net_delayacct_tx_end"
 
 	# 辅助：启用 ftrace 并设置 filter
 	_ftrace_start() {
@@ -1716,7 +1719,7 @@ else
 	iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 3 >/dev/null 2>&1 &
 	_CLI=$!; sleep 2
 	COUNTS_S1=$(_ftrace_stop_and_count)
-	_output "S1 TCP 单向 ftrace counts" "$COUNTS_S1"
+	_output "[TCP] ftrace counts" "$COUNTS_S1"
 	# Debug: 检查 trace 文件内容和 filter 设置（仅 S1 输出，避免重复噪音）
 	# 诊断信息：仅在 NET_DELAYACCT_DEBUG=1 时打印（含内核地址，不宜在 CI 公开日志暴露）
 	if [ "${NET_DELAYACCT_DEBUG:-0}" = "1" ]; then
@@ -1727,8 +1730,9 @@ else
 		head -5 "$TRACEFS/trace" 2>/dev/null | sed 's/^/      | /' || echo "      | (empty or unreadable)"
 	fi
 	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
-	if _ftrace_assert "S1" "$COUNTS_S1" \
-		__netif_rx tcp_recvmsg_locked __tcp_transmit_skb dev_hard_start_xmit; then
+	if _ftrace_assert "TCP" "$COUNTS_S1" \
+		__netif_rx tcp_recvmsg_locked __tcp_transmit_skb dev_hard_start_xmit \
+		net_delayacct_rx_end net_delayacct_tx_start net_delayacct_tx_end; then
 		PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 		_scenario_status 1 PASS
 	else
@@ -1744,10 +1748,11 @@ else
 	iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -u -t 3 -b 10M >/dev/null 2>&1 &
 	_CLI=$!; sleep 2
 	COUNTS_S2=$(_ftrace_stop_and_count)
-	_output "S2 UDP 单向 ftrace counts" "$COUNTS_S2"
+	_output "[UDP] ftrace counts" "$COUNTS_S2"
 	TOTAL_SCENARIOS=$((TOTAL_SCENARIOS + 1))
-	if _ftrace_assert "S2" "$COUNTS_S2" \
-		__netif_rx udp_recvmsg udp_sendmsg dev_hard_start_xmit; then
+	if _ftrace_assert "UDP" "$COUNTS_S2" \
+		__netif_rx udp_recvmsg udp_sendmsg dev_hard_start_xmit \
+		net_delayacct_rx_end net_delayacct_tx_start net_delayacct_tx_end; then
 		PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 		_scenario_status 2 PASS
 	else
@@ -1765,9 +1770,10 @@ else
 		"$PATH_HELPER" tcp-sender 127.0.0.1 "$SPLICE_PORT" 8 >/dev/null 2>&1 &
 		_CLI=$!; sleep 3
 		COUNTS_S3=$(_ftrace_stop_and_count)
-		_output "S3 TCP splice ftrace counts" "$COUNTS_S3"
-		if _ftrace_assert "S3" "$COUNTS_S3" \
-			__netif_rx tcp_read_sock __tcp_transmit_skb dev_hard_start_xmit; then
+		_output "[Splice] ftrace counts" "$COUNTS_S3"
+		if _ftrace_assert "Splice" "$COUNTS_S3" \
+			__netif_rx tcp_read_sock __tcp_transmit_skb dev_hard_start_xmit \
+			net_delayacct_rx_end net_delayacct_tx_start net_delayacct_tx_end; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 			_scenario_status 3 PASS
 		else
@@ -1789,9 +1795,10 @@ else
 		"$PATH_HELPER" tcp-sender 127.0.0.1 "$ZC_PORT" 8 >/dev/null 2>&1 &
 		_CLI=$!; sleep 3
 		COUNTS_S4=$(_ftrace_stop_and_count)
-		_output "S4 TCP zerocopy ftrace counts" "$COUNTS_S4"
-		if _ftrace_assert "S4" "$COUNTS_S4" \
-			__netif_rx tcp_zerocopy_receive __tcp_transmit_skb dev_hard_start_xmit; then
+		_output "[Zerocopy] ftrace counts" "$COUNTS_S4"
+		if _ftrace_assert "Zerocopy" "$COUNTS_S4" \
+			__netif_rx tcp_zerocopy_receive __tcp_transmit_skb dev_hard_start_xmit \
+			net_delayacct_rx_end net_delayacct_tx_start net_delayacct_tx_end; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 			_scenario_status 4 PASS
 		else
@@ -1811,9 +1818,10 @@ else
 		"$PATH_HELPER" corked-udp-client 127.0.0.1 "$CORK_PORT" 8 >/dev/null 2>&1 &
 		_CLI=$!; sleep 2
 		COUNTS_S5=$(_ftrace_stop_and_count)
-		_output "S5 UDP corked ftrace counts" "$COUNTS_S5"
-		if _ftrace_assert "S5" "$COUNTS_S5" \
-			udp_push_pending_frames dev_hard_start_xmit; then
+		_output "[Cork] ftrace counts" "$COUNTS_S5"
+		if _ftrace_assert "Corked" "$COUNTS_S5" \
+			udp_push_pending_frames dev_hard_start_xmit \
+			net_delayacct_tx_start net_delayacct_tx_end; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 			_scenario_status 5 PASS
 		else
@@ -1843,9 +1851,10 @@ else
 		iperf3 -c ::1 -p "$IPERF_PORT" -u -t 2 -b 10M >/dev/null 2>&1 &
 		_CLI6_UDP=$!; sleep 3
 		COUNTS_S6=$(_ftrace_stop_and_count)
-		_output "S6 IPv6 TCP+UDP ftrace counts" "$COUNTS_S6"
-		if _ftrace_assert "S6" "$COUNTS_S6" \
-			__netif_rx tcp_recvmsg_locked udpv6_recvmsg udpv6_sendmsg __tcp_transmit_skb dev_hard_start_xmit; then
+		_output "[IPv6] ftrace counts" "$COUNTS_S6"
+		if _ftrace_assert "IPv6" "$COUNTS_S6" \
+			__netif_rx tcp_recvmsg_locked udpv6_recvmsg udpv6_sendmsg __tcp_transmit_skb dev_hard_start_xmit \
+			net_delayacct_rx_end net_delayacct_tx_start net_delayacct_tx_end; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 			_scenario_status 6 PASS
 		else
@@ -1867,9 +1876,10 @@ else
 		"$PATH_HELPER" corked-udp6-client ::1 "$CORK6_PORT" 8 >/dev/null 2>&1 &
 		_CLI=$!; sleep 2
 		COUNTS_S8=$(_ftrace_stop_and_count)
-		_output "S8 IPv6 UDP corked ftrace counts" "$COUNTS_S8"
-		if _ftrace_assert "S8" "$COUNTS_S8" \
-			udp_v6_push_pending_frames udpv6_sendmsg dev_hard_start_xmit; then
+		_output "[Cork6] ftrace counts" "$COUNTS_S8"
+		if _ftrace_assert "Cork6" "$COUNTS_S8" \
+			udp_v6_push_pending_frames udpv6_sendmsg dev_hard_start_xmit \
+			net_delayacct_tx_start net_delayacct_tx_end; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 			_scenario_status 8 PASS
 		else
@@ -1903,9 +1913,10 @@ else
 		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -t 5 >/dev/null 2>&1 &
 		_CLI=$!; sleep 4
 		COUNTS_S7=$(_ftrace_stop_and_count)
-		_output "S7 TCP 重传 ftrace counts (netem=$NETEM_OK iptables=$IPTABLES_OK)" "$COUNTS_S7"
-		if _ftrace_assert "S7" "$COUNTS_S7" \
-			__tcp_retransmit_skb __tcp_transmit_skb dev_hard_start_xmit; then
+		_output "[Retrans] ftrace counts (netem=$NETEM_OK iptables=$IPTABLES_OK)" "$COUNTS_S7"
+		if _ftrace_assert "Retrans" "$COUNTS_S7" \
+			__tcp_retransmit_skb __tcp_transmit_skb dev_hard_start_xmit \
+			net_delayacct_tx_start net_delayacct_tx_end; then
 			PASSED_SCENARIOS=$((PASSED_SCENARIOS + 1))
 			_scenario_status 7 PASS
 		else
@@ -1948,7 +1959,7 @@ else
 	echo "  |  ftrace 覆盖矩阵 (场景 × 函数调用次数)                             |"
 	echo "  +--------------------------------------------------------------------+"
 	printf "  | %-26s | %4s | %4s | %4s | %4s | %4s | %4s | %4s | %4s |\n" \
-		"函数" "S1" "S2" "S3" "S4" "S5" "S6" "S7" "S8"
+		"函数" "TCP" "UDP" "Splice" "Zcpy" "Cork" "IPv6" "Rtx" "C6"
 	echo "  |----------------------------|------|------|------|------|------|------|------|------|"
 	for _fn in $FTRACE_FUNCS; do
 		printf "  | %-26s | %4s | %4s | %4s | %4s | %4s | %4s | %4s | %4s |\n" \
@@ -1966,14 +1977,15 @@ else
 	# 矩阵解读提示
 	echo "  | 解读: 每列(场景)的预期函数应全部非零 → 场景 PASS                |"
 	echo "  | 解读: 每行(函数)至少在一个场景非零 → 打桩点可达                  |"
+	echo "  | 解读: net_delayacct_* > 0 → start/end 内部逻辑被真实执行          |"
 	echo "  +--------------------------------------------------------------------+"
 
 	# --- 场景级状态汇总（TASK-37: 不打开 QEMU log 也能看到 S7/S8 状态）---
 	echo ""
 	echo "  +--------------------------------------------------------------------+"
-	echo "  |  Test 23 场景状态汇总 (S1-S8)                                      |"
+	echo "  |  Test 23 场景状态汇总 (8 场景)                                     |"
 	echo "  +--------------------------------------------------------------------+"
-	printf "  | S1=%-4s S2=%-4s S3=%-4s S4=%-4s S5=%-4s S6=%-4s S7=%-4s S8=%-4s |\n" \
+	printf "  | TCP=%-4s UDP=%-4s Splice=%-4s Zcpy=%-4s Cork=%-4s IPv6=%-4s Rtx=%-4s C6=%-4s |\n" \
 		"$SCEN_S1" "$SCEN_S2" "$SCEN_S3" "$SCEN_S4" "$SCEN_S5" "$SCEN_S6" "$SCEN_S7" "$SCEN_S8"
 	echo "  +--------------------------------------------------------------------+"
 	printf "  | 场景通过率: %d/%d PASS, %d SKIP, %d FAIL                          |\n" \
