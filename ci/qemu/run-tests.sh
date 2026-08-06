@@ -6,7 +6,7 @@
 # 合并自：selftest (test_netdelayacct.sh) + func tests (tests/func/*.sh)
 #         + demo-tests.sh (可视化演示 + 压力测试)
 #
-# 测试用例清单 (共 22 项):
+# 测试用例清单 (共 26 项):
 #   基础功能 (6 项): PID查询 / Inode查询 / 重置-基础 / TCP路径 / UDP路径 / 多Socket
 #   工具展示 (2 项): JSON输出 / Debug模式
 #   压力测试 (3 项): 高并发 / 大流量 / 混合协议
@@ -16,6 +16,9 @@
 #   语义验证 (1 项): Reset 非原子语义 (流量中 reset 存在非零)
 #   双向流量 (1 项): 同 socket RX+TX 同时有数据
 #   路径覆盖 (4 项): TCP splice RX / TCP zerocopy RX / UDP corked TX / IPv6 TCP+UDP
+#   Ftrace验证 (1 项): 13函数×8场景 覆盖矩阵
+#   Kprobe验证 (2 项): per-skb 配对 / 纯 ACK TX guard
+#   io_uring (1 项): io_uring IORING_OP_SEND TX 路径
 #
 # 运行环境: QEMU guest 内，get_sockdelays 安装于 /usr/local/bin/
 #           delayacct_path_test (辅助程序，路径覆盖测试用) 安装于 /usr/local/bin/
@@ -24,6 +27,7 @@
 export PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
 GET_SOCKDELAYS="${GET_SOCKDELAYS:-/usr/local/bin/get_sockdelays}"
 PATH_HELPER="${PATH_HELPER:-/usr/local/bin/delayacct_path_test}"
+IO_URING_HELPER="${IO_URING_HELPER:-/usr/local/bin/delayacct_io_uring_send}"
 
 # 严格模式：fail fast，同时要求所有变量必须先定义
 set -euo pipefail
@@ -2256,6 +2260,67 @@ if _require iperf3; then
 		_kill "$_SRV" 2>/dev/null || true
 	else
 		_fail "iperf3 server failed to start"
+	fi
+fi
+
+# ================================================================
+# 第十部分：io_uring send 路径验证 (Test 26)
+# ================================================================
+echo ""
+echo "+--------------------------------------------------------------+"
+echo "|  第十部分：io_uring send 路径验证                              |"
+echo "+--------------------------------------------------------------+"
+
+# ---- Test 26: io_uring IORING_OP_SEND TX 路径 ----
+_test_header "io_uring send TX 路径 (IORING_OP_SEND)"
+# 验证目标：
+# io_uring IORING_OP_SEND 最终进入 tcp_sendmsg_locked → __tcp_transmit_skb，
+# 与普通 send() 共享传输层 TX start/end 插桩点。本测验证实 io_uring 路径的
+# TX 计数正常累加，消除 kernel-patches/README.md 附录 B.3 中的 ⚠️ 未验证标注。
+#
+# 验证方法：
+# 1. nc -l 创建 TCP 监听 socket（接收方，仅提供连接目标）
+# 2. delayacct_io_uring_send 通过 io_uring 发送数据
+# 3. 查询 sender 的 TX 计数，应为 > 0
+if _require nc; then
+	_desc \
+		"io_uring IORING_OP_SEND 的 TX 打点与普通 send() 共享传输层路径" \
+		"nc 监听 → delayacct_io_uring_send 发送 → 查询 sender TX 计数" \
+		"sender TX count > 0（确认 io_uring 路径的 TX 打点正常）"
+
+	IOURING_PORT=21449
+
+	# 检查辅助程序
+	if [ ! -x "$IO_URING_HELPER" ]; then
+		_skip "missing helper: delayacct_io_uring_send"
+	else
+		nc -l -p "$IOURING_PORT" >/dev/null 2>&1 &
+		_NC=$!
+		sleep 1
+		if kill -0 "$_NC" 2>/dev/null; then
+			# io_uring 辅助程序：连接并发送 4s 数据
+			"$IO_URING_HELPER" 127.0.0.1 "$IOURING_PORT" 4 2>/dev/null &
+			_SEND=$!
+			sleep 2  # 等发送稳定后进行查询
+			if kill -0 "$_SEND" 2>/dev/null; then
+				OUT=$("$GET_SOCKDELAYS" -p "$_SEND" 2>&1 || true)
+				_output "get_sockdelays -p $_SEND (io_uring sender)" "$OUT"
+
+				SEND_TX=$(echo "$OUT" | awk '/TX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
+				if [ "$SEND_TX" -gt 0 ]; then
+					_pass "io_uring send TX: $SEND_TX packets (path verified)"
+				else
+					_show_output "io_uring sender TX=0 (path not covered?)" "$OUT" "$_SEND"
+					_fail "io_uring send TX count=$SEND_TX (expected >0)"
+				fi
+				_kill "$_SEND"
+			else
+				_fail "io_uring sender exited before query (rc=$?)"
+			fi
+			_kill "$_NC"
+		else
+			_fail "nc listener failed to start"
+		fi
 	fi
 fi
 

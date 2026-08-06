@@ -231,7 +231,7 @@ TX start 点打在 TCP/UDP 的传输层出口处（而非系统调用入口）�
 - TCP corked / `MSG_MORE`：✅，通过 `__tcp_transmit_skb` clone 路径覆盖
 - UDP corked（`UDP_CORK` / `MSG_MORE`）：✅，通过 `udp_push_pending_frames` 覆盖
 - `splice(pipe → sock)` / `sendfile()`：TCP 侧经过 `tcp_sendmsg` 走 clone 路径，✅
-- `io_uring` send：⚠️ 未专门验证
+- `io_uring` send：✅ 通过 `IORING_OP_SEND` → `tcp_sendmsg_locked` → `__tcp_transmit_skb`，共享传输层 TX 路径，Test 26 已验证 TX 计数正常累加
 - 纯 ACK / RST / 窗口探测：`alloc_skb` 零初始化 `delayacct_start=0`，被 `tx_end` 的 zero-check 跳过，不计入 TX 统计（正确行为）
 
 ### B.4 加速路径与 offload

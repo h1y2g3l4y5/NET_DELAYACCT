@@ -15,15 +15,25 @@ CFLAGS  += -D_GNU_SOURCE
 LDFLAGS ?=
 LDLIBS  ?=
 
-BIN     := delayacct_path_test
+BINS    := delayacct_path_test delayacct_io_uring_send
 SRC     := delayacct_path_test.c
+SRC_IO  := delayacct_io_uring_send.c
 
 .PHONY: all clean
 
-all: $(BIN)
+all: $(BINS)
 
 # 尝试静态链接；失败则回退动态链接
-$(BIN): $(SRC)
+delayacct_path_test: $(SRC)
+	@echo "  CC+LD   $@"
+	@if $(CC) $(CFLAGS) -static $(LDFLAGS) -o $@ $< $(LDLIBS) 2>/dev/null; then \
+		echo "  (static linked)"; \
+	else \
+		$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS); \
+		echo "  (dynamic linked)"; \
+	fi
+
+delayacct_io_uring_send: $(SRC_IO)
 	@echo "  CC+LD   $@"
 	@if $(CC) $(CFLAGS) -static $(LDFLAGS) -o $@ $< $(LDLIBS) 2>/dev/null; then \
 		echo "  (static linked)"; \
@@ -33,4 +43,4 @@ $(BIN): $(SRC)
 	fi
 
 clean:
-	rm -f $(BIN)
+	rm -f $(BINS)

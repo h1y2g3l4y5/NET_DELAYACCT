@@ -210,10 +210,11 @@ jobs:
           test -x userspace/get_sockdelays/get_sockdelays
           ./userspace/get_sockdelays/get_sockdelays -h || true
 
-      - name: Build test helper (splice/zerocopy/corked path coverage)
+      - name: Build test helpers (path coverage + io_uring send)
         run: |
           make -C tests/helper CC="ccache gcc" || echo "helper build failed, path tests will SKIP"
-          test -x tests/helper/delayacct_path_test && echo "helper OK" || echo "helper MISSING"
+          test -x tests/helper/delayacct_path_test && echo "path helper OK" || echo "path helper MISSING"
+          test -x tests/helper/delayacct_io_uring_send && echo "io_uring helper OK" || echo "io_uring helper MISSING"
 
       - name: Upload get_sockdelays artifact
         uses: actions/upload-artifact@v4
@@ -227,6 +228,14 @@ jobs:
         with:
           name: delayacct_path_test
           path: tests/helper/delayacct_path_test
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Upload io_uring helper artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: delayacct_io_uring_send
+          path: tests/helper/delayacct_io_uring_send
           retention-days: 1
           if-no-files-found: ignore
 
@@ -271,6 +280,12 @@ jobs:
           name: delayacct_path_test
           path: /tmp/artifacts
 
+      - name: Download io_uring helper artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: delayacct_io_uring_send
+          path: /tmp/artifacts
+
       - name: Build initramfs and run QEMU (KVM)
         run: |
           set -e
@@ -308,14 +323,21 @@ jobs:
           cp /tmp/artifacts/get_sockdelays /tmp/initrd/usr/local/bin/
           chmod +x /tmp/initrd/usr/local/bin/get_sockdelays
 
-          # Copy test helper (splice/zerocopy/corked path coverage, Test 17-19)
-          # 静态链接；缺失时 path-coverage 测试自动 SKIP
+          # Copy test helpers (path coverage, io_uring send)
+          # 静态链接；缺失时相关测试自动 SKIP
           if [ -f /tmp/artifacts/delayacct_path_test ]; then
             cp /tmp/artifacts/delayacct_path_test /tmp/initrd/usr/local/bin/
             chmod +x /tmp/initrd/usr/local/bin/delayacct_path_test
             echo "Copied delayacct_path_test helper"
           else
             echo "WARNING: delayacct_path_test not found, path tests will SKIP"
+          fi
+          if [ -f /tmp/artifacts/delayacct_io_uring_send ]; then
+            cp /tmp/artifacts/delayacct_io_uring_send /tmp/initrd/usr/local/bin/
+            chmod +x /tmp/initrd/usr/local/bin/delayacct_io_uring_send
+            echo "Copied delayacct_io_uring_send helper"
+          else
+            echo "WARNING: delayacct_io_uring_send not found, io_uring test will SKIP"
           fi
 
           # Copy unified test script

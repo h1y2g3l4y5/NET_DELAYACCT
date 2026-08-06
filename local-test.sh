@@ -288,7 +288,7 @@ step_create_initramfs() {
 	done
 	echo "Copied shared libraries for get_sockdelays"
 
-	# Copy test helper (splice/zerocopy/corked path coverage, Test 19-21)
+	# Copy test helpers (path coverage, io_uring send)
 	# 静态链接，无需复制依赖库；构建失败时跳过（run-tests.sh 会 SKIP）
 	local HELPER_BIN="$PROJECT_DIR/tests/helper/delayacct_path_test"
 	if [ -x "$HELPER_BIN" ]; then
@@ -297,6 +297,15 @@ step_create_initramfs() {
 		echo "Copied delayacct_path_test helper"
 	else
 		echo "WARNING: delayacct_path_test not built, path-coverage tests will SKIP"
+	fi
+
+	local IO_URING_BIN="$PROJECT_DIR/tests/helper/delayacct_io_uring_send"
+	if [ -x "$IO_URING_BIN" ]; then
+		cp "$IO_URING_BIN" "$INITRD_DIR/usr/local/bin/delayacct_io_uring_send"
+		chmod +x "$INITRD_DIR/usr/local/bin/delayacct_io_uring_send"
+		echo "Copied delayacct_io_uring_send helper"
+	else
+		echo "WARNING: delayacct_io_uring_send not built, io_uring test will SKIP"
 	fi
 
 	# Copy bash for test scripts (test scripts use bash-specific syntax)
