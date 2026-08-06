@@ -7,6 +7,7 @@
 | TASK-50 | perf-test.sh --strict 模式 + --bzimage-on/off 参数 + exit code 传递 | [已Review-已修订] | v6.5.0 议题3/6/8；warn/fail 分级 + INVALID>50% exit 2 + PERF_EXIT_FILE 子 shell 传值；15 单元测试全过；实现复审 10.3.2 修复（PERF_EXIT=1 + \|\|true） |
 | TASK-51 | ci.yml build-kernel matrix 化（ON/OFF 并行） | [已Review-已修订] | v6.5.0 议题2；matrix [on,off] + OFF 显式关闭 NET_DELAYACCT + qemu-test artifact 下载同步改 bzImage-on；实现复审无问题 |
 | TASK-52 | ci.yml 新增 perf-test job + NO-DATA 假 PASS 修复 | [已Review-已修订] | v6.5.0 议题2/5；continue-on-error + --strict=warn + artifact 分目录；验证中发现全 SKIP 假 PASS 隐患并修复（verdict_pass 计数）；实现复审 10.3.1 修复（timeout 15min+env 240/360）+ 10.3.3 修复（set -euo pipefail） |
+| TASK-54 | CI 验证 perf-test job（push + 监控运行结果） | [已完成-部分待跟进] | 首次 CI run #136 发现 OFF 内核构建失败（0010 patch 未 #ifdef 守卫），修复后 run #137：build-kernel on/off 均 success、QEMU 功能测试 success、perf-test 首次运行（exit 1 verdict FAIL，continue-on-error 不阻断）、overall success |
 
 ### v6.4.0 阶段说明
 TASK-47 是 v6.4.0 实现复审（2026-08-06 Reviewer 首次代码复审）的回应。Reviewer 对 TASK-43/44/45/46 实现提出 5 条问题（1 高 / 2 中 / 2 低），核心是 perf-test.sh verdict 逻辑对噪声数据假 PASS（问题 #3，高）。本任务将 verdict 升级为三态（PASS/FAIL/**INVALID**），5 指标全覆盖，并端到端验证两处修复（TCP slab + \r）联合生效。5 条全部接受，无对话。
@@ -98,12 +99,14 @@ TASK-50/51/52 是 v6.5.0 规划阶段 Reviewer 议题的实现。Reviewer 提出
 ## 明日计划
 
 ### v6.5.0 待办
-- [ ] 提请 Reviewer 复审 TASK-50/51/52（CI 接入实现 + NO-DATA 修复）
-- [ ] 等待 Reviewer 确认议题1（本地无 KVM 改 CI 收集）+ 议题7（5 轮起步）
-- [ ] push 验证 CI perf-test job 实际运行（TASK-54）：KVM 可用性、artifact 文件名、verdict exit code
-- [ ] CI 中收集 KVM perf 数据（5 轮起步，CV<15% 则足够，否则追加至 10 轮）（TASK-48，依赖议题1 确认）
+- [x] 提请 Reviewer 复审 TASK-50/51/52 — 已闭环（v6.5.0 REVIEW_REPORT [闭环完成]）
+- [x] 等待 Reviewer 确认议题1 + 议题7 — 已确认（8/8 全部解决）
+- [x] push 验证 CI perf-test job 实际运行（TASK-54）— 已完成（run #137 overall success；发现并修复 OFF 内核构建 bug）
+- [ ] **perf-test verdict 详情分析**：需 admin token 查看日志，确认哪个指标 FAIL（推测 latency 10μs 阈值过紧）
+- [ ] CI 中收集 KVM perf 数据（5 轮起步，CV<15% 则足够，否则追加至 10 轮）（TASK-48）
 - [ ] 基于 KVM 数据确定稳定阈值 + 更新 PERFORMANCE.md（TASK-49，依赖 TASK-48）
 - [ ] pahole 验证 struct sock 布局（确认 64 vs 72 差异根因）（TASK-53，低优先级）
+- [ ] 本地 linux-6.6 树同步 0010 patch 的 #ifdef 修复（手动重新应用 patch 或编辑 sock.c）
 
 ### v6.4.0 待办
 - [x] 提请 Reviewer 复审 TASK-47 — 已闭环（commit c6e792f，评分 8.5/10）
