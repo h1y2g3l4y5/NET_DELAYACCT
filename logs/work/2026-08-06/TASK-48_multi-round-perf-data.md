@@ -121,22 +121,22 @@ TCG 软件仿真引入 ~10× 噪声放大，使 throughput/PPS/latency 指标的
 
 **限制**：annotations 仅含失败摘要（如 "Process completed with exit code 2."），不包含 Step Summary 中的完整 PERF: 数据行（需 admin 下载 artifact）。但 workflow/job conclusion + failure annotation 足以判定"是否阻断"和"失败类型"。
 
-### 7.2 5 轮 CI KVM 数据汇总
+### 7.2 5 轮 CI KVM 数据汇总（+ TASK-55 修复后验证轮 #145）
 
-| Run | Commit | Workflow | Perf-test | QEMU test (S1-S25) | Perf 持续 | 失败摘要 |
-|-----|--------|----------|-----------|---------------------|-----------|----------|
-| #137 (6e3193c) | "fix: OFF 内核构建..." | failure | ❌ exit 1 | ✅ | 3m6s | verdict FAIL（sock +128>80, latency +115μs>10μs）— TASK-54 已分析 |
-| #139 (93d77b2) | "fix: 阈值校准..." | success | ❌ exit 1 (continue-on-error) | ✅ | — | 推测 cpu_util +7.9% 接近 10% 被噪声推过（TASK-54 推测） |
-| #140 (c720aa6) | "fix: --strict=warn FAIL→exit 0" | **success** | ✅ exit 0 | ✅ | — | FAIL→warn 设计生效 |
-| #141 (bfe86eb) | "docs: TASK-54 工作日志" | **failure** | ✅ exit 0 | ❌ Test 24 ratio=209% | — | Test 24 计数比 209% > 200% 阈值 |
-| #142 (6ab8fa8) | "docs: TASK-54 完成 #140" | **failure** | ❌ exit 2 | ❌ Test 24 ratio=203% | 2m48s | perf-test exit 2 (NO-DATA 或 INVALID>50%) + Test 24 ratio=203% |
-| #143 (f407807) | "feat: TASK-53 pahole" | **success** | ✅ exit 0 | ✅ | 3m6s | 全绿，噪声退去 |
-| #144 (055c89e) | "feat: TASK-48/49/53 完成" | in_progress | — | — | — | 撰写本日志时仍在构建内核 |
+| Run | Commit | 修复前/后 | Workflow | Perf-test | QEMU test (S1-S25) | Perf 持续 | 失败摘要 |
+|-----|--------|-----------|----------|-----------|---------------------|-----------|----------|
+| #137 (6e3193c) | "fix: OFF 内核构建..." | 修复前 | failure | ❌ exit 1 | ✅ | 3m6s | verdict FAIL（sock +128>80, latency +115μs>10μs）— TASK-54 已分析 |
+| #139 (93d77b2) | "fix: 阈值校准..." | 修复前 | success | ❌ exit 1 (continue-on-error) | ✅ | — | 推测 cpu_util +7.9% 接近 10% 被噪声推过（TASK-54 推测） |
+| #140 (c720aa6) | "fix: --strict=warn FAIL→exit 0" | 修复前 | **success** | ✅ exit 0 | ✅ | — | FAIL→warn 设计生效 |
+| #141 (bfe86eb) | "docs: TASK-54 工作日志" | 修复前 | **failure** | ✅ exit 0 | ❌ Test 24 ratio=209% | — | Test 24 计数比 209% > 200% 阈值 |
+| #142 (6ab8fa8) | "docs: TASK-54 完成 #140" | 修复前 | **failure** | ❌ exit 2 | ❌ Test 24 ratio=203% | 2m48s | perf-test exit 2 (NO-DATA 或 INVALID>50%) + Test 24 ratio=203% |
+| #143 (f407807) | "feat: TASK-53 pahole" | 修复前 | **success** | ✅ exit 0 | ✅ | 3m6s | 全绿，噪声退去 |
+| **#145 (bf58488)** | **"feat: v6.5.0 闭环"** | **修复后** | **✅ success** | **✅ exit 0 (167s)** | **✅ success (353s)** | **2m47s** | **6/6 全绿，Test 24 不再 flaky（TASK-55 验证）** |
 
-**5 轮 CI KVM verdict（#140-#143 + #137 历史）**：
-- perf-test job：4 ✅ + 2 ❌（exit 1 × 1, exit 2 × 1）= 67% pass rate
-- QEMU test (Test 24)：3 ✅ + 2 ❌ = 60% pass rate（Test 24 是唯一失败点）
-- workflow 整体：3 ✅ + 3 ❌ = 50% pass rate
+**5 轮 CI KVM verdict（#140-#143 + #137 历史）+ 1 轮修复后验证（#145）**：
+- perf-test job：4 ✅ + 2 ❌（exit 1 × 1, exit 2 × 1）= 67% pass rate；修复后 #145 ✅
+- QEMU test (Test 24)：3 ✅ + 2 ❌ = 60% pass rate（Test 24 是唯一失败点）；修复后 #145 ✅
+- workflow 整体：3 ✅ + 3 ❌ = 50% pass rate；修复后 #145 ✅ 6/6 全绿
 
 ### 7.3 关键发现 1：FAIL→warn 设计验证
 

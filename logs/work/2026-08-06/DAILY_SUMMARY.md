@@ -11,7 +11,7 @@
 | TASK-53 | pahole 验证 struct net_delayacct 实际大小 | [已完成] | pahole (DWARF4) 确认 struct = 72 bytes（spinlock 4B + hole 4B + stats 64B）；slab delta 128B = 72B struct + 56B SLAB_HWCACHE_ALIGN padding，数学验证通过 |
 | TASK-48 | 多轮性能数据收集与阈值稳定性分析 | [已完成-补遗] | 初版：3 轮本地 TCG + 1 轮 CI KVM；补遗：通过 check-runs annotations API（公开只读）补齐 5 轮 CI KVM workflow verdict（#137+#140-#143），验收标准"5+ 轮"达成 |
 | TASK-49 | 基于多轮数据微调阈值 | [已完成-补遗] | perf-test 阈值无需调整（5 轮 KVM 无 FAIL）；Test 24 ratio 阈值 200%→250%（TASK-55）|
-| TASK-55 | Test 24 ratio 阈值 200%→250%（共享 runner flakiness 修复） | [已完成-待Review] | TASK-48 补遗发现 2/4 轮 Test 24 ratio=203-209% 超 200% 阈值；run #141/#142 workflow failure 主因；1 行代码修改 + 注释/失败信息同步 |
+| TASK-55 | Test 24 ratio 阈值 200%→250%（共享 runner flakiness 修复） | [已完成-已验证] | TASK-48 补遗发现 2/4 轮 Test 24 ratio=203-209% 超 200% 阈值；run #141/#142 workflow failure 主因；1 行代码修改 + 注释/失败信息同步；run #145 (bf58488) QEMU test success 验证 Test 24 不再 flaky |
 
 ### v6.4.0 阶段说明
 TASK-47 是 v6.4.0 实现复审（2026-08-06 Reviewer 首次代码复审）的回应。Reviewer 对 TASK-43/44/45/46 实现提出 5 条问题（1 高 / 2 中 / 2 低），核心是 perf-test.sh verdict 逻辑对噪声数据假 PASS（问题 #3，高）。本任务将 verdict 升级为三态（PASS/FAIL/**INVALID**），5 指标全覆盖，并端到端验证两处修复（TCP slab + \r）联合生效。5 条全部接受，无对话。
@@ -54,7 +54,7 @@ TASK-50/51/52 是 v6.5.0 规划阶段 Reviewer 议题的实现。Reviewer 提出
 - **背景**：5 轮 CI KVM workflow verdict 分析发现 Test 24 ratio=203-209% 超 200% 阈值（2/4 轮失败），是 workflow failure 主因
 - **决策**：ratio 上限 200% → 250%（1 行代码），保留 ratio 下限 50% 和 mismatched 阈值不变
 - **理由**：最小变更；250% 给 ~20% 余量覆盖共享 runner 调度噪声；> 250% 仍 FAIL 捕获真正多打点 bug；方案 C（continue-on-error）掩盖真实回归，方案 D（flaky retries）增加 CI 时间不解决根因
-- **验证**：待 push 后下次 CI run 验证（run #144 仍使用旧代码，run #145+ 才含 TASK-55 修复）
+- **验证**：run #145 (bf58488) 6/6 jobs 全绿，QEMU runtime test success（353s），无 Test 24 失败 annotation → 250% 阈值覆盖 203-209% 噪声区间，flakiness 修复确认
 
 ## 踩坑总结
 
@@ -114,6 +114,7 @@ TASK-50/51/52 是 v6.5.0 规划阶段 Reviewer 议题的实现。Reviewer 提出
 | 端到端 Run B (TCG) --skip-build | 2 FAILED + 3 PASS | 坑1 修复后报告；sock +64 稳定 PASS；自检发现坑3 颜色字面量（TASK-47） |
 | 端到端 Run C (TCG) --skip-build | 1 FAILED + 4 PASS | 坑3 颜色修复后最终干净报告；颜色字面量 6→0；供 Reviewer 复审（TASK-47） |
 | CI KVM 多轮 verdict（5 轮） | 3 ✅ + 2 ❌ workflow | #137/#140/#143 success；#141/#142 failure（Test 24 flakiness，TASK-55 修复）；perf-test 5 轮 3 ✅ + 2 ❌（exit 1/2），FAIL→warn 设计验证 |
+| CI KVM run #145 (bf58488) TASK-55 验证 | 6/6 ✅ success | 修复后首轮全绿；QEMU test 353s success（Test 24 PASS，无失败 annotation）；perf-test 167s exit 0；仅 Node.js 20 弃用警告 |
 | pahole 验证（DWARF4） | 通过 | struct net_delayacct = 72 bytes（spinlock 4B + hole 4B + stats 64B）；slab delta 128B = 72B + 56B 对齐填充 |
 
 ### v6.4.0 verdict 三态验证（两次 run 互补）
@@ -148,8 +149,8 @@ TASK-50/51/52 是 v6.5.0 规划阶段 Reviewer 议题的实现。Reviewer 提出
 - [x] v6.4.0 已正式闭环（FINAL_REPORT 已生成）
 
 ### v6.6.0 待办（下一版本预告）
-- [ ] TASK-55 CI 验证：等待 push 后下次 CI run 确认 Test 24 ratio 不再 flaky
+- [x] TASK-55 CI 验证：run #145 (bf58488) QEMU test success，Test 24 ratio 不再 flaky
 - [ ] Test 24 长期监控：观察 10+ 轮 CI run 确认 250% 阈值稳定；若仍 flaky 考虑 flaky retries
 - [ ] CI KVM 完整 PERF: 数据行（需 admin 协助下载 artifact，计算精确 CV）
 - [ ] 物理硬件验证（沙箱环境无物理硬件访问权限）
-- [ ] actions/checkout@v4 升级到 v5（Node.js 24）
+- [ ] actions/checkout@v4 升级到 v5（Node.js 24）— run #145 annotations 提示 Node.js 20 弃用警告

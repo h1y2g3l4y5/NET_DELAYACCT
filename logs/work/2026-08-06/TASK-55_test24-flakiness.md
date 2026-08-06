@@ -2,7 +2,7 @@
 
 - **日期**: 2026-08-06
 - **关联 Review**: v6.5.0 收尾议题（TASK-48 补遗发现，非 v6.5.0 规划议题）
-- **状态**: [已完成-待Review]
+- **状态**: [已完成-已验证]
 
 ## 1. 任务描述
 
@@ -111,9 +111,31 @@ v6.3.0 [TASK-38](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-07-30/TASK-3
 bash -n ci/qemu/run-tests.sh  # 通过
 ```
 
-### 5.2 CI 验证（待 push）
+### 5.2 CI 验证（run #145，commit bf58488）
 
-预期：下一次 CI run（#144 或后续）Test 24 在共享 runner 上即使 ratio=210% 也 PASS。若 ratio > 250% 仍 FAIL（真正异常）。
+push 后通过 GitHub check-runs API（公开只读）轮询 run #145 至所有 job 完成，结果：
+
+| Job | 结论 | 耗时 | 备注 |
+|-----|------|------|------|
+| checkpatch on kernel patches | ✅ success | 73s | |
+| Build userspace get_sockdelays | ✅ success | 26s | |
+| Build kernel (on) | ✅ success | 582s | 共享 runner 较慢 |
+| Build kernel (off) | ✅ success | 753s | #ifdef 守卫修复生效 |
+| QEMU runtime test (KVM) | ✅ success | 353s | **Test 24 PASS — ratio 未超 250%** |
+| Performance test (KVM, ON vs OFF) | ✅ exit 0 | 167s | perf-test FAIL→warn 设计生效 |
+
+**关键结论**：QEMU runtime test conclusion=success，annotations 仅 1 条 Node.js 20 弃用警告（与 Test 24 无关），**无任何 Test 24 失败 annotation** → Test 24 flakiness 修复**验证通过**。
+
+对照修复前 5 轮 KVM verdict：
+
+| Run | Commit | 修复前/后 | Test 24 | workflow |
+|-----|--------|-----------|---------|----------|
+| #141 (bfe86eb) | 修复前 | ❌ ratio=209% > 200% | failure |
+| #142 (6ab8fa8) | 修复前 | ❌ ratio=203% > 200% | failure |
+| #143 (f407807) | 修复前 | ✅（噪声退去） | success |
+| **#145 (bf58488)** | **修复后** | ✅ **PASS** | **success** |
+
+修复后首轮即全绿，250% 阈值覆盖了共享 runner 调度噪声（203-209% 区间）。
 
 ### 5.3 回归保护
 
@@ -126,7 +148,7 @@ bash -n ci/qemu/run-tests.sh  # 通过
 - [x] 根因分析：ratio = tx_end/tx_start，纯 ACK/窗口更新使 ratio 偶尔超 200%
 - [x] 修复方案：ratio 上限 200% → 250%（方案 A）
 - [x] 代码修改 + 语法校验
-- [ ] CI 验证：等待下次 push 后 run #144 或后续 run 确认 Test 24 不再 flaky
+- [x] CI 验证：run #145 (bf58488) QEMU runtime test success，Test 24 不再 flaky
 - [ ] 长期监控：观察 10+ 轮 CI run，确认 250% 阈值稳定；若仍 flaky，考虑方案 D（flaky retries）
 
 ## 7. 关联文档
