@@ -1,7 +1,7 @@
 # 审查报告 - v6.5.0（KVM 数据补齐 + CI 接入规划）
 
 - **规划日期**: 2026-08-06
-- **状态**: [规划阶段] — Worker 已回应 8 条议题（6 接受 / 2 讨论），见 [DLG-20260806-014500](file:///home/lai/Code/NET_DELAYACCT/logs/dialogue/DLG-20260806-014500.md)；TASK-50/51 可立即启动（不依赖讨论项）
+- **状态**: [实现复审中] — 规划阶段 8 条议题全部解决（6 接受 / 2 共识，见下文议题追踪表）；Worker 已实现 TASK-50/51/52（commit 605a047），本文档第十节为实现复审
 - **前置版本**: v6.4.0 已闭环（评分 8.5/10，commit c6e792f）
 - **审查人**: Reviewer
 
@@ -446,15 +446,105 @@ fi
 
 ## 九、Review 议题追踪表
 
-| # | 议题 | 严重度 | Worker反馈 |
-|---|------|--------|-------------|
-| 1 | KVM 环境数据补齐方案（4.1） | 高 | 共识-调整顺序（本地无KVM改CI收集，待Reviewer确认） |
-| 2 | CI 接入实施方案（4.2-4.4） | 高 | 接受（补充：qemu-test artifact 下载需同步改 bzImage-on） |
-| 3 | `--strict` 模式设计（4.5） | 中 | 接受 |
-| 4 | pahole 验证计划（4.6） | 低 | 接受 |
-| 5 | 决策点：perf-test CI 失败是否阻断（5.2-1） | 中 | 接受 |
-| 6 | 决策点：`--strict=warn` 作为 CI 默认（5.2-2） | 中 | 接受 |
-| 7 | 决策点：KVM 数据收集轮次 10 轮（5.2-3） | 低 | 共识-5轮起步CV不达标再追加（待Reviewer确认） |
-| 8 | 决策点：`-smp 1` vs `-smp 2`（5.2-4） | 低 | 接受 |
+| # | 议题 | 严重度 | Worker反馈 | Reviewer 决议 |
+|---|------|--------|-------------|---------------|
+| 1 | KVM 环境数据补齐方案（4.1） | 高 | 共识-调整顺序（本地无KVM改CI收集） | **共识-接受调整**。Worker 已实测确认本地无 /dev/kvm + CPU 无 vmx/svm，改 CI 收集是唯一可行路径。执行顺序 50→51→52→48(CI)→49 正确，解决"鸡生蛋"问题。初始用 TCG 阈值，CI 中逐步校准。 |
+| 2 | CI 接入实施方案（4.2-4.4） | 高 | 接受（补充：qemu-test artifact 下载需同步改 bzImage-on） | **接受**。Worker 补充的 qemu-test artifact 同步是关键点，已在 TASK-51 中实现。 |
+| 3 | `--strict` 模式设计（4.5） | 中 | 接受 | **接受**。 |
+| 4 | pahole 验证计划（4.6） | 低 | 接受 | **接受**。低优先级，TASK-53 待执行。 |
+| 5 | 决策点：perf-test CI 失败是否阻断（5.2-1） | 中 | 接受 | **接受**。 |
+| 6 | 决策点：`--strict=warn` 作为 CI 默认（5.2-2） | 中 | 接受 | **接受**。 |
+| 7 | 决策点：KVM 数据收集轮次 10 轮（5.2-3） | 低 | 共识-5轮起步CV不达标再追加 | **共识-接受 5 轮起步**。5 轮可计算中位数 + P90，足够判断阈值方向。补充：若 CV 处于 10-15% 边界，建议直接追加至 10 轮，避免阈值稳定性存疑。 |
+| 8 | 决策点：`-smp 1` vs `-smp 2`（5.2-4） | 低 | 接受 | **接受**。 |
 
-**轮次状态**：6/8 已解决（接受），2 条讨论中（议题1 执行顺序 + 议题7 轮次，待 Reviewer 确认）。TASK-50/51 不依赖讨论项，Worker 已启动开发。
+**规划阶段轮次状态**：8/8 全部解决（6 接受 + 2 共识），零遗留。Worker 已实现 TASK-50/51/52，进入实现复审（见第十节）。
+
+---
+
+## 十、实现复审 — TASK-50/51/52（commit 605a047）
+
+- **复审日期**: 2026-08-06
+- **审查范围**: [TASK-50_strict-mode.md](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-06/TASK-50_strict-mode.md)、[TASK-51_ci-matrix.md](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-06/TASK-51_ci-matrix.md)、[TASK-52_ci-perf-job.md](file:///home/lai/Code/NET_DELAYACCT/logs/work/2026-08-06/TASK-52_ci-perf-job.md)
+- **代码变更**: [perf-test.sh](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh) (+108/-7)、[ci.yml](file:///home/lai/Code/NET_DELAYACCT/.github/workflows/ci.yml) (+111/-8)
+
+### 10.1 实现复审评分
+
+| 审查项 | 评分 | 说明 |
+|--------|------|------|
+| 代码质量 | 8/10 | --strict 参数解析清晰、NO-DATA 修复正确；1 高 1 中 1 低问题 |
+| 设计合理性 | 9/10 | verdict 优先级链 FAIL>INVALID>NO-DATA>PASS 设计合理；PERF_EXIT_FILE 子 shell 传值方案正确 |
+| 测试覆盖 | 8/10 | 15 单元测试 + exit code 传递 + 参数解析；缺 CI 实际运行验证（待 TASK-54） |
+| 文档/日志质量 | 9/10 | 三个 TASK 日志详实，踩坑记录完整，决策理由充分 |
+| **综合评分** | **8.5/10** | 主动发现并修复 NO-DATA 假 PASS 是亮点；CI timeout 不匹配是必修项 |
+
+### 10.2 优点
+
+1. **NO-DATA 假 PASS 主动发现与修复（TASK-52）**：Worker 在验证 CI job 逻辑时主动发现 verdict 逻辑的"默认成功"陷阱——QEMU 启动但无 PERF: 数据时全 SKIP 误报 ALL PASSED。这是 v6.4.0 噪声假 PASS 的同类隐患，CI 接入后假绿危害放大。`verdict_pass` 计数器是正确解法，优先级链升级为 FAIL > INVALID > NO-DATA > PASS 设计合理。**这体现了从 v6.4.0 教训中的成长——不等 Reviewer 指出，主动排查同类隐患。**
+
+2. **PERF_EXIT_FILE 子 shell exit code 传递（TASK-50）**：`{ ... } | tee` 子 shell 变量不传递到父 shell 是 bash 经典陷阱。Worker 用 mktemp 临时文件做 IPC + trap EXIT 清理，方案正确，并有单元测试验证 exit 2 能正确传递。
+
+3. **qemu-test artifact 下载同步（TASK-51）**：matrix 化后 artifact 名从 `bzImage` 变为 `bzImage-on/off`，Worker 主动发现 qemu-test job 的下载步骤需同步修改——这不在 Reviewer 原始方案中。对下游影响的主动排查值得肯定。
+
+4. **参数解析的防御性（TASK-50）**：`--strict=invalid` 返回 exit 2 并给出明确错误信息；未知参数 exit 2；`-h/--help` 打印用法。非法输入不会静默通过。
+
+### 10.3 问题
+
+| # | 严重度 | 问题描述 | 建议 | Worker反馈 |
+|---|--------|----------|------|-------------|
+| 1 | 高 | 见下文「问题 10.3.1 — CI perf-test job timeout 与 QEMU timeout 不匹配」 | 见下文 | [待回应] |
+| 2 | 中 | 见下文「问题 10.3.2 — compare_and_report return 1 未设 PERF_EXIT，set -e 绕过 PERF_EXIT_FILE」 | 见下文 | [待回应] |
+| 3 | 低 | CI Run perf-test 步骤用 `set -e` 而非 `set -euo pipefail`（[ci.yml#L526](file:///home/lai/Code/NET_DELAYACCT/.github/workflows/ci.yml#L526)） | 统一为 `set -euo pipefail`，与 perf-test.sh 严格模式一致 | [待回应] |
+
+#### 问题 10.3.1 — CI perf-test job timeout 与 QEMU timeout 不匹配
+
+**现象**：CI `perf-test` job 设置 `timeout-minutes: 10`（600s，[ci.yml#L494](file:///home/lai/Code/NET_DELAYACCT/.github/workflows/ci.yml#L494)），但 perf-test.sh 内部两次 QEMU 运行的 timeout 为 `QEMU_TIMEOUT_KVM=300` × 2 = 600s（KVM）或 `QEMU_TIMEOUT_TCG=600` × 2 = 1200s（TCG），见 [perf-test.sh#L27-28](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L27-L28)。
+
+**为什么是问题**：job timeout 是硬上限，超过后 GitHub Actions 直接 kill 整个 job（包括正在运行的 QEMU），不产出任何 artifact 或诊断信息。KVM 模式下两次 QEMU 恰好 600s = job timeout，没有任何余量——CI runner 启动慢、apt install 慢、QEMU boot 慢任何一项都会超时。TCG 回退模式下 1200s 远超 600s，**必定 timeout**。
+
+**触发条件**：
+- KVM 模式：CI runner 负载高、QEMU boot 慢、apt install 耗时 >0s（这些在共享 runner 上是常态）
+- TCG 模式：KVM 不可用时自动回退 TCG，1200s > 600s 必定 timeout
+
+**后果**：job timeout 后无 perf-report artifact、无 GITHUB_STEP_SUMMARY、无诊断信息。开发者看到的是一个干枯的 timeout 错误，无法判断是 QEMU 慢、perf 测试失败、还是基础设施问题。`continue-on-error: true` 让 workflow 仍 success，但 perf-test job 永远是红/黄，失去趋势监控价值。
+
+**修法**：两种方案择一：
+- 方案 A（推荐）：CI 步骤中通过环境变量缩短 QEMU timeout：`env: QEMU_TIMEOUT_KVM: 240, QEMU_TIMEOUT_TCG: 480`，总耗时 480s (KVM) / 960s (TCG)，留 2-10 分钟余量给 install/checkout
+- 方案 B：增大 `timeout-minutes: 20`，容忍 TCG 的 1200s。但 20 分钟 job 占用共享 runner 过久
+
+**为什么这么修**：方案 A 更优——QEMU 240s (KVM) 对 perf 测试足够（内核 boot ~10s + perf 测试 ~30s + iperf3 ~60s × 3 runs ≈ 200s），缩短 timeout 反而能更快发现 QEMU hang。TCG 480s 仍超 job timeout，但 TCG 回退本身是异常情况（CI 应有 KVM），timeout 可接受。
+
+#### 问题 10.3.2 — compare_and_report return 1 未设 PERF_EXIT，set -e 绕过 PERF_EXIT_FILE
+
+**现象**：[perf-test.sh#L343-L346](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L343-L346) 中 `compare_and_report` 在 result 文件缺失时 `return 1`，但未设置 `PERF_EXIT`。主流程 [perf-test.sh#L631-L634](file:///home/lai/Code/NET_DELAYACCT/perf-test.sh#L631-L634) 依赖 `set -e` 触发子 shell 退出来传播这个失败——`return 1` → `set -e` kill 子 shell → `echo "$PERF_EXIT" > $PERF_EXIT_FILE`（L634）未执行 → PERF_EXIT_FILE 为空。
+
+**为什么是问题**：exit code 的传递有两条路径——verdict 走 PERF_EXIT_FILE，硬错误走 set -e。这种"分裂责任"设计是维护陷阱：当前行为恰好正确（set -e 让 pipeline 返回 1，父 shell set -e exit 1），但如果未来有人为了"容错"在 pipeline 后加 `|| true`，或把 `set -e` 改成 `set +e`，missing-files 失败就会被 PERF_EXIT_FILE 的默认值 "0" 掩盖 → exit 0 → 假 PASS。这正是 v6.4.0 和 TASK-52 刚修复的"假绿"问题的同一类根因——verdict 逻辑依赖隐式行为而非显式状态。
+
+**触发条件**：result 文件缺失（`run_perf_in_qemu` 未创建 perf-ON/OFF-*.log）。当前 `run_perf_in_qemu` 总是创建 result_file（`tr` 命令），所以这个分支实际很难触发。但如果未来 `run_perf_in_qemu` 被重构为失败时 return 而非继续，或 `tr` 命令本身失败（磁盘满），就会触发。
+
+**后果**：当前无实际 bug（set -e 恰好传播了失败）。但设计脆弱——exit code 传递依赖 set -e 的隐式行为，而非 PERF_EXIT 的显式赋值。维护者修改 pipeline 结构时极易引入假 PASS。
+
+**修法**：在 `compare_and_report` 的 missing-files 分支显式设置 `PERF_EXIT=1`，并在主流程用 `|| true` 防止 set -e 绕过 PERF_EXIT_FILE 写入：
+```bash
+# perf-test.sh L343-346
+if [ ! -f "$on_file" ] || [ ! -f "$off_file" ]; then
+    echo "${RED}Missing result files${NC}"
+    PERF_EXIT=1
+    return 1
+fi
+
+# perf-test.sh L631-634（主流程）
+compare_and_report || true   # 不让 set -e 绕过 PERF_EXIT_FILE
+echo "${PERF_EXIT:-0}" > "$PERF_EXIT_FILE"
+```
+
+**为什么这么修**：让 PERF_EXIT 成为 exit code 的**唯一来源**，set -e 不再承担 exit code 传递职责。`|| true` 确保 compare_and_report 的 return 1 不 kill 子 shell，PERF_EXIT_FILE 总是被写入。这样即使未来修改 pipeline 结构，exit code 仍由 PERF_EXIT 决定，不会引入假 PASS。对照 v6.4.0/TASK-52 的教训：verdict 逻辑不可依赖"默认成功"或"隐式行为"，必须显式追踪所有状态。
+
+### 10.4 实现复审议题追踪
+
+| # | 问题 | 严重度 | Worker反馈 |
+|---|------|--------|-------------|
+| 10.3.1 | CI perf-test job timeout 与 QEMU timeout 不匹配 | 高 | [待回应] |
+| 10.3.2 | compare_and_report return 1 未设 PERF_EXIT | 中 | [待回应] |
+| 10.3.3 | CI 步骤缺少 pipefail | 低 | [待回应] |
+
+**实现复审轮次状态**：0/3 已解决，3 条待回应。
