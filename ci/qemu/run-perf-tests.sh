@@ -180,6 +180,9 @@ perf_4_memory() {
     # UDP/UDPv6 等 slab 的 objsize 上。这里用 TCP slab 作代表：
     # struct tcp_sock 的第一个成员就是 struct sock，故 ON 内核的 TCP slab
     # objsize 应比 OFF 大 ~72 bytes（struct net_delayacct 大小）。
+    # 注意：实际 slab delta 可能 ~128 bytes，因 TCP slab 用 SLAB_HWCACHE_ALIGN
+    # （64 字节缓存行对齐），/proc/slabinfo 报 s->size（含对齐填充）非
+    # s->object_size（原始 struct 大小）。72B struct 跨 64B 边界 → 56B padding。
     #
     # /proc/slabinfo 格式: name active_objs num_objs objsize objperslab ...
     # 第 4 列是 objsize。guest 内 init 为 root，可直接读 /proc/slabinfo
