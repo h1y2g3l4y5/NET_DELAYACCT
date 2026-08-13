@@ -19,6 +19,10 @@
 #   INITRAMFS      - initramfs 镜像路径 (必须包含 iperf3/netperf)
 #   IPERF_HOST     - 外部 iperf3 服务端地址 (若不使用本地回环)
 #   NETPERF_HOST   - 外部 netperf 服务端地址
+#
+# 注意: 本脚本是 legacy helper，主性能测试请使用 perf-test.sh。
+#   perf-test.sh 生成结构化 Markdown/CSV 摘要，支持三态 verdict。
+#   本脚本保留用于简单的双内核快速对比。
 
 set -eu
 
@@ -202,6 +206,29 @@ format_throughput() {
 	echo "${gbps} Gbps"
 }
 
+# 计算百分比变化（处理 N/A 和非数值）
+# 参数: $1=baseline值 $2=enabled值 $3=方向(drop/increase)
+# drop: (baseline - enabled) / baseline * 100（正值=下降=变差）
+# increase: (enabled - baseline) / baseline * 100（正值=增加=变差）
+calc_delta_pct() {
+	local base="$1" enabled="$2" direction="$3"
+	if [ "$base" = "N/A" ] || [ -z "$base" ] || \
+	   [ "$enabled" = "N/A" ] || [ -z "$enabled" ]; then
+		echo "N/A"
+		return
+	fi
+	if ! echo "$base" | grep -qE '^[0-9.]+$' || \
+	   ! echo "$enabled" | grep -qE '^[0-9.]+$'; then
+		echo "N/A"
+		return
+	fi
+	if [ "$direction" = "drop" ]; then
+		awk "BEGIN {if(${base}>0) printf \"%+.1f%%\", (${base}-${enabled})/${base}*100; else print \"N/A\"}"
+	else
+		awk "BEGIN {if(${base}>0) printf \"%+.1f%%\", (${enabled}-${base})/${base}*100; else print \"N/A\"}"
+	fi
+}
+
 # 运行两组测试
 RESULT_A=$(run_benchmarks "$KERNEL_A" "baseline")
 RESULT_B=$(run_benchmarks "$KERNEL_B" "enabled")
@@ -214,6 +241,11 @@ TCP_RTT_B=$(get_metric "$RESULT_B" "tcp_rtt_us")
 TCP_RR_A=$(get_metric "$RESULT_A" "tcp_rr_latency_us")
 TCP_RR_B=$(get_metric "$RESULT_B" "tcp_rr_latency_us")
 
+# 计算 Delta
+TCP_TP_DELTA=$(calc_delta_pct "$TCP_BPS_A" "$TCP_BPS_B" "drop")
+TCP_RTT_DELTA=$(calc_delta_pct "$TCP_RTT_A" "$TCP_RTT_B" "increase")
+TCP_RR_DELTA=$(calc_delta_pct "$TCP_RR_A" "$TCP_RR_B" "increase")
+
 # 生成对比表
 generate_table() {
 	cat <<TABLE_EOF
@@ -222,10 +254,15 @@ generate_table() {
 ============================================================
 Metric                 | Baseline (n)    | Enabled (y)     | Delta
 -----------------------|-----------------|-----------------|--------
-TCP Throughput         | $(printf '%-15s' "$(format_throughput "$TCP_BPS_A")") | $(printf '%-15s' "$(format_throughput "$TCP_BPS_B")") | -
-TCP RTT (us)           | $(printf '%-15s' "${TCP_RTT_A:-N/A}") | $(printf '%-15s' "${TCP_RTT_B:-N/A}") | -
-TCP_RR Latency (us)    | $(printf '%-15s' "${TCP_RR_A:-N/A}") | $(printf '%-15s' "${TCP_RR_B:-N/A}") | -
+TCP Throughput         | $(printf '%-15s' "$(format_throughput "$TCP_BPS_A")") | $(printf '%-15s' "$(format_throughput "$TCP_BPS_B")") | $TCP_TP_DELTA
+TCP RTT (us)           | $(printf '%-15s' "${TCP_RTT_A:-N/A}") | $(printf '%-15s' "${TCP_RTT_B:-N/A}") | $TCP_RTT_DELTA
+TCP_RR Latency (us)    | $(printf '%-15s' "${TCP_RR_A:-N/A}") | $(printf '%-15s' "${TCP_RTT_B:-N/A}") | $TCP_RR_DELTA
 ============================================================
+
+Delta direction:
+  TCP Throughput: (baseline - enabled) / baseline * 100  (positive = throughput drop)
+  TCP RTT:        (enabled - baseline) / baseline * 100  (positive = RTT increase)
+  TCP_RR Latency: (enabled - baseline) / baseline * 100  (positive = latency increase)
 TABLE_EOF
 }
 

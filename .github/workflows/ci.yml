@@ -576,24 +576,35 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: perf-report
-          path: tests/reports/perf/perf-test-*.log
+          path: |
+            tests/reports/perf/perf-test-*.log
+            tests/reports/perf/perf-summary-*.md
+            tests/reports/perf/perf-summary-*.csv
+            tests/reports/perf/perf-ON-*.log
+            tests/reports/perf/perf-OFF-*.log
           retention-days: 30
 
       - name: Generate perf summary
         if: always()
         run: |
-          PERF_LOG=$(ls -t tests/reports/perf/perf-test-*.log 2>/dev/null | head -1)
-          if [ -n "$PERF_LOG" ]; then
-            {
-              echo "## Performance Test Results (ON vs OFF)"
-              echo ""
-              echo "### Verdict Summary"
-              echo '```'
-              sed -n '/Verdict:/,/===.*===/p' "$PERF_LOG" | head -20
-              echo '```'
-              echo ""
-              echo "Full log: download perf-report artifact"
-            } >> "$GITHUB_STEP_SUMMARY"
+          # 优先展示 Markdown 摘要，fallback 到 log verdict 摘要
+          PERF_MD=$(ls -t tests/reports/perf/perf-summary-*.md 2>/dev/null | head -1)
+          if [ -n "$PERF_MD" ] && [ -f "$PERF_MD" ]; then
+            cat "$PERF_MD" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "## Performance Test: no log found" >> "$GITHUB_STEP_SUMMARY"
+            PERF_LOG=$(ls -t tests/reports/perf/perf-test-*.log 2>/dev/null | head -1)
+            if [ -n "$PERF_LOG" ]; then
+              {
+                echo "## Performance Test Results (ON vs OFF)"
+                echo ""
+                echo "### Verdict Summary"
+                echo '```'
+                sed -n '/Verdict:/,/===.*===/p' "$PERF_LOG" | head -20
+                echo '```'
+                echo ""
+                echo "Full log: download perf-report artifact"
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "## Performance Test: no log found" >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi

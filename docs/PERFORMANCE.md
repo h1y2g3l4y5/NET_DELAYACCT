@@ -261,6 +261,19 @@ PERF_RUNS=5 ./perf-test.sh --skip-build
 - `perf-test-TIMESTAMP.log` — 完整测试日志（含对比报告）
 - `perf-ON-TIMESTAMP.log` — ON 内核 QEMU 输出
 - `perf-OFF-TIMESTAMP.log` — OFF 内核 QEMU 输出
+- `perf-summary-TIMESTAMP.md` — 结构化 Markdown 摘要（含原始采样值、中位数、delta、阈值、verdict）
+- `perf-summary-TIMESTAMP.csv` — CSV 格式摘要（便于自动化解析和趋势分析）
+
+### CI artifact
+
+CI（`.github/workflows/ci.yml` 的 `perf-test` job）上传以下产物（`perf-report` artifact）：
+- `perf-test-*.log` — 完整测试日志
+- `perf-summary-*.md` — Markdown 摘要
+- `perf-summary-*.csv` — CSV 摘要
+- `perf-ON-*.log` — ON 内核 QEMU 原始输出
+- `perf-OFF-*.log` — OFF 内核 QEMU 原始输出
+
+GitHub Step Summary 优先展示 `perf-summary-*.md`；若无摘要文件，fallback 到 log 中的 verdict 摘要。
 
 ## 八、局限性与后续计划
 

@@ -24,6 +24,10 @@ LINUX_SRC="${LINUX_SRC:-$PROJECT_DIR/../linux-6.6}"
 LOG_DIR="$PROJECT_DIR/tests/reports/perf"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
+# 结构化摘要报告文件（Markdown + CSV）
+SUMMARY_MD="$LOG_DIR/perf-summary-${TIMESTAMP}.md"
+SUMMARY_CSV="$LOG_DIR/perf-summary-${TIMESTAMP}.csv"
+
 QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
 QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-300}"
 QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-600}"
@@ -319,6 +323,56 @@ run_perf_in_qemu() {
 # ============================================================================
 # Step 5: 解析并对比结果
 # ============================================================================
+
+# 生成 Markdown + CSV 结构化摘要报告
+# 参数: $1 = 摘要数据行（每行 tab 分隔: metric unit on_raw off_raw on_med off_med delta_abs delta_pct threshold verdict）
+#       $2 = ON mode, $3 = OFF mode
+write_summary_files() {
+    local summary_data="$1"
+    local on_mode="$2"
+    local off_mode="$3"
+
+    # CSV
+    {
+        echo "metric,unit,on_raw,off_raw,on_median,off_median,delta_absolute,delta_percent,threshold,verdict"
+        while IFS=$'\t' read -r metric unit on_raw off_raw on_med off_med delta_abs delta_pct threshold verdict; do
+            [ -z "$metric" ] && continue
+            printf '"%s","%s","%s","%s",%s,%s,%s,%s,%s,%s\n' \
+                "$metric" "$unit" "$on_raw" "$off_raw" "$on_med" "$off_med" "$delta_abs" "$delta_pct" "$threshold" "$verdict"
+        done <<< "$summary_data"
+    } > "$SUMMARY_CSV"
+
+    # Markdown
+    {
+        echo "# Performance Test Summary"
+        echo ""
+        echo "- **Timestamp**: ${TIMESTAMP}"
+        echo "- **ON kernel mode**: ${on_mode:-unknown}"
+        echo "- **OFF kernel mode**: ${off_mode:-unknown}"
+        echo ""
+        echo "## Metrics"
+        echo ""
+        echo "| metric | unit | ON raw | OFF raw | ON median | OFF median | delta abs | delta % | threshold | verdict |"
+        echo "|--------|------|--------|---------|-----------|------------|-----------|---------|-----------|---------|"
+        while IFS=$'\t' read -r metric unit on_raw off_raw on_med off_med delta_abs delta_pct threshold verdict; do
+            [ -z "$metric" ] && continue
+            echo "| $metric | $unit | $on_raw | $off_raw | $on_med | $off_med | $delta_abs | $delta_pct | $threshold | $verdict |"
+        done <<< "$summary_data"
+        echo ""
+        echo "## Delta Calculation Direction"
+        echo ""
+        echo "- TCP throughput: (OFF - ON) / OFF * 100 (positive = throughput drop)"
+        echo "- UDP PPS: (OFF - ON) / OFF * 100 (positive = PPS drop)"
+        echo "- TCP latency: (ON - OFF) / OFF * 100 (positive = latency increase)"
+        echo "- CPU utilization: (ON - OFF) / OFF * 100 (positive = CPU increase)"
+        echo "- Socket objsize: ON - OFF (bytes)"
+    } > "$SUMMARY_MD"
+
+    echo "Summary reports:"
+    echo "  Markdown: $SUMMARY_MD"
+    echo "  CSV: $SUMMARY_CSV"
+}
+
 parse_results() {
     local file="$1"
     local prefix="$2"  # on or off
@@ -368,6 +422,14 @@ compare_and_report() {
 
     echo "ON  kernel mode: $on_mode"
     echo "OFF kernel mode: $off_mode"
+
+    # ON/OFF mode sanity check：确认 QEMU 输出中的 PERF: mode= 与预期一致
+    if [ "$on_mode" != "ON" ]; then
+        echo "${YELLOW}WARNING: ON kernel log reports mode='${on_mode}', expected 'ON'${NC}"
+    fi
+    if [ "$off_mode" != "OFF" ]; then
+        echo "${YELLOW}WARNING: OFF kernel log reports mode='${off_mode}', expected 'OFF'${NC}"
+    fi
     echo ""
     echo "+----------------------------------------------------------------+"
     echo "|  NET_DELAYACCT Performance Comparison (QEMU relative values)  |"
@@ -441,22 +503,33 @@ compare_and_report() {
     # 未产出数据，如内核 panic / guest init 失败），不应报 ALL PASSED（假绿），应 exit 2。
     local verdict_pass=0 verdict_fail=0 verdict_invalid=0 status
     local v_on v_off v_onm v_offm v_drop v_lat v_cpu v_mem v_entry v_m v_t
+    # 摘要报告数据行（tab 分隔: metric unit on_raw off_raw on_med off_med delta_abs delta_pct threshold verdict）
+    local SUMMARY_ROWS=""
 
     # Perf-1/2 吞吐与 PPS：degradation = (OFF-ON)/OFF*100，阈值 5% / 15%
     for v_entry in "tcp_throughput_mbps:5" "udp_pps:15"; do
         v_m="${v_entry%:*}"; v_t="${v_entry##*:}"
         v_on="${on_values[${v_m}_vals]:-}"; v_off="${off_values[${v_m}_vals]:-}"
+        local v_unit v_delta_abs
+        if [ "$v_m" = "tcp_throughput_mbps" ]; then
+            v_unit="Mbps"
+        else
+            v_unit="packets/sec"
+        fi
         if [ -n "$v_on" ] && [ -n "$v_off" ]; then
             v_onm=$(_median "$v_on"); v_offm=$(_median "$v_off")
             v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_offm}-${v_onm})/${v_offm}*100}")
+            v_delta_abs=$(awk "BEGIN {printf \"%.2f\", ${v_offm}-${v_onm}}")
             status=$(_verdict3 "$v_drop" "$v_t")
             case "$status" in
                 PASS)    echo "  ${GREEN}PASS${NC} $v_m: drop ${v_drop}% <= ${v_t}% threshold"; verdict_pass=$((verdict_pass+1));;
                 FAIL)    echo "  ${RED}FAIL${NC} $v_m: drop ${v_drop}% > ${v_t}% threshold"; verdict_fail=$((verdict_fail+1));;
                 INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: ON>OFF by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
             esac
+            SUMMARY_ROWS+="${v_m}	${v_unit}	${v_on}	${v_off}	${v_onm}	${v_offm}	${v_delta_abs}	${v_drop}%	${v_t}%	${status}"$'\n'
         else
             echo "  ${YELLOW}SKIP${NC} $v_m: no data"
+            SUMMARY_ROWS+="${v_m}	${v_unit}	-	-	-	-	-	-	${v_t}%	SKIP"$'\n'
         fi
     done
 
@@ -467,14 +540,18 @@ compare_and_report() {
     if [ -n "$v_on" ] && [ -n "$v_off" ]; then
         v_onm=$(_median "$v_on"); v_offm=$(_median "$v_off")
         v_lat=$(awk "BEGIN {printf \"%.1f\", (${v_onm}-${v_offm})/${v_offm}*100}")
+        local v_lat_abs
+        v_lat_abs=$(awk "BEGIN {printf \"%.2f\", ${v_onm}-${v_offm}}")
         status=$(_verdict3 "$v_lat" 10)
         case "$status" in
             PASS)    echo "  ${GREEN}PASS${NC} tcp_latency_us: +${v_lat}% <= 10% threshold"; verdict_pass=$((verdict_pass+1));;
             FAIL)    echo "  ${RED}FAIL${NC} tcp_latency_us: +${v_lat}% > 10% threshold"; verdict_fail=$((verdict_fail+1));;
             INVALID) echo "  ${YELLOW}INVALID${NC} tcp_latency_us: ON<OFF (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
         esac
+        SUMMARY_ROWS+="tcp_latency_us	us	${v_on}	${v_off}	${v_onm}	${v_offm}	${v_lat_abs}	${v_lat}%	10%	${status}"$'\n'
     else
         echo "  ${YELLOW}SKIP${NC} tcp_latency_us: no data"
+        SUMMARY_ROWS+="tcp_latency_us	us	-	-	-	-	-	-	10%	SKIP"$'\n'
     fi
 
     # Perf-5 CPU 利用率：degradation = (ON-OFF)/OFF*100 (相对 %)，阈值 10%
@@ -482,14 +559,18 @@ compare_and_report() {
     if [ -n "$v_on" ] && [ -n "$v_off" ]; then
         v_onm=$(_median "$v_on"); v_offm=$(_median "$v_off")
         v_cpu=$(awk "BEGIN {printf \"%.1f\", (${v_onm}-${v_offm})/${v_offm}*100}")
+        local v_cpu_abs
+        v_cpu_abs=$(awk "BEGIN {printf \"%.2f\", ${v_onm}-${v_offm}}")
         status=$(_verdict3 "$v_cpu" 10)
         case "$status" in
             PASS)    echo "  ${GREEN}PASS${NC} cpu_util_pct: +${v_cpu}% <= 10% threshold"; verdict_pass=$((verdict_pass+1));;
             FAIL)    echo "  ${RED}FAIL${NC} cpu_util_pct: +${v_cpu}% > 10% threshold"; verdict_fail=$((verdict_fail+1));;
             INVALID) echo "  ${YELLOW}INVALID${NC} cpu_util_pct: ON<OFF (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
         esac
+        SUMMARY_ROWS+="cpu_util_pct	%	${v_on}	${v_off}	${v_onm}	${v_offm}	${v_cpu_abs}	${v_cpu}%	10%	${status}"$'\n'
     else
         echo "  ${YELLOW}SKIP${NC} cpu_util_pct: no data"
+        SUMMARY_ROWS+="cpu_util_pct	%	-	-	-	-	-	-	10%	SKIP"$'\n'
     fi
 
     # Perf-4 每 socket 内存：degradation = ON-OFF (bytes)，阈值 192
@@ -506,8 +587,10 @@ compare_and_report() {
             FAIL)    echo "  ${RED}FAIL${NC} sock_objsize: +${v_mem} bytes > 192 threshold"; verdict_fail=$((verdict_fail+1));;
             INVALID) echo "  ${YELLOW}INVALID${NC} sock_objsize: ON<OFF (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
         esac
+        SUMMARY_ROWS+="sock_objsize_bytes	bytes	${on_sock}	${off_sock}	${on_sock}	${off_sock}	+${v_mem}	N/A	192	${status}"$'\n'
     else
         echo "  ${YELLOW}SKIP${NC} sock_objsize: no data"
+        SUMMARY_ROWS+="sock_objsize_bytes	bytes	${on_sock:-SKIP}	${off_sock:-SKIP}	-	-	-	N/A	192	SKIP"$'\n'
     fi
 
     # 总结论（优先级：FAIL > INVALID(视strict) > NO-DATA > PASS）
@@ -569,6 +652,9 @@ compare_and_report() {
     echo "Note: QEMU relative values only. For absolute data, run on physical hardware."
     echo "Note: Thresholds are initial values, subject to calibration with multiple runs."
     echo "Full logs: $LOG_DIR/perf-{ON,OFF}-${TIMESTAMP}.log"
+
+    # 生成结构化摘要报告（Markdown + CSV）
+    write_summary_files "$SUMMARY_ROWS" "$on_mode" "$off_mode"
 }
 
 # ============================================================================
