@@ -174,13 +174,13 @@ new file mode 100644
 + * @skb: the skb about to be handed to the driver
 + *
 + * Computes the delta from skb->delayacct_start to "now" and adds it
-+ * to the per-socket TX total.  Called from dev_hard_start_xmit.
++ * to the per-socket TX total.  Called from dev_queue_xmit.
 + *
-+ * Granularity note: when a GSO super-packet is segmented in
-+ * dev_hard_start_xmit, each segment calls tx_end once, so tx_count is
-+ * inflated by the number of segments.  The delayacct_start is
-+ * propagated to each segment via __copy_skb_header, so per-segment
-+ * latency values remain accurate.
++ * Granularity note: tx_end runs in dev_queue_xmit, before qdisc
++ * enqueue and GSO segmentation, so a GSO super-packet is accounted
++ * once and tx_count is no longer inflated by the number of GSO
++ * segments.  delayacct_start still propagates to each segment via
++ * __copy_skb_header, but is not consumed per-segment.
 + *
 + * Defined out-of-line in net/core/net-delayacct.c (see
 + * net_delayacct_rx_end for the reason).

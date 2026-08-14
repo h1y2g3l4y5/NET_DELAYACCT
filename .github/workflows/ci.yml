@@ -509,24 +509,25 @@ jobs:
           retention-days: 30
 
   perf-test:
-    name: Performance test (KVM, ON vs OFF)
+    name: Performance test (KVM, K0 vs K2)
     runs-on: ubuntu-22.04
     needs: [build-kernel]
     if: github.event_name == 'push'
-    # timeout-minutes=15: KVM 模式 ~580s（240×2 + 100s setup），余量 320s；
-    #   TCG 回退 ~820s（360×2 + 100s），余量 80s（v6.5.0 问题 10.3.1 修复）
-    timeout-minutes: 15
+    # timeout-minutes=20: KVM 模式 ~700s（300×2 + 100s setup），余量 500s；
+    #   测试时长从 5s 增至 10s + 预热 3s + 新增 idle/cycles/固定负载测试
+    #   TCG 回退 ~1000s（480×2 + 100s），余量 200s
+    timeout-minutes: 20
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
     # --strict=warn 下 FAIL → exit 0（告警），仅 NO-DATA/INVALID>50% → exit 2（job 失败）。
     # continue-on-error: exit 2 时 workflow 仍 success，CI 界面显示 ⚠️
     continue-on-error: true
     env:
-      # CI 专用 QEMU timeout（短于本地默认 300/600s），确保 job 在 15min 内完成
-      # KVM 240s: 内核 boot ~10s + perf 测试 ~200s，足够；缩短 timeout 反而能更快发现 QEMU hang
-      # TCG 360s: TCG 回退是异常情况（CI 应有 KVM），360s 仍超 KVM 但在 job timeout 内
-      QEMU_TIMEOUT_KVM: 240
-      QEMU_TIMEOUT_TCG: 360
+      # CI 专用 QEMU timeout：测试时长增加（10s+3s warmup）+ 新增 idle/cycles/固定负载测试
+      # KVM 300s: 内核 boot ~10s + perf 测试 ~280s（含 idle 15s + 6项测试×3轮×13s）
+      # TCG 480s: TCG 回退是异常情况，480s 覆盖慢速环境
+      QEMU_TIMEOUT_KVM: 300
+      QEMU_TIMEOUT_TCG: 480
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -561,15 +562,17 @@ jobs:
           echo "=== KVM availability ==="
           ls -la /dev/kvm 2>/dev/null && echo "  /dev/kvm: exists" || echo "  /dev/kvm: not found (will fallback to TCG)"
           echo ""
-          # --strict=warn（CI 默认）：FAIL/INVALID 均为告警（exit 0），不阻断；
+          # K0=OFF内核(基线), K2=ON内核(检测开启,无查询)
+          # --strict=warn: FAIL/INVALID 均为告警（exit 0），不阻断；
           #   仅 NO-DATA（全 SKIP）或 INVALID>50%（数据不可信）才 exit 2。
-          #   共享 runner 噪声大，单次 FAIL 可能是噪声非回归，FAIL 详情在 Step Summary 供趋势分析。
-          # --bzimage-on/off: 指定 CI artifact 路径（非默认 LINUX_SRC 树）
+          # --test-duration=10: CI 用较短时长（本地可设 60s 做完整验证）
+          # --warmup=3: iperf3 --omit 3 跳过 slow-start
           # exit code: 0=PASS/warn通过, 2=数据不可信(NO-DATA/INVALID>50%)
           #   continue-on-error 保证 exit 2 也不阻断 workflow
           ./perf-test.sh --skip-build --strict=warn \
             --bzimage-on=/tmp/artifacts/on/bzImage \
-            --bzimage-off=/tmp/artifacts/off/bzImage
+            --bzimage-off=/tmp/artifacts/off/bzImage \
+            --test-duration=10 --warmup=3
 
       - name: Upload perf report
         if: always()
@@ -580,8 +583,9 @@ jobs:
             tests/reports/perf/perf-test-*.log
             tests/reports/perf/perf-summary-*.md
             tests/reports/perf/perf-summary-*.csv
-            tests/reports/perf/perf-ON-*.log
-            tests/reports/perf/perf-OFF-*.log
+            tests/reports/perf/perf-K0-*.log
+            tests/reports/perf/perf-K2-*.log
+            tests/reports/perf/perf-K3-*.log
           retention-days: 30
 
       - name: Generate perf summary
@@ -595,7 +599,7 @@ jobs:
             PERF_LOG=$(ls -t tests/reports/perf/perf-test-*.log 2>/dev/null | head -1)
             if [ -n "$PERF_LOG" ]; then
               {
-                echo "## Performance Test Results (ON vs OFF)"
+                echo "## Performance Test Results (K0 vs K2)"
                 echo ""
                 echo "### Verdict Summary"
                 echo '```'

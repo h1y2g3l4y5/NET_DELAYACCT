@@ -165,8 +165,9 @@ GRO 在 `__netif_receive_skb_core()` 之前把属于同一流的多个小 skb
 
 ### GSO（发送侧拆分）
 
-GSO 在 `dev_hard_start_xmit()` 之前把应用层一次 `send()` 产生的大
-skb（如 64KB）拆成多个 MTU 大小的小 skb segment，再逐个发给网卡。
+GSO 在 `dev_queue_xmit()` 之后（qdisc 出队、驱动发送前）把应用层一次
+`send()` 产生的大 skb（如 64KB）拆成多个 MTU 大小的小 skb segment，
+再逐个发给网卡。
 
 对本项目的影响：
 
@@ -174,26 +175,29 @@ skb（如 64KB）拆成多个 MTU 大小的小 skb segment，再逐个发给网�
   块或 `udp_sendmsg()` / `udp_push_pending_frames()`）。
 - `skbuff_h-modification.patch` 把 `delayacct_start` 放在
   `struct sk_buff` 的 headers `struct_group` 内，因此 GSO 拆分时
-  `__copy_skb_header()` 会自动把该字段复制到每个子 segment。
-- `net_delayacct_tx_end(skb->sk, skb)` 在 `dev_hard_start_xmit()`
-  中对每个子 segment 各调用一次。
-- 结果：`tx_count` 按 segment 数量膨胀（一次应用层 send 可能对应 N
-  个 segment），但每个 segment 的真实发送时延是准确的。
+  `__copy_skb_header()` 仍会自动把该字段复制到每个子 segment。
+- `net_delayacct_tx_end(skb->sk, skb)` 打在 `dev_queue_xmit()` 中、
+  `__dev_queue_xmit()` 调用之前，即 qdisc 入队与 GSO 拆分之前，因此
+  大 GSO skb 作为整体只计一次。
+- 结果：`tx_count` 不再因 GSO 拆分而膨胀（一次应用层 send 对应一次
+  计数），统计语义更贴近"协议栈处理单元数"；代价是不再捕获每个子
+  segment 的驱动级时延。
 
-这里同样是一个 trade-off：项目选择了"segment 级精度 + 代码简单"，而
-非"应用层 send 计一次"的语义。详见 `tx-instrumentation.patch` 中的
-commit message。
+这里同样是一个 trade-off：项目选择在 qdisc 入队前插桩，换取"一次 send
+计一次"的 `tx_count` 语义与排除 qdisc 排队时延的更纯协议栈时延，而非
+segment 级精度。详见 `tx-instrumentation.patch` 中的 commit message。
 
 ### 总结
 
 | 机制 | 方向 | 操作 | 对 count 的影响 | 项目选择 |
 |------|------|------|----------------|----------|
 | GRO | 接收 | 多小包 → 一大包 | `rx_count` 减少 | 接受，换取插桩简洁 |
-| GSO | 发送 | 一大包 → 多小包 | `tx_count` 膨胀 | 接受，换取 segment 精度 |
+| GSO | 发送 | 一大包 → 多小包 | `tx_count` 不膨胀 | 插桩在 qdisc 前，整体计一次 |
 
 因此，本工具输出的 `rx_count` / `tx_count` 不应直接等同于网卡上的
-物理包数，而应理解为"协议栈处理单元数"。平均值（`total / count`）
-仍然有意义，但 count 本身的绝对值会受 GRO/GSO 影响。
+物理包数：`rx_count` 受 GRO 合并影响而偏少；`tx_count` 因插在 qdisc
+入队与 GSO 拆分之前，更贴近应用层 send 次数，不受 segment 数影响。
+平均值（`total / count`）仍然有意义。
 
 ## 附录 B：支持的数据流路径范围
 
@@ -241,7 +245,7 @@ TX start 点打在 TCP/UDP 的传输层出口处（而非系统调用入口）�
 | GRO | RX | ✅ | 合并后 head skb 打 start；count 减少 |
 | LRO（硬件 GRO）| RX | ✅ | 最终同样走 `__netif_receive_skb_core` |
 | RPS | RX | ✅ | CPU 分发不改变入口，自动覆盖 |
-| GSO | TX | ✅ | headers group 自动复制 start；count 膨胀 |
+| GSO | TX | ✅ | headers group 自动复制 start；插桩在 qdisc 前，count 不膨胀 |
 | TSO（硬件 GSO）| TX | ✅ | 路径同 GSO，自动覆盖 |
 | UFO | TX | ✅ | UDP 分片类似 GSO |
 | XDP | RX | ❌ | 驱动层处理，不进入协议栈 |
@@ -292,7 +296,7 @@ TX start 点打在 TCP/UDP 的传输层出口处（而非系统调用入口）�
 
 | # | 文件 | 函数 | 位置说明 |
 |---|------|------|---------|
-| 7 | [net/core/dev.c](file:///home/lai/Code/linux-6.6/net/core/dev.c) | `dev_hard_start_xmit()` | 循环体内，`skb_mark_not_on_list(skb)` 之后、`xmit_one()` 调用之前。所有发送包（含 GSO 拆分后的子 segment）在此处累计时延。 |
+| 7 | [net/core/dev.c](file:///home/lai/Code/linux-6.6/net/core/dev.c) | `dev_queue_xmit()` | `return __dev_queue_xmit(skb, dev, reason)` 之前，即 qdisc 入队与 GSO 拆分之前。所有发送包（含 GSO 大包）作为整体在此处累计一次时延，不受 GSO 拆分影响。 |
 
 > 注：TX start 不再在 `tcp_sendmsg_locked()` 入口处打戳（v3.0.0 BUG-7 修复
 > 后移除），统一改在 clone/pskb_copy/corked 出口处打，确保 TX 时延语义为

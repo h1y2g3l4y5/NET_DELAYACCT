@@ -4,8 +4,8 @@ Date: Mon, 27 Jul 2026 20:35:31 +0800
 Subject: [PATCH 2/2] net-delayacct: add TX path instrumentation
 
 Stamp skb->delayacct_start on outgoing sk_buffs and accumulate
-per-socket TX latency in dev_hard_start_xmit() before the driver
-xmit callback.
+per-socket TX latency in dev_queue_xmit() before qdisc enqueue and
+GSO segmentation.
 
 TX timestamp is set in:
 - __tcp_transmit_skb() clone block: covers all clone_it=1 paths
@@ -24,10 +24,12 @@ which zero-initializes delayacct_start; tx_end guards against
 start==0 so they are not counted.
 
 Known limitations (design trade-offs, see v3.0.0 review ISSUE-8):
-- GSO: a large GSO skb is segmented in dev_hard_start_xmit, each
-  segment calls tx_end once, so tx_count is inflated by N. The
-  delayacct_start is propagated via __copy_skb_header, so per-segment
-  latency values remain accurate.
+- GSO: a large GSO skb is segmented after the dev_queue_xmit call
+  point (in the qdisc/driver path). Because tx_end now runs in
+  dev_queue_xmit before segmentation, the super-packet is counted once
+  and tx_count is not inflated by N; per-segment driver-level latency
+  is not captured. The delayacct_start still propagates via
+  __copy_skb_header, but is not consumed per-segment.
 
 Includes fixes for:
 - BUG-1: IPv6 UDP TX instrumentation
@@ -53,14 +55,14 @@ diff --git a/net/core/dev.c b/net/core/dev.c
 index 0d8072c13..a5d0f9cd9 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
-@@ -3590,6 +3590,7 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *de
- 		struct sk_buff *next = skb->next;
+@@ -4282,6 +4282,7 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
+ 	int rc = -ENOMEM;
+ 	bool again = false;
 
- 		skb_mark_not_on_list(skb);
-+		net_delayacct_tx_end(skb->sk, skb);
- 		rc = xmit_one(skb, dev, txq, next != NULL);
- 		if (unlikely(!dev_xmit_complete(rc))) {
- 			skb->next = next;
++	net_delayacct_tx_end(skb->sk, skb);
+ 	skb_reset_mac_header(skb);
+ 	skb_assert_len(skb);
+
 diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
 index 5631041ae..b3d670ad9 100644
 --- a/net/ipv4/tcp_output.c

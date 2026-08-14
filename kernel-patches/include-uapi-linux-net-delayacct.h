@@ -22,7 +22,7 @@
  *
  * TX latency is measured from the time a process calls send/sendmsg
  * (entering tcp_sendmsg / udp_sendmsg) until the packet reaches the
- * network device driver (via dev_hard_start_xmit).
+ * network device driver (via dev_queue_xmit).
  *
  * Average latency for a socket is computed as total_ns / count.
  * min/max enable tail-latency analysis without storing individual samples.
