@@ -513,10 +513,10 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [build-kernel]
     if: github.event_name == 'push'
-    # timeout-minutes=20: KVM 模式 ~700s（300×2 + 100s setup），余量 500s；
-    #   测试时长从 5s 增至 10s + 预热 3s + 新增 idle/cycles/固定负载测试
-    #   TCG 回退 ~1000s（480×2 + 100s），余量 200s
-    timeout-minutes: 20
+    # timeout-minutes=30: KVM 模式 ~800s（360×2 + 80s setup），余量 1000s；
+    #   测试时长 10s + 预热 3s + 新增 idle/cycles/固定负载测试
+    #   TCG 回退 ~1400s（700×2 + 80s setup），余量 400s
+    timeout-minutes: 30
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
     # --strict=warn 下 FAIL → exit 0（告警），仅 NO-DATA/INVALID>50% → exit 2（job 失败）。
@@ -526,8 +526,8 @@ jobs:
       # CI 专用 QEMU timeout：测试时长增加（10s+3s warmup）+ 新增 idle/cycles/固定负载测试
       # KVM 300s: 内核 boot ~10s + perf 测试 ~280s（含 idle 15s + 6项测试×3轮×13s）
       # TCG 480s: TCG 回退是异常情况，480s 覆盖慢速环境
-      QEMU_TIMEOUT_KVM: 300
-      QEMU_TIMEOUT_TCG: 480
+      QEMU_TIMEOUT_KVM: 360
+      QEMU_TIMEOUT_TCG: 700
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
