@@ -513,21 +513,23 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [build-kernel]
     if: github.event_name == 'push'
-    # timeout-minutes=30: KVM 模式 ~800s（360×2 + 80s setup），余量 1000s；
-    #   测试时长 10s + 预热 3s + 新增 idle/cycles/固定负载测试
-    #   TCG 回退 ~1400s（700×2 + 80s setup），余量 400s
-    timeout-minutes: 30
+    # timeout-minutes=40: GH Actions 共享 runner 常无 KVM，回退 TCG（单线程模拟慢）。
+    #   -smp 2 + 加重测试矩阵（100 采样/10s/+idle）下，单次 QEMU ~620s，两次(K0+K2)+setup ~1320s
+    #   TCG 900s × 2 + 80s setup = 1880s < 2400s(40min)，余量 ~520s
+    #   KVM 可用时单次 ~280s，两次 ~640s，远低于上限
+    timeout-minutes: 40
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
     # --strict=warn 下 FAIL → exit 0（告警），仅 NO-DATA/INVALID>50% → exit 2（job 失败）。
     # continue-on-error: exit 2 时 workflow 仍 success，CI 界面显示 ⚠️
     continue-on-error: true
     env:
-      # CI 专用 QEMU timeout：测试时长增加（10s+3s warmup）+ 新增 idle/cycles/固定负载测试
-      # KVM 300s: 内核 boot ~10s + perf 测试 ~280s（含 idle 15s + 6项测试×3轮×13s）
-      # TCG 480s: TCG 回退是异常情况，480s 覆盖慢速环境
+      # CI 专用 QEMU timeout：
+      # KVM 360s: 内核 boot ~10s + perf 测试 ~280s（含 idle 15s + 6项测试×3轮×13s）
+      # TCG 900s: TCG 回退（无 KVM 时），-smp 2 下 boot ~120s + 测试 ~420s + 余量；
+      #   原 700s 在 -smp 1 下 rc=124 超时（K0/K2 全 SKIP），改 -smp 2 + 900s 修复
       QEMU_TIMEOUT_KVM: 360
-      QEMU_TIMEOUT_TCG: 700
+      QEMU_TIMEOUT_TCG: 900
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -611,4 +613,31 @@ jobs:
             else
               echo "## Performance Test: no log found" >> "$GITHUB_STEP_SUMMARY"
             fi
+          fi
+
+          # 诊断段：把每个模式的 PERF 行数 + QEMU rc 写进 Summary，
+          # 全 SKIP / NO-DATA 时无需翻原始日志即可定位（rc=124=TCG 超时 / 0 行=guest 未启动）
+          PERF_LOG=$(ls -t tests/reports/perf/perf-test-*.log 2>/dev/null | head -1)
+          if [ -n "$PERF_LOG" ] && [ -f "$PERF_LOG" ]; then
+            {
+              echo ""
+              echo "### QEMU Run Diagnostics"
+              echo ""
+              echo "| Mode | PERF lines | QEMU rc | Note |"
+              echo "|------|-----------|---------|------|"
+              for mode in K0 K2 K3; do
+                # K3 在 CI 默认未运行，ls 无匹配会退出非零；加 || true 避免 set -e 中断 summary
+                mode_log=$(ls -t tests/reports/perf/perf-${mode}-*.log 2>/dev/null | head -1 || true)
+                [ -z "$mode_log" ] && { echo "| ${mode} | - | - | 未运行 |"; continue; }
+                n=$(grep -c "^PERF:" "$mode_log" 2>/dev/null || true)
+                [ -z "$n" ] && n=0
+                rc=$(grep -oE "QEMU exited \(rc=[0-9]+\)" "$mode_log" 2>/dev/null | head -1 | grep -oE "[0-9]+" || echo "?")
+                note=""
+                [ "$rc" = "124" ] && note="TCG/KVM 超时"
+                [ "$n" = "0" ] && note="${note:+$note; }guest 未产出 PERF 行（启动/panic/超时）"
+                echo "| ${mode} | ${n} | ${rc} | ${note:--} |"
+              done
+              echo ""
+              echo "> K3 显示 \"-\" 是正常的：CI 默认只跑 K0 vs K2（未加 --with-k3）"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi

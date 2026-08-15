@@ -37,8 +37,11 @@ SUMMARY_MD="$LOG_DIR/perf-summary-${TIMESTAMP}.md"
 SUMMARY_CSV="$LOG_DIR/perf-summary-${TIMESTAMP}.csv"
 
 QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
-QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-300}"
-QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-600}"
+# KVM 360s: 内核 boot ~10s + perf 测试 ~280s
+# TCG 900s: TCG 单线程模拟慢，-smp 2 + 加重测试矩阵（100 采样/10s/+idle）需更大余量；
+#   原 600/700s 在 GH Actions 共享 runner（无 KVM）下 rc=124 超时（K0/K2 全 SKIP）
+QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-360}"
+QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-900}"
 
 # --strict 模式控制 FAIL/INVALID 的判定行为（参数解析可覆盖）：
 #   warn（默认）：FAIL/INVALID 均为告警（exit 0），不阻断。共享 runner 噪声大，
@@ -349,7 +352,10 @@ run_perf_in_qemu() {
 
     local qemu_common_args=(
         -m "$QEMU_MEMORY"
-        -smp 1
+        # -smp 2: 与功能测试 (qemu-test) 一致。TCG 下 -smp 1 单线程模拟极慢
+        # （GH Actions 无 KVM 时 rc=124 超时，K0/K2 全 SKIP），-smp 2 多 vCPU 线程
+        # 显著加速 boot 与测试。CPU 利用率指标用 /proc/stat 聚合行，K0/K2 相对对比不受影响。
+        -smp 2
         -kernel "$kernel_img"
         -initrd "$PERF_INITRD"
         -append "$append_str"
@@ -372,7 +378,10 @@ run_perf_in_qemu() {
     set -e
 
     # KVM 失败则回退 TCG
-    if [ "$qemu_rc" -ne 0 ] && grep -Eq '(/dev/kvm|failed to initialize kvm|Permission denied)' "$qemu_out" 2>/dev/null; then
+    # 模式与功能测试 (ci.yml qemu-test) 对齐：覆盖不同 QEMU 版本的报错措辞
+    #   "Could not access KVM" (模块不可访问) / "failed to initialize kvm" (初始化失败)
+    #   / "/dev/kvm" / "Permission denied"
+    if [ "$qemu_rc" -ne 0 ] && grep -Eq '(Could not access KVM|failed to initialize kvm|/dev/kvm|Permission denied)' "$qemu_out" 2>/dev/null; then
         echo "KVM unavailable, falling back to TCG (timeout=${QEMU_TIMEOUT_TCG}s)..."
         set +e
         timeout "$QEMU_TIMEOUT_TCG" qemu-system-x86_64 \
@@ -391,6 +400,20 @@ run_perf_in_qemu() {
     local result_file="$LOG_DIR/perf-${mode_label}-${TIMESTAMP}.log"
     tr -d '\r' < "$qemu_out" > "$result_file"
     echo "Results saved: $result_file"
+
+    # 诊断输出：PERF 行计数 +（无数据或超时时）QEMU 末尾日志
+    # 目的：CI 失败时无需下载 artifact 即可在 job 日志里定位根因
+    # （rc=124=timeout / guest panic / init 失败 / run-perf-tests 异常）
+    local perf_n
+    # grep -c 无匹配时打印 "0" 并退出 1：用 || true 屏蔽退出码，避免 || echo 0 产生 "0\n0"
+    perf_n=$(grep -c "^PERF:" "$result_file" 2>/dev/null || true)
+    [ -z "$perf_n" ] && perf_n=0
+    echo "PERF lines found: $perf_n"
+    if [ "$perf_n" -eq 0 ] || [ "$qemu_rc" -ne 0 ]; then
+        echo "${YELLOW}--- QEMU output tail (last 30 lines) for diagnosis ---${NC}"
+        tail -30 "$result_file" 2>/dev/null | sed 's/^/    /'
+        echo "${YELLOW}--- end tail ---${NC}"
+    fi
 
     # 输出 PERF: 行
     grep "^PERF:" "$result_file" || echo "${YELLOW}No PERF: lines found in output${NC}"
