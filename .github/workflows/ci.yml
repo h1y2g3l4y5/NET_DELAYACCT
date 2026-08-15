@@ -510,13 +510,14 @@ jobs:
 
   perf-test:
     name: Performance test (KVM, K0 vs K2 vs K3)
-    runs-on: ubuntu-22.04
+    # self-hosted runner（本地 VM，有 KVM 加速）
+    # 注册 runner 时需加 linux + kvm 标签：./config.sh --labels linux,kvm
+    # 前置条件：VM 需安装 qemu-system-x86, iperf3, busybox-static, ncat, cpio, iproute2, libmnl0
+    runs-on: [self-hosted, linux, kvm]
     needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    # timeout-minutes=60: GH Actions 共享 runner 常无 KVM，回退 TCG（单线程模拟慢）。
-    #   --with-k3 启用后 3 次 QEMU (K0+K2+K3)，每次 TCG 900s 上限：
-    #   3 × 900s + 80s setup = 2780s < 3600s(60min)，余量 ~820s
-    #   KVM 可用时单次 ~280s，三次 ~920s，远低于上限
+    # timeout-minutes=60: self-hosted KVM 下单次 QEMU ~280s，三次 ~920s + setup < 20min
+    #   保留 60min 上限兼容 TCG 回退（KVM 不可用时 3 × 900s + setup ~2780s）
     timeout-minutes: 60
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
