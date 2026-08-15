@@ -202,6 +202,14 @@ perf_3_tcp_latency() {
     local latencies=""
     local i start_us end_us latency_us
     local NUM_SAMPLES=100
+
+    # 预热连接：丢弃前 3 个连接。冷启动（nc 首次 accept / socket slab 分配 /
+    # 首次连接 SYN 重传）会产生 ~1s 离群点，直接污染 p999/max（n=100 时 p999==max）。
+    local warm_i
+    for warm_i in $(seq 1 3); do
+        (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null
+    done
+
     for i in $(seq 1 "$NUM_SAMPLES"); do
         start_us=${EPOCHREALTIME:-}
         [ -z "$start_us" ] && break
@@ -335,7 +343,7 @@ perf_6_idle_cpu() {
         return
     fi
     # Idle CPU = idle 占比（无流量时应该接近 100%）
-    cpu_pct=$((100 - (idle_diff * 100 / total_diff)))
+    cpu_pct=$((idle_diff * 100 / total_diff))
     echo "PERF: idle_cpu_pct_run${run}=$cpu_pct"
 }
 

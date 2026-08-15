@@ -445,13 +445,11 @@ parse_results() {
 # delta 方向（正值语义）：
 #   throughput/PPS: (K0 - Kx) / K0 * 100（正值=吞吐下降，Kx 更差）
 #   latency/CPU/cycles: (Kx - K0) / K0 * 100（正值=延迟/CPU 增加，Kx 更差）
-#   idle_cpu: (Kx - K0) / K0 * 100（正值=idle 增加=好事，见下方说明）
+#   idle_cpu: (Kx - K0)（百分点差，正值=idle增加=好事）
 #   sock_objsize: 用 calc_delta_abs（字节差），不调本函数
 #
-# 注意：idle_cpu 的 delta 方向说明（正值=好事）按需求文档定义。
-# guest 输出 idle_cpu_pct 实为"空闲期间 CPU 利用率"（值越小越好），但需求文档
-# 指定 delta 方向为 (Kx - K0) / K0 * 100 且"正值=idle增加=好事"，故本函数按
-# 文档语义实现。verdict 使用绝对值判定，方向不影响 pass/fail。
+# 注意：idle_cpu_pct 为真实 idle 占比（≈100% 为完全空闲），高基线下相对 % 无意义，
+# 故改用百分点差 (Kx - K0)，输出 "+N.Npp" 格式。正值=idle 增加=好事。
 calc_delta_pct() {
     local metric="$1" base="$2" comp="$3"
     case "$metric" in
@@ -460,8 +458,8 @@ calc_delta_pct() {
             awk "BEGIN {if(${base}+0>0) printf \"%+.1f%%\", (${base}-${comp})/${base}*100; else print \"N/A\"}"
             ;;
         idle_cpu_pct)
-            # idle_cpu：(Kx - K0) / K0 * 100（正值=idle增加=好事，按需求文档）
-            awk "BEGIN {if(${base}+0>0) printf \"%+.1f%%\", (${comp}-${base})/${base}*100; else print \"N/A\"}"
+            # 百分点差（pp）：idle 是接近 100% 的高基线，相对 % 无意义（1%→6% 会显示 +500%）
+            awk "BEGIN {printf \"%+.1fpp\", ${comp}-${base}}"
             ;;
         *)
             # 默认（latency/CPU/cycles/fixed_load）：(Kx - K0) / K0 * 100（正值=增加=更差）
@@ -527,7 +525,7 @@ write_summary_files() {
         echo "- UDP PPS: (K0 - Kx) / K0 * 100（正值 = PPS 下降，Kx 更差）"
         echo "- TCP 延迟: (Kx - K0) / K0 * 100（正值 = 延迟增加，Kx 更差）"
         echo "- CPU 利用率: (Kx - K0) / K0 * 100（正值 = CPU 增加，Kx 更差）"
-        echo "- Idle CPU: (Kx - K0) / K0 * 100（正值 = idle 增加 = 好事，K2/K3 不增加空闲开销）"
+        echo "- Idle CPU: (Kx - K0)（百分点差，正值 = idle 增加 = 好事）"
         echo "- cycles/packet: (Kx - K0) / K0 * 100（正值 = cycles 增加，Kx 更差）"
         echo "- Socket 对象大小: Kx - K0（字节，正值 = 内存增加）"
         echo ""
@@ -560,6 +558,9 @@ compare_and_report() {
     # 解析所有模式到 values 数组
     # 键格式: "${mode}|${metric}_vals"，值为空格分隔的多次运行结果
     declare -A values
+    # 摘要表存储：按 metric 存各列，verdict 段回填 threshold/verdict 后统一生成摘要行
+    declare -A SUM_UNIT SUM_RAW0 SUM_RAW2 SUM_RAW3 SUM_MED0 SUM_MED2 SUM_MED3
+    declare -A SUM_D02 SUM_D03 SUM_D23 VERDICTS THRESHOLDS
 
     local mode metric val
     while IFS='|=' read -r mode metric val; do
@@ -745,8 +746,17 @@ compare_and_report() {
             "$m_metric" "$k0_disp" "$k2_disp" "$k3_disp" \
             "${d_k0k2:- -}" "${d_k0k3:- -}" "${d_k2k3:- -}" "-" "info"
 
-        # 摘要行：threshold 和 verdict 在 verdict 段填充，这里先留空
-        SUMMARY_ROWS+="${m_metric}	${m_unit}	${k0_raw}	${k2_raw}	${k3_raw}	${k0_disp}	${k2_disp}	${k3_disp}	${d_k0k2}	${d_k0k3}	${d_k2k3}	-	-"$'\n'
+        # 存入摘要数组：threshold/verdict 在 verdict 段回填，最后统一生成摘要行
+        SUM_UNIT[$m_metric]="$m_unit"
+        SUM_RAW0[$m_metric]="$k0_raw"
+        SUM_RAW2[$m_metric]="$k2_raw"
+        SUM_RAW3[$m_metric]="$k3_raw"
+        SUM_MED0[$m_metric]="$k0_disp"
+        SUM_MED2[$m_metric]="$k2_disp"
+        SUM_MED3[$m_metric]="$k3_disp"
+        SUM_D02[$m_metric]="$d_k0k2"
+        SUM_D03[$m_metric]="$d_k0k3"
+        SUM_D23[$m_metric]="$d_k2k3"
     done
 
     echo "+----------------------------------------------------------------------------------------+"
@@ -773,6 +783,7 @@ compare_and_report() {
     # Perf-1/2 吞吐与 PPS：degradation = (K0-K2)/K0*100，阈值 5% / 15%
     for v_entry in "tcp_throughput_mbps:5:drop:Mbps" "udp_pps:15:drop:pps"; do
         IFS=':' read -r v_m v_t v_dir v_unit <<< "$v_entry"
+        THRESHOLDS[$v_m]="${v_t}%"
         v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
         if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
             v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
@@ -785,9 +796,11 @@ compare_and_report() {
                 INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2>K0 by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
             esac
         else
+            status="SKIP"
             echo "  ${YELLOW}SKIP${NC} $v_m: no data"
             verdict_skip=$((verdict_skip+1))
         fi
+        VERDICTS[$v_m]="$status"
     done
 
     # Perf-3 TCP 延迟：阈值 10%
@@ -796,6 +809,7 @@ compare_and_report() {
         # P50 和 P99: degradation = (K2-K0)/K0*100，阈值 10%
         for v_entry in "tcp_latency_p50:10" "tcp_latency_p99:10"; do
             IFS=':' read -r v_m v_t <<< "$v_entry"
+            THRESHOLDS[$v_m]="${v_t}%"
             v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
             if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
                 v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
@@ -808,13 +822,16 @@ compare_and_report() {
                     INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
                 esac
             else
+                status="SKIP"
                 echo "  ${YELLOW}SKIP${NC} $v_m: no data"
                 verdict_skip=$((verdict_skip+1))
             fi
+            VERDICTS[$v_m]="$status"
         done
     else
         # 旧格式：tcp_latency_us（向后兼容）
         v_m="tcp_latency_us"; v_t=10
+        THRESHOLDS[$v_m]="${v_t}%"
         v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
         if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
             v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
@@ -827,13 +844,16 @@ compare_and_report() {
                 INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
             esac
         else
+            status="SKIP"
             echo "  ${YELLOW}SKIP${NC} $v_m: no data"
             verdict_skip=$((verdict_skip+1))
         fi
+        VERDICTS[$v_m]="$status"
     fi
 
     # Perf-5 CPU 利用率：degradation = (K2-K0)/K0*100 (相对 %)，阈值 10%
     v_m="cpu_util_pct"; v_t=10
+    THRESHOLDS[$v_m]="${v_t}%"
     v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
     if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
         v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
@@ -846,36 +866,39 @@ compare_and_report() {
             INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
         esac
     else
+        status="SKIP"
         echo "  ${YELLOW}SKIP${NC} $v_m: no data"
         verdict_skip=$((verdict_skip+1))
     fi
+    VERDICTS[$v_m]="$status"
 
-    # Perf-6 Idle CPU：K2 vs K0 差异 < 2%（几乎零开销）
-    # 使用绝对值判定（|delta| < 2% = PASS），不设 INVALID
-    # 理由：idle_cpu 语义在 guest 实现中可能存在歧义（变量名 vs 公式），
-    # 绝对值判定方向无关，更稳健。degradation 仍按 (K2-K0)/K0*100 计算。
+    # Perf-6 Idle CPU：K2 vs K0 差异 < 2pp（几乎零开销）
+    # idle_cpu_pct 为真实 idle 占比（≈100% 为完全空闲），高基线下相对 % 无意义，
+    # 改用百分点差判定（|Δpp| <= 2 = PASS）。方向无关，不设 INVALID。
     v_m="idle_cpu_pct"; v_t=2
+    THRESHOLDS[$v_m]="${v_t}pp"
     v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
     if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
         v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
-        # delta = (K2 - K0) / K0 * 100（按需求文档方向：正值=idle增加=好事）
-        v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_k2m}-${v_k0m})/${v_k0m}*100}")
-        # 绝对值用于 verdict
+        # delta = K2 - K0（百分点差，正值=idle 增加=好事）
+        v_drop=$(awk "BEGIN {printf \"%.1f\", ${v_k2m}-${v_k0m}}")
         local v_abs_drop
         v_abs_drop=$(awk -v d="$v_drop" 'BEGIN {printf "%.1f", (d<0?-d:d)}')
         if awk "BEGIN {exit !(${v_abs_drop} > ${v_t})}"; then
             status="FAIL"
-            echo "  ${RED}FAIL${NC} $v_m: |${v_drop}%| > ${v_t}% threshold (idle overhead too high)"
+            echo "  ${RED}FAIL${NC} $v_m: |${v_drop}pp| > ${v_t}pp threshold (idle overhead too high)"
             verdict_fail=$((verdict_fail+1))
         else
             status="PASS"
-            echo "  ${GREEN}PASS${NC} $v_m: |${v_drop}%| <= ${v_t}% threshold (almost zero idle overhead)"
+            echo "  ${GREEN}PASS${NC} $v_m: |${v_drop}pp| <= ${v_t}pp threshold (almost zero idle overhead)"
             verdict_pass=$((verdict_pass+1))
         fi
     else
+        status="SKIP"
         echo "  ${YELLOW}SKIP${NC} $v_m: no data"
         verdict_skip=$((verdict_skip+1))
     fi
+    VERDICTS[$v_m]="$status"
 
     # Perf-4 每 socket 内存：degradation = K2-K0 (bytes)，阈值 192
     # 阈值 192 = 72(struct net_delayacct) + 56(SLAB_HWCACHE_ALIGN 64B 对齐填充) + 64(余量)
@@ -883,6 +906,7 @@ compare_and_report() {
     # TCP slab 用 SLAB_HWCACHE_ALIGN（tcp.c kmem_cache_create），ON struct 增加 72B 后
     # 跨 64B 边界 → 对齐填充 56B → slab delta 128B。原始 struct 开销仅 72B（<= 80 理论阈值）。
     v_m="sock_objsize_bytes"; v_t=192
+    THRESHOLDS[$v_m]="${v_t}B"
     local k0_sock k2_sock k3_sock
     # tr -d '\r': QEMU 串口输出为 \r\n，提取的值末尾带 \r 会导致
     # grep -qE '^[0-9]+$' 失败，内存 delta 误显示为 "-"
@@ -901,9 +925,11 @@ compare_and_report() {
             INVALID) echo "  ${YELLOW}INVALID${NC} sock_objsize: K2<K0 (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
         esac
     else
+        status="SKIP"
         echo "  ${YELLOW}SKIP${NC} sock_objsize: no data"
         verdict_skip=$((verdict_skip+1))
     fi
+    VERDICTS[$v_m]="$status"
 
     # ---- 信息性指标（K0→K3 / K2→K3，不影响 verdict）----
     if [ -n "$k3_file" ]; then
@@ -984,6 +1010,12 @@ compare_and_report() {
     echo "Full logs: $LOG_DIR/perf-{K0,K2,K3}-${TIMESTAMP}.log"
 
     # 生成结构化摘要报告（Markdown + CSV）
+    # 回填 threshold/verdict：按 table_metrics 顺序从存储数组重组摘要行
+    SUMMARY_ROWS=""
+    for entry in "${table_metrics[@]}"; do
+        m_metric="${entry%%:*}"
+        SUMMARY_ROWS+="${m_metric}	${SUM_UNIT[$m_metric]}	${SUM_RAW0[$m_metric]}	${SUM_RAW2[$m_metric]}	${SUM_RAW3[$m_metric]}	${SUM_MED0[$m_metric]}	${SUM_MED2[$m_metric]}	${SUM_MED3[$m_metric]}	${SUM_D02[$m_metric]}	${SUM_D03[$m_metric]}	${SUM_D23[$m_metric]}	${THRESHOLDS[$m_metric]:--}	${VERDICTS[$m_metric]:-info}"$'\n'
+    done
     write_summary_files "$SUMMARY_ROWS" "$k0_mode" "$k2_mode" "${k3_mode:--}"
 }
 
