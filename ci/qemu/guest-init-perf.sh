@@ -28,8 +28,26 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo "=== QEMU perf guest boot: $(date -u) ==="
 
+# Watchdog: force poweroff after 600s
+# 提高上限以容纳更长的测试矩阵：K3 主动查询 + cycles/packet + 固定负载延迟测试
+# 原 540s 在新增测试项后余量不足，600s 给 perf test timeout (540s) 留 60s 收尾时间
+( sleep 600; echo "WATCHDOG: forcing poweroff after 600s timeout"; poweroff -f ) &
+WATCHDOG_PID=$!
+
+# --- Mount essential filesystems ---
+# 注意：mountpoint 不是 busybox applet，直接 mount（已挂载时返回 EBUSY，用 || true 忽略）
+# 注意：前三个 mount 不能用 2>/dev/null 重定向，因为此时 /dev 尚未挂载，/dev/null 不存在
+mount -t proc  proc  /proc  -o nosuid,noexec,nodev || true
+mount -t sysfs sysfs /sys   -o nosuid,noexec,nodev || true
+mount -t devtmpfs dev /dev -o mode=0755,nosuid || true
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts -o mode=0620,gid=5 2>/dev/null || true
+mount -t tmpfs  tmpfs  /dev/shm 2>/dev/null || true
+
 # ----------------------------------------------------------------------------
 # 从 /proc/cmdline 解析 host 传入的参数，导出为环境变量供 run-perf-tests.sh 使用
+# 注意：必须在 mount /proc 之后执行！否则 /proc/cmdline 不存在，awk 读取失败
+#       在 set -e 下会导致 init 退出 → 内核 panic（exitcode=0x100）
 # ----------------------------------------------------------------------------
 # 默认值与 run-perf-tests.sh 保持一致；仅在 cmdline 显式给出时覆盖
 export QUERY_MODE="${QUERY_MODE:-K2}"
@@ -53,17 +71,18 @@ _cmdline_arg() {
     ' /proc/cmdline 2>/dev/null
 }
 
-_val=$(_cmdline_arg query_mode)
+# || true 防止 awk 读取失败时 set -e 终止 init（双重保险）
+_val=$(_cmdline_arg query_mode) || true
 [ -n "$_val" ] && export QUERY_MODE="$_val"
-_val=$(_cmdline_arg test_duration)
+_val=$(_cmdline_arg test_duration) || true
 [ -n "$_val" ] && export TEST_DURATION="$_val"
-_val=$(_cmdline_arg warmup_duration)
+_val=$(_cmdline_arg warmup_duration) || true
 [ -n "$_val" ] && export WARMUP_DURATION="$_val"
-_val=$(_cmdline_arg enable_cycles)
+_val=$(_cmdline_arg enable_cycles) || true
 [ -n "$_val" ] && export ENABLE_CYCLES="$_val"
 # fixed_load_rates 在 cmdline 中用逗号分隔（避免空格破坏 cmdline tokenization），
 # 转换为空格分隔以匹配 run-perf-tests.sh 的预期格式
-_val=$(_cmdline_arg fixed_load_rates)
+_val=$(_cmdline_arg fixed_load_rates) || true
 if [ -n "$_val" ]; then
     # tr 替换逗号为空格；awk squeeze 重复空格并 trim 两端
     export FIXED_LOAD_RATES="$(echo "$_val" | tr ',' ' ' | awk '{$1=$1};1')"
@@ -71,22 +90,6 @@ fi
 unset _val _cmdline_arg
 
 echo "[guest-init] perf params: QUERY_MODE=$QUERY_MODE TEST_DURATION=$TEST_DURATION WARMUP_DURATION=$WARMUP_DURATION ENABLE_CYCLES=$ENABLE_CYCLES FIXED_LOAD_RATES='$FIXED_LOAD_RATES'"
-
-# Watchdog: force poweroff after 600s
-# 提高上限以容纳更长的测试矩阵：K3 主动查询 + cycles/packet + 固定负载延迟测试
-# 原 540s 在新增测试项后余量不足，600s 给 perf test timeout (540s) 留 60s 收尾时间
-( sleep 600; echo "WATCHDOG: forcing poweroff after 600s timeout"; poweroff -f ) &
-WATCHDOG_PID=$!
-
-# --- Mount essential filesystems ---
-# 注意：mountpoint 不是 busybox applet，直接 mount（已挂载时返回 EBUSY，用 || true 忽略）
-# 注意：前三个 mount 不能用 2>/dev/null 重定向，因为此时 /dev 尚未挂载，/dev/null 不存在
-mount -t proc  proc  /proc  -o nosuid,noexec,nodev || true
-mount -t sysfs sysfs /sys   -o nosuid,noexec,nodev || true
-mount -t devtmpfs dev /dev -o mode=0755,nosuid || true
-mkdir -p /dev/pts /dev/shm
-mount -t devpts devpts /dev/pts -o mode=0620,gid=5 2>/dev/null || true
-mount -t tmpfs  tmpfs  /dev/shm 2>/dev/null || true
 
 # --- Bring up loopback ---
 ip link set lo up 2>/dev/null || true
