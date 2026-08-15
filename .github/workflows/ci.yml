@@ -509,25 +509,24 @@ jobs:
           retention-days: 30
 
   perf-test:
-    name: Performance test (KVM, K0 vs K2)
+    name: Performance test (KVM, K0 vs K2 vs K3)
     runs-on: ubuntu-22.04
-    needs: [build-kernel]
+    needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    # timeout-minutes=40: GH Actions 共享 runner 常无 KVM，回退 TCG（单线程模拟慢）。
-    #   -smp 2 + 加重测试矩阵（100 采样/10s/+idle）下，单次 QEMU ~620s，两次(K0+K2)+setup ~1320s
-    #   TCG 900s × 2 + 80s setup = 1880s < 2400s(40min)，余量 ~520s
-    #   KVM 可用时单次 ~280s，两次 ~640s，远低于上限
-    timeout-minutes: 40
+    # timeout-minutes=60: GH Actions 共享 runner 常无 KVM，回退 TCG（单线程模拟慢）。
+    #   --with-k3 启用后 3 次 QEMU (K0+K2+K3)，每次 TCG 900s 上限：
+    #   3 × 900s + 80s setup = 2780s < 3600s(60min)，余量 ~820s
+    #   KVM 可用时单次 ~280s，三次 ~920s，远低于上限
+    timeout-minutes: 60
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
     # --strict=warn 下 FAIL → exit 0（告警），仅 NO-DATA/INVALID>50% → exit 2（job 失败）。
     # continue-on-error: exit 2 时 workflow 仍 success，CI 界面显示 ⚠️
     continue-on-error: true
     env:
-      # CI 专用 QEMU timeout：
+      # CI 专用 QEMU timeout（每次 QEMU 运行的上限，K0/K2/K3 各一次）：
       # KVM 360s: 内核 boot ~10s + perf 测试 ~280s（含 idle 15s + 6项测试×3轮×13s）
-      # TCG 900s: TCG 回退（无 KVM 时），-smp 2 下 boot ~120s + 测试 ~420s + 余量；
-      #   原 700s 在 -smp 1 下 rc=124 超时（K0/K2 全 SKIP），改 -smp 2 + 900s 修复
+      # TCG 900s: TCG 回退（无 KVM 时），-smp 2 下 boot ~120s + 测试 ~420s + 余量
       QEMU_TIMEOUT_KVM: 360
       QEMU_TIMEOUT_TCG: 900
     steps:
@@ -539,7 +538,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio iproute2
+          # libmnl0: get_sockdelays 运行时依赖，ldd 需要它才能解析并拷贝 libmnl.so.0 到 initramfs
+          sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio iproute2 libmnl0
 
       - name: Download bzImage-on
         uses: actions/download-artifact@v4
@@ -555,23 +555,39 @@ jobs:
           name: bzImage-off
           path: /tmp/artifacts/off
 
-      - name: Run perf-test (KVM, --strict=warn)
+      - name: Download get_sockdelays artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: get_sockdelays
+          path: /tmp/artifacts
+
+      - name: Place get_sockdelays binary
+        run: |
+          # perf-test.sh 期望二进制位于 userspace/get_sockdelays/get_sockdelays
+          mkdir -p userspace/get_sockdelays
+          cp /tmp/artifacts/get_sockdelays userspace/get_sockdelays/get_sockdelays
+          chmod +x userspace/get_sockdelays/get_sockdelays
+          echo "get_sockdelays placed: $(file userspace/get_sockdelays/get_sockdelays)"
+
+      - name: Run perf-test (KVM, --strict=warn, --with-k3)
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
           test -f /tmp/artifacts/on/bzImage || { echo "ERROR: bzImage-on not found"; exit 1; }
           test -f /tmp/artifacts/off/bzImage || { echo "ERROR: bzImage-off not found"; exit 1; }
+          test -x userspace/get_sockdelays/get_sockdelays || { echo "ERROR: get_sockdelays not found"; exit 1; }
           echo "=== KVM availability ==="
           ls -la /dev/kvm 2>/dev/null && echo "  /dev/kvm: exists" || echo "  /dev/kvm: not found (will fallback to TCG)"
           echo ""
-          # K0=OFF内核(基线), K2=ON内核(检测开启,无查询)
+          # K0=OFF内核(基线), K2=ON内核(检测开启,无查询), K3=ON内核+主动查询
+          # --with-k3: 启用 K3 模式（需 get_sockdelays 已就位）
           # --strict=warn: FAIL/INVALID 均为告警（exit 0），不阻断；
           #   仅 NO-DATA（全 SKIP）或 INVALID>50%（数据不可信）才 exit 2。
           # --test-duration=10: CI 用较短时长（本地可设 60s 做完整验证）
           # --warmup=3: iperf3 --omit 3 跳过 slow-start
           # exit code: 0=PASS/warn通过, 2=数据不可信(NO-DATA/INVALID>50%)
           #   continue-on-error 保证 exit 2 也不阻断 workflow
-          ./perf-test.sh --skip-build --strict=warn \
+          ./perf-test.sh --skip-build --with-k3 --strict=warn \
             --bzimage-on=/tmp/artifacts/on/bzImage \
             --bzimage-off=/tmp/artifacts/off/bzImage \
             --test-duration=10 --warmup=3
@@ -601,7 +617,7 @@ jobs:
             PERF_LOG=$(ls -t tests/reports/perf/perf-test-*.log 2>/dev/null | head -1)
             if [ -n "$PERF_LOG" ]; then
               {
-                echo "## Performance Test Results (K0 vs K2)"
+                echo "## Performance Test Results (K0 vs K2 vs K3)"
                 echo ""
                 echo "### Verdict Summary"
                 echo '```'
@@ -626,7 +642,7 @@ jobs:
               echo "| Mode | PERF lines | QEMU rc | Note |"
               echo "|------|-----------|---------|------|"
               for mode in K0 K2 K3; do
-                # K3 在 CI 默认未运行，ls 无匹配会退出非零；加 || true 避免 set -e 中断 summary
+                # K3 log 可能不存在（get_sockdelays 缺失或构建失败时降级），加 || true 避免 set -e 中断 summary
                 mode_log=$(ls -t tests/reports/perf/perf-${mode}-*.log 2>/dev/null | head -1 || true)
                 [ -z "$mode_log" ] && { echo "| ${mode} | - | - | 未运行 |"; continue; }
                 n=$(grep -c "^PERF:" "$mode_log" 2>/dev/null || true)
@@ -638,6 +654,6 @@ jobs:
                 echo "| ${mode} | ${n} | ${rc} | ${note:--} |"
               done
               echo ""
-              echo "> K3 显示 \"-\" 是正常的：CI 默认只跑 K0 vs K2（未加 --with-k3）"
+              echo "> K3 显示 \"-\" 表示 get_sockdelays 未就位或 QEMU 未产出数据"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
