@@ -600,12 +600,9 @@ compare_and_report() {
         echo "${YELLOW}WARNING: K3 kernel log reports mode='${k3_mode}', expected 'ON'${NC}"
     fi
     echo ""
-    echo "+----------------------------------------------------------------------------------------+"
-    echo "|          NET_DELAYACCT Performance Comparison (K0 vs K2 vs K3)                          |"
-    echo "+----------------------------------------------------------------------------------------+"
-    printf "| %-26s | %8s | %8s | %8s | %8s | %8s | %8s | %8s | %-6s |\n" \
-        "Metric" "K0" "K2" "K3" "K0→K2" "K0→K3" "K2→K3" "Thresh" "Verdict"
-    echo "+----------------------------------------------------------------------------------------+"
+
+    # 对比表数据行在 verdict 段计算完成后再统一打印（表头/数据/表尾延后），
+    # 以便回填真实的 Thresh/Verdict 列（此前硬编码 "-" / "info" 与 md/csv 不一致）。
 
     # 判定延迟指标格式：新格式（p50/p95/p99/p999/max）还是旧格式（tcp_latency_us）
     # 新格式优先；仅当新格式缺失且旧格式存在时回退到旧格式（向后兼容）
@@ -742,9 +739,7 @@ compare_and_report() {
         k2_disp="${k2_med:-SKIP}"
 
         # verdict 占位（实际 verdict 在下方按 K0→K2 计算；非 verdict 指标显示 info）
-        printf "| %-26s | %8s | %8s | %8s | %8s | %8s | %8s | %8s | %-6s |\n" \
-            "$m_metric" "$k0_disp" "$k2_disp" "$k3_disp" \
-            "${d_k0k2:- -}" "${d_k0k3:- -}" "${d_k2k3:- -}" "-" "info"
+        # 控制台行延后到 verdict 段后统一打印，此处只存摘要数组
 
         # 存入摘要数组：threshold/verdict 在 verdict 段回填，最后统一生成摘要行
         SUM_UNIT[$m_metric]="$m_unit"
@@ -759,7 +754,6 @@ compare_and_report() {
         SUM_D23[$m_metric]="$d_k2k3"
     done
 
-    echo "+----------------------------------------------------------------------------------------+"
     echo ""
     echo "Pass criteria (initial, subject to calibration):"
     echo "  Perf-1 TCP throughput drop (K0→K2):  < 5%"
@@ -1008,6 +1002,26 @@ compare_and_report() {
     echo "Note: QEMU relative values only. For absolute data, run on physical hardware."
     echo "Note: Thresholds are initial values, subject to calibration with multiple runs."
     echo "Full logs: $LOG_DIR/perf-{K0,K2,K3}-${TIMESTAMP}.log"
+
+    # ---- 打印对比表（verdict 计算完成后，回填真实 Thresh/Verdict）----
+    echo ""
+    echo "+----------------------------------------------------------------------------------------+"
+    echo "|          NET_DELAYACCT Performance Comparison (K0 vs K2 vs K3)                          |"
+    echo "+----------------------------------------------------------------------------------------+"
+    printf "| %-26s | %8s | %8s | %8s | %8s | %8s | %8s | %8s | %-6s |\n" \
+        "Metric" "K0" "K2" "K3" "K0→K2" "K0→K3" "K2→K3" "Thresh" "Verdict"
+    echo "+----------------------------------------------------------------------------------------+"
+    local entry _t_metric
+    for entry in "${table_metrics[@]}"; do
+        _t_metric="${entry%%:*}"
+        printf "| %-26s | %8s | %8s | %8s | %8s | %8s | %8s | %8s | %-6s |\n" \
+            "$_t_metric" "${SUM_MED0[$_t_metric]:-SKIP}" "${SUM_MED2[$_t_metric]:-SKIP}" \
+            "${SUM_MED3[$_t_metric]:--}" \
+            "${SUM_D02[$_t_metric]:- -}" "${SUM_D03[$_t_metric]:- -}" "${SUM_D23[$_t_metric]:- -}" \
+            "${THRESHOLDS[$_t_metric]:--}" "${VERDICTS[$_t_metric]:-info}"
+    done
+    echo "+----------------------------------------------------------------------------------------+"
+    echo ""
 
     # 生成结构化摘要报告（Markdown + CSV）
     # 回填 threshold/verdict：按 table_metrics 顺序从存储数组重组摘要行

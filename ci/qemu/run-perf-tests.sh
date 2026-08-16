@@ -186,6 +186,14 @@ perf_3_tcp_latency() {
     local run=$1
     local port=$((IPERF_BASE_PORT + 2))
 
+    # SYN 溢出调优：100 连接零间隔连发 + nc -k 串行 accept 会导致半连接队列
+    # 溢出丢 SYN，客户端按初始 RTO=1s 重传 → p999/max 出现 ~1s 离群点
+    # （20260816_015227 实测 K3 2/3 轮中招，中位数被污染）。
+    # syncookies: SYN 队列溢出时不丢包，直接回 SYNACK
+    # somaxconn:  加大 accept 队列深度，吸收串行 accept 的瞬时积压
+    echo 1 > /proc/sys/net/ipv4/tcp_syncookies 2>/dev/null
+    echo 1024 > /proc/sys/net/core/somaxconn 2>/dev/null
+
     nc -k -l -p "$port" >/dev/null 2>&1 &
     local srv_pid=$!
     sleep 0.3
