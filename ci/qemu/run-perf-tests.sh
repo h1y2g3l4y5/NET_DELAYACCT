@@ -193,6 +193,9 @@ perf_3_tcp_latency() {
     # somaxconn:  加大 accept 队列深度，吸收串行 accept 的瞬时积压
     echo 1 > /proc/sys/net/ipv4/tcp_syncookies 2>/dev/null
     echo 1024 > /proc/sys/net/core/somaxconn 2>/dev/null
+    # 读回验证（诊断 initramfs 下 /proc/sys 是否可写；20260816_135316 一轮
+    # 调优后 p999 仍全 1s，需确认写入是否生效）
+    echo "PERF: sysctl_check syncookies=$(cat /proc/sys/net/ipv4/tcp_syncookies 2>/dev/null || echo NA) somaxconn=$(cat /proc/sys/net/core/somaxconn 2>/dev/null || echo NA)"
 
     nc -k -l -p "$port" >/dev/null 2>&1 &
     local srv_pid=$!
@@ -259,6 +262,8 @@ perf_3_tcp_latency() {
     echo "PERF: tcp_latency_p99_run${run}=$p99"
     echo "PERF: tcp_latency_p999_run${run}=$p999"
     echo "PERF: tcp_latency_max_run${run}=$max_val"
+    # top3 最大样本（诊断 ~1s 离群点形态：单个 1s / 多个 1s / 长尾连续分布）
+    echo "PERF: tcp_latency_top3_run${run}=$(echo $latencies | tr ' ' '\n' | sort -n | tail -3 | tr '\n' ' ')"
 }
 
 # ----------------------------------------------------------------------------
