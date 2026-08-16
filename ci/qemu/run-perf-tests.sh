@@ -248,12 +248,18 @@ perf_3_tcp_latency() {
 
     _kill_proc "$srv_pid"
 
-    if [ -z "$latencies" ]; then
+    # 最小有效样本数防护（review v6.5.2 问题 2.1.1）：>100ms 剔除阈值锚定 KVM
+    # 模式（正常 p999 仅 10-20ms），TCG 回退路径下正常延迟可能整体 >100ms 被
+    # 全量误剔除 → 空/少样本 percentile 失真甚至假 PASS。剔除过半时该轮按
+    # no-data 处理（host 端走 SKIP 三态路径，与 CI INVALID>50% 阻塞线对齐）。
+    local valid_cnt=$((NUM_SAMPLES - retrans_cnt))
+    if [ -z "$latencies" ] || [ "$valid_cnt" -lt $((NUM_SAMPLES / 2)) ]; then
         echo "PERF: tcp_latency_p50_run${run}=SKIP"
         echo "PERF: tcp_latency_p95_run${run}=SKIP"
         echo "PERF: tcp_latency_p99_run${run}=SKIP"
         echo "PERF: tcp_latency_p999_run${run}=SKIP"
         echo "PERF: tcp_latency_max_run${run}=SKIP"
+        echo "PERF: tcp_latency_INVALID_run${run}=1 (valid ${valid_cnt}/${NUM_SAMPLES}, retrans ${retrans_cnt} — 疑非 KVM 环境或极端调度噪声)"
         return
     fi
 
