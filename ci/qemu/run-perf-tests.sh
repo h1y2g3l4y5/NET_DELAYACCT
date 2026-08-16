@@ -213,6 +213,12 @@ perf_3_tcp_latency() {
     local latencies=""
     local i start_us end_us latency_us
     local NUM_SAMPLES=100
+    # SYN 重传伪影剔除：busybox nc listen(3, 1) backlog=1（strace 实锤），
+    # accept 队列积压 2 个即溢出丢 SYN → 客户端 RTO=1s 重传。该伪影与被测的
+    # delayacct 开销无关（K0 基线同样发生，20260816_141453 实测每轮 1-3 个），
+    # 且 syncookies/somaxconn 无法干预（listen backlog=min(1,1024)=1）。
+    # 阈值 100ms：正常 QEMU connect p999 仅 10-20ms，>100ms 只能是 RTO 重传。
+    local retrans_cnt=0
 
     # 预热连接：丢弃前 3 个连接。冷启动（nc 首次 accept / socket slab 分配 /
     # 首次连接 SYN 重传）会产生 ~1s 离群点，直接污染 p999/max（n=100 时 p999==max）。
@@ -231,7 +237,11 @@ perf_3_tcp_latency() {
                 s_int=${start_us/./}
                 e_int=${end_us/./}
                 latency_us=$((e_int - s_int))
-                latencies="$latencies $latency_us"
+                if [ "$latency_us" -gt 100000 ]; then
+                    retrans_cnt=$((retrans_cnt + 1))
+                else
+                    latencies="$latencies $latency_us"
+                fi
             fi
         fi
     done
@@ -262,7 +272,9 @@ perf_3_tcp_latency() {
     echo "PERF: tcp_latency_p99_run${run}=$p99"
     echo "PERF: tcp_latency_p999_run${run}=$p999"
     echo "PERF: tcp_latency_max_run${run}=$max_val"
-    # top3 最大样本（诊断 ~1s 离群点形态：单个 1s / 多个 1s / 长尾连续分布）
+    # SYN 重传剔除计数（健康指标：剔除过多说明该轮数据受调度噪声影响大）
+    echo "PERF: tcp_latency_retrans_run${run}=$retrans_cnt"
+    # top3 最大样本（诊断剔除后剩余长尾形态）
     echo "PERF: tcp_latency_top3_run${run}=$(echo $latencies | tr ' ' '\n' | sort -n | tail -3 | tr '\n' ' ')"
 }
 
