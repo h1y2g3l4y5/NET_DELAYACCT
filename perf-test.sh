@@ -533,6 +533,12 @@ write_summary_files() {
         echo ""
         echo "- 主判定基于 K0→K2（与现有 ON/OFF 对比行为一致）"
         echo "- K0→K3 / K2→K3 差值仅供参考，不影响 verdict"
+        echo "- K3 = ON 内核 + 每 50ms 全表查询：吞吐/PPS 的 K3 差值是 2 vCPU 环境"
+        echo "  下的查询干扰（真实多核会被稀释），后台查询自身的 CPU 开销直接读"
+        echo "  idle_cpu_pct 的 K3 差值（约 -6pp）；cpu_per_gbps 在不同吞吐点非线性，"
+        echo "  K3 的归一化值仅供参考"
+        echo "- p95/p99/p999/max 为 info：QEMU 单机环境尾延迟由 vCPU 调度主导"
+        echo "  （K0 vs K0B 噪声地板实测远超阈值，ftrace 证实 hook 仅占 p99 的 0.06%）"
         echo "- K3 未运行时显示 \"-\""
     } > "$SUMMARY_MD"
 
@@ -816,10 +822,14 @@ compare_and_report() {
     done
 
     # Perf-3 TCP 延迟：阈值 10%
-    # 新格式：p50 和 p99 分别判定；旧格式：tcp_latency_us 单一判定
+    # 新格式：仅 p50 判定；旧格式：tcp_latency_us 单一判定
+    # p99 移出 verdict（20260816）：K0 vs K0B 噪声地板两轮实测 53.6%/90.2%，
+    # 远超 10% 阈值——QEMU 单机环境尾延迟由 vCPU 调度主导（ftrace 已证 hook
+    # 仅占 p99 的 0.06%），判定只会产出 INVALID/假 FAIL，降级 info 展示。
+    # 阈值校准依赖 Noise Floor 数据积累（p50 floor 1.1%~10.3% 仍在观察）。
     if [ "$use_new_latency" = true ]; then
-        # P50 和 P99: degradation = (K2-K0)/K0*100，阈值 10%
-        for v_entry in "tcp_latency_p50:10" "tcp_latency_p99:10"; do
+        # P50: degradation = (K2-K0)/K0*100，阈值 10%
+        for v_entry in "tcp_latency_p50:10"; do
             IFS=':' read -r v_m v_t <<< "$v_entry"
             THRESHOLDS[$v_m]="${v_t}%"
             v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
@@ -1065,9 +1075,8 @@ compare_and_report() {
         echo "+----------------------------------------------------------------------------------------+"
         local nf_metric nf_k0m nf_k0bm nf_floor nf_thr nf_ok
         local floor_md="" floor_csv=""
-        # 静态阈值须与 verdict 段一致（cpu_per_gbps 为新归一化指标，初始 10%）
-        for nf_metric in tcp_throughput_mbps udp_pps tcp_latency_p50 \
-                         tcp_latency_p99 cpu_per_gbps; do
+        # 静态阈值须与 verdict 段一致（p99 已降级 info，不在此列）
+        for nf_metric in tcp_throughput_mbps udp_pps tcp_latency_p50 cpu_per_gbps; do
             case "$nf_metric" in
                 tcp_throughput_mbps) nf_thr=5;;
                 udp_pps)             nf_thr=15;;

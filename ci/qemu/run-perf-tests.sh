@@ -381,7 +381,8 @@ perf_5_cpu() {
         return
     fi
 
-    echo "PERF: cpu_util_pct_run${run}=$cpu_pct"
+    # %.1f：iperf3 双精度浮点（16 位小数）直接输出会撑爆 host 端摘要表格
+    echo "PERF: cpu_util_pct_run${run}=$(awk -v v="$cpu_pct" 'BEGIN {printf "%.1f", v}')"
     # 归一化 CPU 代价：%/Gbps（1 位小数；bps→Gbps 除 1e9）
     echo "PERF: cpu_per_gbps_run${run}=$(awk -v c="$cpu_pct" -v b="$bps" 'BEGIN {if (b > 0) printf "%.2f", c / (b / 1e9); else print "SKIP"}')"
 }
