@@ -158,11 +158,10 @@ perf_1_tcp_throughput() {
 # ----------------------------------------------------------------------------
 # Perf-2: 小包 UDP PPS (iperf3 -u -l 64 -b 0, packets/sec)
 #
-# 20260816 设计审查 B8：此前取 sender 行总报文数 = 发送 PPS，丢包不可见。
-# iperf3 UDP client 结束时经控制连接回传 server 端统计（receiver 行，含
-# Lost/Total Datagrams），优先用 receiver 口径 = 送达 PPS；receiver 行缺失
-# （iperf3 版本差异）回退 sender 口径并输出 loss=SKIP。丢包率独立输出供
-# host 端 info 展示（loopback 下正常 <0.1%）。
+# 20260816 设计审查 B8：PPS 用 sender 口径 = CPU 饱和发送能力（受 hook
+# 开销影响的被测量）；receiver 行的 Lost/Total 提取丢包率独立输出
+# （-b 0 饱和灌包下 loopback 实测丢 24-29%，比例波动大会污染 PPS，
+# 故 receiver 口径不用于 PPS）。丢包率仅 info 展示，不参与 verdict。
 # ----------------------------------------------------------------------------
 perf_2_udp_pps() {
     local run=$1
@@ -184,21 +183,19 @@ perf_2_udp_pps() {
     fi
 
     recv_pair=$(printf '%s\n' "$recv_line" | grep -oE '[0-9]+/[0-9]+' | tail -1)
+    # PPS 用 sender 口径（CPU 饱和发送能力，受 hook 开销影响，是有效被测量）；
+    # receiver 口径会混入丢包比例的波动（-b 0 饱和灌包下 loopback 实测丢 24-29%，
+    # 比例本身噪声大，会污染 PPS），丢包率独立输出 info 展示
+    pps=$((total_datagrams / TEST_DURATION))
+    echo "PERF: udp_pps_run${run}=$pps"
     if echo "$recv_pair" | grep -qE '^[0-9]+/[0-9]+$'; then
         lost_cnt=${recv_pair%%/*}
         local recv_total=${recv_pair##*/}
         if [ "$recv_total" -gt 0 ] 2>/dev/null; then
-            lost_pct=$(awk -v l="$lost_cnt" -v t="$recv_total" 'BEGIN {printf "%.3f", l * 100 / t}')
-            # 送达 PPS：接收侧总数（发送-丢）/ 时长
-            pps=$(( (recv_total - lost_cnt) / TEST_DURATION ))
-            echo "PERF: udp_pps_run${run}=$pps"
-            echo "PERF: udp_loss_pct_run${run}=$lost_pct"
+            echo "PERF: udp_loss_pct_run${run}=$(awk -v l="$lost_cnt" -v t="$recv_total" 'BEGIN {printf "%.3f", l * 100 / t}')"
             return
         fi
     fi
-    # 回退：sender 口径（发送 PPS），丢包不可见
-    pps=$((total_datagrams / TEST_DURATION))
-    echo "PERF: udp_pps_run${run}=$pps"
     echo "PERF: udp_loss_pct_run${run}=SKIP"
 }
 
@@ -365,11 +362,18 @@ perf_5_cpu() {
     json_out=$(_iperf3_client "$port" -J 2>/dev/null) || json_out=""
     _kill_proc "$srv_pid"
 
-    # JSON 字段提取（busybox 无 jq，用 awk；iperf3 -J 为 pretty-printed JSON）
-    cpu_pct=$(printf '%s\n' "$json_out" | awk -F': *' '/"host_percent"/ {gsub(/[ ",]/,"",$2); print $2; exit}')
+    # JSON 字段提取（busybox 无 jq，用 awk；iperf3 -J 为 tab 缩进的 JSON，
+    # 字段值清理须含 [[:space:]]（tab），否则值带前导 tab 触发 SKIP 校验失败）
+    # CPU 字段双版本兼容：3.9+ 为 cpu_utilization_percent.host_total，
+    # 旧版（3.1-3.7）为 cpu_utilization.host_percent（本地 iperf3 3.9 实测确认）
+    cpu_pct=$(printf '%s\n' "$json_out" | awk -F': *' '
+        /"cpu_utilization_percent"/ {blk="new"; next}
+        /"cpu_utilization"[[:space:]]*:/ {blk="old"; next}
+        blk=="new" && /"host_total"/ {gsub(/[[:space:]",]/,"",$2); print $2; exit}
+        blk=="old" && /"host_percent"/ {gsub(/[[:space:]",]/,"",$2); print $2; exit}')
     bps=$(printf '%s\n' "$json_out" | awk -F': *' '
         /"sum_sent"/ {insum=1}
-        insum && /"bits_per_second"/ {gsub(/[ ",]/,"",$2); print $2; exit}')
+        insum && /"bits_per_second"/ {gsub(/[[:space:]",]/,"",$2); print $2; exit}')
 
     if [ -z "$cpu_pct" ] || [ -z "$bps" ] || ! echo "$cpu_pct$bps" | grep -qE '^[0-9.]+$'; then
         echo "PERF: cpu_util_pct_run${run}=SKIP"
