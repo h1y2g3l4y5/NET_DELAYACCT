@@ -157,6 +157,12 @@ perf_1_tcp_throughput() {
 
 # ----------------------------------------------------------------------------
 # Perf-2: 小包 UDP PPS (iperf3 -u -l 64 -b 0, packets/sec)
+#
+# 20260816 设计审查 B8：此前取 sender 行总报文数 = 发送 PPS，丢包不可见。
+# iperf3 UDP client 结束时经控制连接回传 server 端统计（receiver 行，含
+# Lost/Total Datagrams），优先用 receiver 口径 = 送达 PPS；receiver 行缺失
+# （iperf3 版本差异）回退 sender 口径并输出 loss=SKIP。丢包率独立输出供
+# host 端 info 展示（loopback 下正常 <0.1%）。
 # ----------------------------------------------------------------------------
 perf_2_udp_pps() {
     local run=$1
@@ -164,23 +170,43 @@ perf_2_udp_pps() {
     iperf3 -s -p "$port" >/dev/null 2>&1 &
     local srv_pid=$!
     sleep 0.5
-    local raw_output total_datagrams
-    raw_output=$(_iperf3_client "$port" -u -l 64 -b 0 | grep -E "sender$" | tail -1)
+    local raw_output sender_line recv_line total_datagrams recv_pair lost_cnt lost_pct pps
+    raw_output=$(_iperf3_client "$port" -u -l 64 -b 0)
     _kill_proc "$srv_pid"
-    total_datagrams=$(echo "$raw_output" | grep -oE '[0-9]+/[0-9]+' | tail -1 | cut -d/ -f2)
+    sender_line=$(printf '%s\n' "$raw_output" | grep -E "sender$" | tail -1)
+    recv_line=$(printf '%s\n' "$raw_output" | grep -E "receiver$" | tail -1)
+
+    total_datagrams=$(printf '%s\n' "$sender_line" | grep -oE '[0-9]+/[0-9]+' | tail -1 | cut -d/ -f2)
     if ! echo "$total_datagrams" | grep -qE '^[0-9]+$' || [ "$total_datagrams" -eq 0 ] 2>/dev/null; then
         echo "PERF: udp_pps_run${run}=SKIP"
+        echo "PERF: udp_loss_pct_run${run}=SKIP"
         return
     fi
-    local pps=$((total_datagrams / TEST_DURATION))
+
+    recv_pair=$(printf '%s\n' "$recv_line" | grep -oE '[0-9]+/[0-9]+' | tail -1)
+    if echo "$recv_pair" | grep -qE '^[0-9]+/[0-9]+$'; then
+        lost_cnt=${recv_pair%%/*}
+        local recv_total=${recv_pair##*/}
+        if [ "$recv_total" -gt 0 ] 2>/dev/null; then
+            lost_pct=$(awk -v l="$lost_cnt" -v t="$recv_total" 'BEGIN {printf "%.3f", l * 100 / t}')
+            # 送达 PPS：接收侧总数（发送-丢）/ 时长
+            pps=$(( (recv_total - lost_cnt) / TEST_DURATION ))
+            echo "PERF: udp_pps_run${run}=$pps"
+            echo "PERF: udp_loss_pct_run${run}=$lost_pct"
+            return
+        fi
+    fi
+    # 回退：sender 口径（发送 PPS），丢包不可见
+    pps=$((total_datagrams / TEST_DURATION))
     echo "PERF: udp_pps_run${run}=$pps"
+    echo "PERF: udp_loss_pct_run${run}=SKIP"
 }
 
 # ----------------------------------------------------------------------------
 # Perf-3: TCP 连接延迟 (bash /dev/tcp, P50/P95/P99/P99.9/max, μs)
 #
-# 测量 TCP connect() 延迟。使用 100 次采样以获得有意义的 P99。
-# 输出百分位分布而非仅中位数，用于检测尾延迟变化。
+# 测量 TCP connect() 延迟。使用 200 次采样（间隔 5ms，无 fork），
+# 输出百分位分布用于检测尾延迟变化。设计变更见函数内注释（20260816 审查）。
 # ----------------------------------------------------------------------------
 perf_3_tcp_latency() {
     local run=$1
@@ -211,40 +237,58 @@ perf_3_tcp_latency() {
     fi
 
     local latencies=""
+    local raw_samples
     local i start_us end_us latency_us
-    local NUM_SAMPLES=100
-    # SYN 重传伪影剔除：busybox nc listen(3, 1) backlog=1（strace 实锤），
-    # accept 队列积压 2 个即溢出丢 SYN → 客户端 RTO=1s 重传。该伪影与被测的
-    # delayacct 开销无关（K0 基线同样发生，20260816_141453 实测每轮 1-3 个），
-    # 且 syncookies/somaxconn 无法干预（listen backlog=min(1,1024)=1）。
-    # 阈值 100ms：正常 QEMU connect p999 仅 10-20ms，>100ms 只能是 RTO 重传。
-    local retrans_cnt=0
-
-    # 预热连接：丢弃前 3 个连接。冷启动（nc 首次 accept / socket slab 分配 /
-    # 首次连接 SYN 重传）会产生 ~1s 离群点，直接污染 p999/max（n=100 时 p999==max）。
-    local warm_i
-    for warm_i in $(seq 1 3); do
-        (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null
-    done
-
-    for i in $(seq 1 "$NUM_SAMPLES"); do
-        start_us=${EPOCHREALTIME:-}
-        [ -z "$start_us" ] && break
-        if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
-            end_us=${EPOCHREALTIME:-}
-            if [ -n "$start_us" ] && [ -n "$end_us" ]; then
-                local s_int e_int
-                s_int=${start_us/./}
-                e_int=${end_us/./}
-                latency_us=$((e_int - s_int))
-                if [ "$latency_us" -gt 100000 ]; then
-                    retrans_cnt=$((retrans_cnt + 1))
-                else
-                    latencies="$latencies $latency_us"
-                fi
+    # 样本设计（20260816 设计审查 B1/B2/B7 重做）：
+    # - n=200：n=100 时 p99 与 p999/max 过近（剔除后 n=97 甚至退化 p99==max），
+    #   n=200 保证 p99=index 198 独立于尾部单样本
+    # - 连接间隔 5ms：给 busybox nc -k（串行 accept, listen backlog=1）时间清空
+    #   accept 队列。零间隔连发时 connect() 大部分耗时在等 accept 排队（毫秒级），
+    #   被测的 delayacct hook（~7us/connect，ftrace 实测）完全被淹没——此前
+    #   p95/p99/p999 实测的是 QEMU 调度而非内核 connect 路径
+    # - 无 fork 采样：此前 `(exec 3<>/dev/tcp/...)` 每样本 fork 子 shell
+    #   （QEMU 内 ~0.5-1.5ms），占 p50 一半以上。改为主 shell `exec 3<>` 直接
+    #   打开/关闭 FD，计时窗口内零 fork
+    # - 整个循环放命令替换 subshell 中隔离：exec FD 重定向失败会退出非交互
+    #   shell，隔离后最坏只丢本轮（走 SKIP 防护），主脚本安全
+    # - SYN 重传伪影剔除（保留）：>100ms（KVM 正常 p999 10-20ms，超此值只能是
+    #   RTO=1s 重传）计 retrans 不进样本；busybox nc listen(3,1) backlog=1，
+    #   accept 队列积压 2 个即溢出丢 SYN（strace 实锤），syncookies/somaxconn
+    #   无法干预（listen backlog=min(1,1024)=1）
+    # - 输出协议：有效样本每行一个延迟 μs；被剔除样本输出 "R"
+    local NUM_SAMPLES=200
+    raw_samples=$(
+        for w in 1 2 3; do
+            # 预热（丢弃）：nc 首次 accept / socket slab 分配 / 冷启动重传
+            if exec 3<>/dev/tcp/127.0.0.1/"$port" 2>/dev/null; then
+                exec 3<&- 2>/dev/null || true
             fi
-        fi
-    done
+            sleep 0.005
+        done
+        for i in $(seq 1 "$NUM_SAMPLES"); do
+            start_us=${EPOCHREALTIME:-}
+            [ -z "$start_us" ] && exit 0
+            if exec 3<>/dev/tcp/127.0.0.1/"$port" 2>/dev/null; then
+                end_us=${EPOCHREALTIME:-}
+                exec 3<&- 2>/dev/null || true
+                if [ -n "$end_us" ]; then
+                    latency_us=$(( ${end_us/./} - ${start_us/./} ))
+                    if [ "$latency_us" -gt 100000 ]; then
+                        echo R
+                    else
+                        echo "$latency_us"
+                    fi
+                fi
+            else
+                # connect 失败（nc 死亡/队列异常）按剔除处理，触发下方防护
+                echo R
+            fi
+            sleep 0.005
+        done
+    )
+    local retrans_cnt
+    retrans_cnt=$(printf '%s\n' "$raw_samples" | grep -cx 'R' || true)
+    latencies=$(printf '%s\n' "$raw_samples" | grep -vx 'R' | tr '\n' ' ')
 
     _kill_proc "$srv_pid"
 
@@ -299,43 +343,43 @@ perf_4_memory() {
 }
 
 # ----------------------------------------------------------------------------
-# Perf-5: CPU 利用率 (iperf3 期间 /proc/stat 采样, %)
+# Perf-5: CPU 利用率 (iperf3 -J JSON: host_percent + 归一化 CPU/Gbps)
+#
+# 20260816 设计审查 B3/B4 重做：此前用 /proc/stat 手工差分测"iperf 期间整机
+# busy%"，存在两个混杂——(1) 采样窗口含 0.5s server 启动等待（idle 稀释 ~5%）；
+# (2) busy% 正比于吞吐，跨模式吞吐不同时 CPU 不可比（K3 吞吐 -11% 时 busy% 假性
+# -10.7%，与 idle -6pp 方向矛盾）。改用 iperf3 JSON：
+#   - end.cpu_utilization.host_percent：iperf3 以自身流量起止为窗口的 busy%，
+#     窗口精确对齐，消除 (1)
+#   - cpu_per_gbps = host_percent / (bps/1e9)：单位吞吐的 CPU 代价，消除 (2)；
+#     host 端 verdict 改判此指标，cpu_util_pct 降为 info
 # ----------------------------------------------------------------------------
 perf_5_cpu() {
     local run=$1
     local port=$((IPERF_BASE_PORT + 3))
 
-    local idle_before total_before idle_after total_after
-    local stat_line
-    stat_line=$(head -1 /proc/stat 2>/dev/null)
-    idle_before=$(echo "$stat_line" | awk '{print $5}')
-    total_before=$(echo "$stat_line" | awk '{s=0; for(i=2;i<=NF;i++) s+=$i; print s}')
-
     iperf3 -s -p "$port" >/dev/null 2>&1 &
     local srv_pid=$!
     sleep 0.5
-    _iperf3_client "$port" >/dev/null 2>&1 || true
+    local json_out cpu_pct bps
+    json_out=$(_iperf3_client "$port" -J 2>/dev/null) || json_out=""
     _kill_proc "$srv_pid"
 
-    stat_line=$(head -1 /proc/stat 2>/dev/null)
-    idle_after=$(echo "$stat_line" | awk '{print $5}')
-    total_after=$(echo "$stat_line" | awk '{s=0; for(i=2;i<=NF;i++) s+=$i; print s}')
+    # JSON 字段提取（busybox 无 jq，用 awk；iperf3 -J 为 pretty-printed JSON）
+    cpu_pct=$(printf '%s\n' "$json_out" | awk -F': *' '/"host_percent"/ {gsub(/[ ",]/,"",$2); print $2; exit}')
+    bps=$(printf '%s\n' "$json_out" | awk -F': *' '
+        /"sum_sent"/ {insum=1}
+        insum && /"bits_per_second"/ {gsub(/[ ",]/,"",$2); print $2; exit}')
 
-    if [ -z "$idle_before" ] || [ -z "$total_before" ] || \
-       [ -z "$idle_after" ] || [ -z "$total_after" ]; then
+    if [ -z "$cpu_pct" ] || [ -z "$bps" ] || ! echo "$cpu_pct$bps" | grep -qE '^[0-9.]+$'; then
         echo "PERF: cpu_util_pct_run${run}=SKIP"
+        echo "PERF: cpu_per_gbps_run${run}=SKIP"
         return
     fi
 
-    local idle_diff total_diff cpu_pct
-    idle_diff=$((idle_after - idle_before))
-    total_diff=$((total_after - total_before))
-    if [ "$total_diff" -le 0 ]; then
-        echo "PERF: cpu_util_pct_run${run}=SKIP"
-        return
-    fi
-    cpu_pct=$((100 - (idle_diff * 100 / total_diff)))
     echo "PERF: cpu_util_pct_run${run}=$cpu_pct"
+    # 归一化 CPU 代价：%/Gbps（1 位小数；bps→Gbps 除 1e9）
+    echo "PERF: cpu_per_gbps_run${run}=$(awk -v c="$cpu_pct" -v b="$bps" 'BEGIN {if (b > 0) printf "%.2f", c / (b / 1e9); else print "SKIP"}')"
 }
 
 # ----------------------------------------------------------------------------

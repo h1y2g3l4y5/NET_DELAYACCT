@@ -548,6 +548,10 @@ compare_and_report() {
     local k2_file="$LOG_DIR/perf-K2-${TIMESTAMP}.log"
     local k3_file=""
     [ -f "$LOG_DIR/perf-K3-${TIMESTAMP}.log" ] && k3_file="$LOG_DIR/perf-K3-${TIMESTAMP}.log"
+    # K0B（B5/B6 噪声地板）：同 OFF 内核在批次末尾再跑一遍，
+    # K0(首) vs K0B(尾) 差值 = 时段漂移 + 测量噪声的合成下界
+    local k0b_file=""
+    [ -f "$LOG_DIR/perf-K0B-${TIMESTAMP}.log" ] && k0b_file="$LOG_DIR/perf-K0B-${TIMESTAMP}.log"
 
     if [ ! -f "$k0_file" ] || [ ! -f "$k2_file" ]; then
         echo "${RED}Missing result files (K0/K2)${NC}"
@@ -572,10 +576,11 @@ compare_and_report() {
         parse_results "$k0_file" K0
         parse_results "$k2_file" K2
         [ -n "$k3_file" ] && parse_results "$k3_file" K3
+        [ -n "$k0b_file" ] && parse_results "$k0b_file" K0B
     )
 
     # 模式检测（PERF: mode= 和 PERF: query_mode=）
-    local k0_mode k2_mode k3_mode k0_qmode k2_qmode k3_qmode
+    local k0_mode k2_mode k3_mode k0_qmode k2_qmode k3_qmode k0b_mode
     k0_mode=$(grep "^PERF: mode=" "$k0_file" | head -1 | cut -d= -f2 | tr -d '\r')
     k2_mode=$(grep "^PERF: mode=" "$k2_file" | head -1 | cut -d= -f2 | tr -d '\r')
     k0_qmode=$(grep "^PERF: query_mode=" "$k0_file" | head -1 | cut -d= -f2 | tr -d '\r')
@@ -583,6 +588,12 @@ compare_and_report() {
     if [ -n "$k3_file" ]; then
         k3_mode=$(grep "^PERF: mode=" "$k3_file" | head -1 | cut -d= -f2 | tr -d '\r')
         k3_qmode=$(grep "^PERF: query_mode=" "$k3_file" | head -1 | cut -d= -f2 | tr -d '\r')
+    fi
+    if [ -n "$k0b_file" ]; then
+        k0b_mode=$(grep "^PERF: mode=" "$k0b_file" | head -1 | cut -d= -f2 | tr -d '\r')
+        if [ "$k0b_mode" != "OFF" ]; then
+            echo "${YELLOW}WARNING: K0B kernel log reports mode='${k0b_mode}', expected 'OFF' (noise floor invalid)${NC}"
+        fi
     fi
 
     echo "K0: mode=$k0_mode query=$k0_qmode"
@@ -633,6 +644,9 @@ compare_and_report() {
     local table_metrics=()
     table_metrics+=("tcp_throughput_mbps:Mbps:drop")
     table_metrics+=("udp_pps:pps:drop")
+    # udp_loss_pct：UDP 丢包率（receiver 口径，B8 修复后输出），仅 info 展示
+    # （loopback 正常 <0.1%，不参与 verdict）
+    table_metrics+=("udp_loss_pct:%:increase")
     if [ "$use_new_latency" = true ]; then
         table_metrics+=("tcp_latency_p50:us:increase")
         table_metrics+=("tcp_latency_p95:us:increase")
@@ -643,6 +657,10 @@ compare_and_report() {
         table_metrics+=("tcp_latency_us:us:increase")
     fi
     table_metrics+=("cpu_util_pct:%:increase")
+    # cpu_per_gbps：归一化 CPU 代价（%/Gbps，B3 修复引入）。verdict 判此指标，
+    # cpu_util_pct（iperf3 host_percent，绝对 busy%）降为 info——绝对 busy% 正比
+    # 吞吐，跨模式吞吐不同时不可比（K3 吞吐低会假性"更省 CPU"）
+    table_metrics+=("cpu_per_gbps:%/Gbps:increase")
     table_metrics+=("idle_cpu_pct:%:idle")
     # cycles_per_packet：仅当至少一个 mode 有数据时显示
     if [ -n "${values[K0|cycles_per_packet_vals]:-}" ] || \
@@ -845,8 +863,10 @@ compare_and_report() {
         VERDICTS[$v_m]="$status"
     fi
 
-    # Perf-5 CPU 利用率：degradation = (K2-K0)/K0*100 (相对 %)，阈值 10%
-    v_m="cpu_util_pct"; v_t=10
+    # Perf-5 CPU 代价（B3 修复）：判归一化指标 cpu_per_gbps（%/Gbps），
+    # 相对 % 阈值 10%。绝对 busy%（cpu_util_pct）正比吞吐不可跨模式比，降为 info。
+    # 阈值为初始值，待 K0 vs K0B 噪声地板数据积累后校准（见 Noise Floor 节）。
+    v_m="cpu_per_gbps"; v_t=10
     THRESHOLDS[$v_m]="${v_t}%"
     v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
     if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
@@ -1031,6 +1051,63 @@ compare_and_report() {
         SUMMARY_ROWS+="${m_metric}	${SUM_UNIT[$m_metric]}	${SUM_RAW0[$m_metric]}	${SUM_RAW2[$m_metric]}	${SUM_RAW3[$m_metric]}	${SUM_MED0[$m_metric]}	${SUM_MED2[$m_metric]}	${SUM_MED3[$m_metric]}	${SUM_D02[$m_metric]}	${SUM_D03[$m_metric]}	${SUM_D23[$m_metric]}	${THRESHOLDS[$m_metric]:--}	${VERDICTS[$m_metric]:-info}"$'\n'
     done
     write_summary_files "$SUMMARY_ROWS" "$k0_mode" "$k2_mode" "${k3_mode:--}"
+
+    # ---- 噪声地板节（B5/B6）：K0(首) vs K0B(尾)，同 OFF 内核 ----
+    # |Δ%| = 宿主机时段漂移 + 测量固有噪声的合成下界。floor >= 静态阈值的
+    # 指标标 NOISY（该环境下判定不可信，需放宽阈值/加轮数/避开忙时段）。
+    # 数据积累多轮后再据此校准静态阈值（本节只报告，不改变判定逻辑）。
+    if [ -n "$k0b_file" ]; then
+        echo "+----------------------------------------------------------------------------------------+"
+        echo "| Noise Floor (K0 first vs K0B last, same OFF kernel)                                     |"
+        echo "+----------------------------------------------------------------------------------------+"
+        printf "| %-26s | %10s | %10s | %10s | %8s | %-6s |\n" \
+            "Metric" "K0(median)" "K0B(median)" "|delta|%" "Thresh" "Usable"
+        echo "+----------------------------------------------------------------------------------------+"
+        local nf_metric nf_k0m nf_k0bm nf_floor nf_thr nf_ok
+        local floor_md="" floor_csv=""
+        # 静态阈值须与 verdict 段一致（cpu_per_gbps 为新归一化指标，初始 10%）
+        for nf_metric in tcp_throughput_mbps udp_pps tcp_latency_p50 \
+                         tcp_latency_p99 cpu_per_gbps; do
+            case "$nf_metric" in
+                tcp_throughput_mbps) nf_thr=5;;
+                udp_pps)             nf_thr=15;;
+                *)                   nf_thr=10;;
+            esac
+            nf_k0m="${SUM_MED0[$nf_metric]:-}"
+            nf_k0bm=$(_median "${values[K0B|${nf_metric}_vals]:-}")
+            if [ -n "$nf_k0m" ] && [ -n "$nf_k0bm" ] && \
+               awk "BEGIN {exit !(${nf_k0m} > 0)}"; then
+                nf_floor=$(awk -v a="$nf_k0m" -v b="$nf_k0bm" \
+                    'BEGIN {d=(b-a); if (d<0) d=-d; printf "%.1f", d/a*100}')
+                nf_ok=$(awk -v f="$nf_floor" -v t="$nf_thr" \
+                    'BEGIN {print (f < t) ? "YES" : "NOISY"}')
+            else
+                nf_floor="-"; nf_ok="-"
+            fi
+            printf "| %-26s | %10s | %10s | %10s | %8s | %-6s |\n" \
+                "$nf_metric" "${nf_k0m:--}" "${nf_k0bm:--}" "${nf_floor}" "${nf_thr}%" "${nf_ok}"
+            floor_md+="| ${nf_metric} | ${nf_k0m:--} | ${nf_k0bm:--} | ${nf_floor}% | ${nf_thr}% | ${nf_ok} |"$'\n'
+            floor_csv+="${nf_metric}__noise_floor	${SUM_UNIT[$nf_metric]:--}	${SUM_RAW0[$nf_metric]:--}	-	-	${nf_k0m:--}	${nf_k0bm:--}	-	${nf_floor}%	-	-	${nf_thr}%	FLOOR"$'\n'
+        done
+        echo "+----------------------------------------------------------------------------------------+"
+        echo "Note: NOISY = |K0-K0B| >= threshold -> verdict for this metric is noise-dominated."
+        echo ""
+
+        # 追加到 Markdown / CSV 摘要
+        local summary_md_path="$LOG_DIR/perf-summary-${TIMESTAMP}.md"
+        local summary_csv_path="$LOG_DIR/perf-summary-${TIMESTAMP}.csv"
+        {
+            echo ""
+            echo "## Noise Floor (K0 first vs K0B last, same OFF kernel)"
+            echo ""
+            echo "| Metric | K0(median) | K0B(median) | floor(\\|delta\\|%) | Thresh | Usable |"
+            echo "|---|---|---|---|---|---|"
+            printf '%s' "$floor_md"
+            echo ""
+            echo "NOISY = verdict noise-dominated in this environment (threshold below floor)."
+        } >> "$summary_md_path"
+        printf '%s' "$floor_csv" >> "$summary_csv_path"
+    fi
 }
 
 # ============================================================================
@@ -1171,6 +1248,10 @@ done
         run_perf_in_qemu "$BZIMAGE_ON" "K3" "K3"
         echo ""
     fi
+    # K0B: 同 OFF 内核再跑一遍（批次末尾）。B5/B6：K0(首) vs K0B(尾) 提供
+    # 噪声地板（时段漂移 + 测量噪声下界），见 compare_and_report 的 Noise Floor 节
+    run_perf_in_qemu "$BZIMAGE_OFF" "K0B" "K0"
+    echo ""
 
     # Step 5: 对比报告
     # || true: compare_and_report 在 missing-files 时 return 1，不让 set -e 绕过
