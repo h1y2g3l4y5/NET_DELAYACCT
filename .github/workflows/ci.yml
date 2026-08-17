@@ -253,8 +253,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio iproute2 iptables
+          # 同 perf-test job：公网间歇抖动容错（update 非致命，install 重试，已装包无网可过）
+          for i in 1 2 3; do sudo apt-get update && break; echo "apt update retry $i"; sleep $((i*15)); done || true
+          for i in 1 2 3; do
+            sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio iproute2 iptables && break
+            echo "apt install retry $i"; sleep $((i*15))
+          done
 
       - name: Setup KVM acceleration
         run: |
@@ -538,10 +542,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          # libmnl0: get_sockdelays 运行时依赖，ldd 需要它才能解析并拷贝 libmnl.so.0 到 initramfs
-          # gcc: bench-net 微基准在 runner 上编译后打入 initramfs（perf-test.sh 内完成）
-          sudo apt-get install -y qemu-system-x86 busybox-static cpio iproute2 libmnl0 gcc
+          # 本机网络对公网间歇性抖动（20260817 当天 443 outage 已打死 2 轮 checkout、
+          # 1 轮 apt）：update 带重试且非致命；install 重试 3 次，包已装时无网也可过
+          for i in 1 2 3; do sudo apt-get update && break; echo "apt update retry $i"; sleep $((i*15)); done || true
+          for i in 1 2 3; do
+            # libmnl0: get_sockdelays 运行时依赖，ldd 需要它才能解析并拷贝 libmnl.so.0 到 initramfs
+            # gcc: bench-net 微基准在 runner 上编译后打入 initramfs（perf-test.sh 内完成）
+            sudo apt-get install -y qemu-system-x86 busybox-static cpio iproute2 libmnl0 gcc && break
+            echo "apt install retry $i"; sleep $((i*15))
+          done
 
       - name: Download bzImage-on
         uses: actions/download-artifact@v4
