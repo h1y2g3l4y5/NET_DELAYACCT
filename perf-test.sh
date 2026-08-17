@@ -3,10 +3,13 @@
 #
 # perf-test.sh — NET_DELAYACCT 性能基准测试编排脚本（host 侧）
 #
-# 对比 K0/K2/K3 三种模式的性能开销：
+# 对比 K0/K3 两种模式的性能开销：
 #   K0: OFF 内核（CONFIG_NET_DELAYACCT=n）— 基线，无插桩开销
-#   K2: ON 内核，检测开启，无主动查询（纯插桩开销）
-#   K3: ON 内核，检测开启 + dump 导出计时（导出开销，需 get_sockdelays）
+#   K3: ON 内核，检测开启 + dump 导出计时（最坏情形口径，需 get_sockdelays）
+#
+# 20260817 K2 模式移除：K2 与 K3 本就是同一个 bzImage-on，且 guest 侧
+# 执行顺序为 bench→ftrace→slab→dump（dump 在 bench 之后），K3 的 bench
+# 阶段与 K2 逐字节一致 → K2 是纯冗余启动，主判定直接取 K0→K3。
 #
 # 20260816 方案重建（iperf3 速率驱动 → 固定工作量微基准）：
 # 旧方案信噪比倒挂（信号 ~1% < 噪声 5-50%，见 run-perf-tests.sh 头注释），
@@ -19,17 +22,18 @@
 # 旧 iperf3 指标（吞吐/PPS/延迟百分位/CPU）全部移除。
 #
 # 流程：
-#   1. 构建 ON 内核 (CONFIG_NET_DELAYACCT=y) → bzImage-on（K2/K3 共用）
+#   1. 构建 ON 内核 (CONFIG_NET_DELAYACCT=y) → bzImage-on（K3/K3R 共用）
 #   2. 构建 OFF 内核 (CONFIG_NET_DELAYACCT=n) → bzImage-off（K0/K0R/K0B）
 #   3. 创建 perf initramfs（bench-net 静态编译 + run-perf-tests.sh + get_sockdelays）
-#   4. QEMU(-smp 1, 宿主侧绑核) 交错启动 K0→K2→K0R→K2R→[K3]→K0B：
+#   4. QEMU(-smp 1, 宿主侧绑核) WARM 预热 + 交错启动 K0→K3→K0R→K3R→K0B：
 #      同二进制"启动间"漂移实测 ~10%（run#178: K2↔K3 同 bzImage 差
-#      10.7-12.8%），单对 K0↔K0B=1% 是采样运气而非真实地板。交错重复
-#      使时漂对 K0/K2 等权，K0R/K2R 结果并入 K0/K2 中位数
-#   5. 对比并生成报告（K0 为基线，K0→K2 为主判定；全部同二进制启动对
+#      10.7-12.8%），且批次前 1-2 次启动有 +30% 预热瞬态（run#179）→
+#      WARM 丢弃启动吸收瞬态；交错重复使时漂对 K0/K3 等权，
+#      K0R/K3R 结果并入 K0/K3 中位数
+#   5. 对比并生成报告（K0 为基线，K0→K3 为主判定；全部同二进制启动对
 #      |Δ| 的最大值 = 启动间噪声地板，|Δ| 低于地板 → INVALID）
 #
-# 用法: ./perf-test.sh [--skip-build] [--with-k3] [--runs=5] ...
+# 用法: ./perf-test.sh [--skip-build] [--runs=5] ...
 #
 # 注意: 需写入内核源码树 (../linux-6.6)，须在非沙箱环境运行
 
@@ -84,9 +88,6 @@ trap 'rm -f "$PERF_EXIT_FILE"' EXIT
 # 测试参数（可被命令行参数覆盖）
 # ============================================================================
 
-# 是否额外运行 K3 模式（附加 dump 导出计时）
-WITH_K3=false
-
 # bench-net 每项测试轮数（每轮自动校准 ~1s，中位数抗噪）
 PERF_RUNS="${PERF_RUNS:-5}"
 
@@ -106,7 +107,7 @@ _median() {
 }
 
 # 三态判定，回显状态字 PASS / FAIL / INVALID，由调用方计数与打印
-# degradation: 正值=K2 更差（预期方向，工具加开销）；负值=K2 更优（噪声主导→INVALID）；
+# degradation: 正值=K3 更差（预期方向，工具加开销）；负值=K3 更优（噪声主导→INVALID）；
 #              超过 threshold=FAIL，否则 PASS。用 INVALID 而非 FAIL：噪声不是回归，
 #              FAIL 会误报回归方向；INVALID 表达"本次测量不可信，建议重跑"。
 _verdict3() {
@@ -285,9 +286,9 @@ create_perf_initramfs() {
         copy_binary_with_libs "$(command -v ip)" "$INITRD_DIR"
     fi
 
-    # get_sockdelays 二进制 + 依赖（含 libmnl）— K3 模式必需
-    # K3 模式通过后台主动调用 get_sockdelays 模拟导出开销；缺此二进制时
-    # run-perf-tests.sh 会自动降级为 K2 行为（仅检测不查询）
+    # get_sockdelays 二进制 + 依赖（含 libmnl）— K3 模式 Perf-D 必需
+    # K3 模式通过主动调用 get_sockdelays 计量导出开销；缺此二进制时
+    # run-perf-tests.sh 会自动跳过 dump 计时（bench/ftrace 不受影响）
     local TOOL_BIN="$PROJECT_DIR/userspace/get_sockdelays/get_sockdelays"
     if [ ! -x "$TOOL_BIN" ]; then
         echo "get_sockdelays not found, attempting build..."
@@ -302,7 +303,7 @@ create_perf_initramfs() {
         copy_binary_with_libs "$TOOL_BIN" "$INITRD_DIR"
         echo "Packed get_sockdelays (for K3 mode)"
     else
-        echo "${YELLOW}WARNING: get_sockdelays not built, K3 mode will fall back to K2 behavior${NC}"
+        echo "${YELLOW}WARNING: get_sockdelays not built, K3 dump timing will be SKIPped${NC}"
     fi
 
     # perf 测试脚本
@@ -324,11 +325,13 @@ create_perf_initramfs() {
 # Step 4: QEMU 启动并收集性能数据
 # ============================================================================
 
-# $1 = kernel_img, $2 = mode_label (K0/K2/K0R/K2R/K3/K0B), $3 = query_mode (传给 guest 的 cmdline 参数)
+# $1 = kernel_img, $2 = mode_label (WARM/K0/K3/K0R/K3R/K0B),
+# $3 = query_mode (传给 guest 的 cmdline 参数), $4 = bench 轮数(默认 PERF_RUNS)
 run_perf_in_qemu() {
     local kernel_img="$1"
     local mode_label="$2"
     local query_mode="$3"
+    local runs="${4:-${PERF_RUNS:-5}}"
     local qemu_out="/tmp/perf-qemu-${mode_label}-$$.log"
 
     log_section "Booting QEMU ($mode_label)"
@@ -351,8 +354,15 @@ run_perf_in_qemu() {
     # nokaslr：本地旧 .config 增量构建的内核会卡在 KASLR 阶段（v6.5.2 坑1），
     # CI fresh clone 构建的内核无此问题；KASLR 只影响启动，禁用不改变运行时基准
     local append_str="console=ttyS0,115200n8 rdinit=/init nokaslr"
+    # RT 节流禁用（run#179 实证 "sched: RT throttling activated"）：
+    # bench 的 SCHED_FIFO 在 loopback 上不睡眠（send 路径 softirq 已将
+    # 数据入队，recv 立即返回），950ms/s 配额耗尽后被强制停 50ms/s，
+    # 每轮 ~1s 的测量被随机截入 5% 停顿 → 轮内离散 10-25% 的自伤噪声。
+    # sched_rt_runtime_us=-1（RUNTIME_INF）关闭节流；单用途测量 guest，
+    # 卡死由 QEMU timeout 兜底。内核 6.6 支持 sysctl.* cmdline 参数。
+    append_str+=" sysctl.kernel.sched_rt_runtime_us=-1"
     append_str+=" query_mode=${query_mode}"
-    append_str+=" perf_runs=${PERF_RUNS}"
+    append_str+=" perf_runs=${runs}"
 
     # QEMU 串口输出直接落文件（-serial file:），进程 stderr 单独捕获：
     # 用户终端环境下 -nographic(stdio 多路复用) 与 e1000 会致 QEMU 进程级
@@ -365,7 +375,7 @@ run_perf_in_qemu() {
         -m "$QEMU_MEMORY"
         # -smp 1（20260816 方案重建）：单 vCPU 消除 vCPU 间迁移/调度相位噪声，
         # bench-net 单进程绑 CPU0 + SCHED_FIFO，配合固定循环次数，
-        # K0/K2 的 ns/op 差值即插桩开销（分辨率 ~0.1%）。
+        # K0/K3 的 ns/op 差值即插桩开销（分辨率 ~0.1%）。
         # TCG 回退无需 -smp 2 加速：bench 自动校准每轮 ~1s，矩阵总时长可控
         -smp 1
         -kernel "$kernel_img"
@@ -444,7 +454,7 @@ run_perf_in_qemu() {
 # ============================================================================
 
 # 解析 PERF: *_runN= 行，输出 mode|metric=value
-# $1 = 文件, $2 = 模式前缀 (K0/K2/K3/K0B)
+# $1 = 文件, $2 = 模式前缀 (K0/K3/K0B)
 parse_results() {
     local file="$1"
     local prefix="$2"
@@ -478,24 +488,23 @@ calc_delta_abs() {
 }
 
 # 生成 Markdown + CSV 结构化摘要报告
-# 参数: $1 = 摘要数据行（每行 tab 分隔 13 列）:
-#       metric unit k0_raw k2_raw k3_raw k0_med k2_med k3_med delta_k0k2 delta_k0k3 delta_k2k3 threshold verdict
-#       $2 = K0 mode, $3 = K2 mode, $4 = K3 mode（"-"表示未运行）
+# 参数: $1 = 摘要数据行（每行 tab 分隔 9 列）:
+#       metric unit k0_raw k3_raw k0_med k3_med delta_k0k3 threshold verdict
+#       $2 = K0 mode, $3 = K3 mode（"-"表示未运行）
 write_summary_files() {
     local summary_data="$1"
     local k0_mode="$2"
-    local k2_mode="$3"
-    local k3_mode="${4:--}"
+    local k3_mode="${3:--}"
 
     # CSV
     {
-        echo "metric,unit,k0_raw,k2_raw,k3_raw,k0_median,k2_median,k3_median,delta_k0k2,delta_k0k3,delta_k2k3,threshold,verdict"
-        while IFS=$'\t' read -r metric unit k0_raw k2_raw k3_raw k0_med k2_med k3_med d_k0k2 d_k0k3 d_k2k3 threshold verdict; do
+        echo "metric,unit,k0_raw,k3_raw,k0_median,k3_median,delta_k0k3,threshold,verdict"
+        while IFS=$'\t' read -r metric unit k0_raw k3_raw k0_med k3_med d_k0k3 threshold verdict; do
             [ -z "$metric" ] && continue
-            printf '"%s","%s","%s","%s","%s",%s,%s,%s,%s,%s,%s,%s,%s\n' \
-                "$metric" "$unit" "$k0_raw" "$k2_raw" "$k3_raw" \
-                "$k0_med" "$k2_med" "$k3_med" \
-                "$d_k0k2" "$d_k0k3" "$d_k2k3" \
+            printf '"%s","%s","%s","%s",%s,%s,%s,%s,%s\n' \
+                "$metric" "$unit" "$k0_raw" "$k3_raw" \
+                "$k0_med" "$k3_med" \
+                "$d_k0k3" \
                 "$threshold" "$verdict"
         done <<< "$summary_data"
     } > "$SUMMARY_CSV"
@@ -506,30 +515,31 @@ write_summary_files() {
         echo ""
         echo "- **时间戳**: ${TIMESTAMP}"
         echo "- **K0 内核模式**: ${k0_mode:-unknown}（OFF 内核，基线）"
-        echo "- **K2 内核模式**: ${k2_mode:-unknown}（ON 内核，检测开启，无查询）"
-        echo "- **K3 内核模式**: ${k3_mode:--}（ON 内核，检测+查询）"
+        echo "- **K3 内核模式**: ${k3_mode:--}（ON 内核，检测+查询，最坏情形）"
         echo "- **bench 轮数**: ${PERF_RUNS}（每轮自动校准 ~1s）"
         echo ""
         echo "## 指标详情"
         echo ""
-        echo "| 指标 | 单位 | K0 | K2 | K3 | K0→K2 差值 | K0→K3 差值 | K2→K3 差值 | 阈值 | 判定 |"
-        echo "|------|------|----|----|----|-----------|-----------|-----------|------|------|"
-        while IFS=$'\t' read -r metric unit k0_raw k2_raw k3_raw k0_med k2_med k3_med d_k0k2 d_k0k3 d_k2k3 threshold verdict; do
+        echo "| 指标 | 单位 | K0 | K3 | K0→K3 差值 | 阈值 | 判定 |"
+        echo "|------|------|----|----|-----------|------|------|"
+        while IFS=$'\t' read -r metric unit k0_raw k3_raw k0_med k3_med d_k0k3 threshold verdict; do
             [ -z "$metric" ] && continue
-            echo "| $metric | $unit | $k0_med | $k2_med | $k3_med | $d_k0k2 | $d_k0k3 | $d_k2k3 | $threshold | $verdict |"
+            echo "| $metric | $unit | $k0_med | $k3_med | $d_k0k3 | $threshold | $verdict |"
         done <<< "$summary_data"
         echo ""
         echo "## Delta 计算方向"
         echo ""
-        echo "- bench ns/op: (Kx - K0) / K0 * 100（正值 = 每循环耗时增加，Kx 更差）"
-        echo "- Socket 对象大小: Kx - K0（字节，正值 = 内存增加）"
+        echo "- bench ns/op: (K3 - K0) / K0 * 100（正值 = 每循环耗时增加，K3 更差）"
+        echo "- Socket 对象大小: K3 - K0（字节，正值 = 内存增加）"
         echo ""
         echo "## 判定说明"
         echo ""
-        echo "- 主判定基于 K0→K2 的 Perf-A 微基准（bench_udp64 / bench_tcprw ns/op）"
-        echo "- K0/K2 各交错启动 2 次（K0R/K2R 并入中位数），QEMU vCPU 线程"
+        echo "- 主判定基于 K0→K3 的 Perf-A 微基准（bench_udp64 / bench_tcprw ns/op）"
+        echo "- K0/K3 各交错启动 2 次（K0R/K3R 并入中位数），QEMU vCPU 线程"
         echo "  宿主侧绑核，抑制同二进制启动间漂移（实测可达 10%+）"
-        echo "- K2 < K0（负 delta）→ INVALID：加开销工具不可能反向提升，"
+        echo "- K2 模式已移除（20260817）：与 K3 同 bzImage 且 bench 阶段一致，"
+        echo "  dump 在 bench 之后执行不干扰，K3 即最坏情形口径"
+        echo "- K3 < K0（负 delta）→ INVALID：加开销工具不可能反向提升，"
         echo "  负值说明测量被噪声主导，建议重跑"
         echo "- |Δ| 低于启动间噪声地板（同二进制启动对 |Δ| 的最大值）→ INVALID："
         echo "  差异不可分辨于启动漂移"
@@ -537,7 +547,6 @@ write_summary_files() {
         echo "  数量级吻合，用于把微基准差值归因到 hook 开销"
         echo "- K3 dump_per_call_us 为 info：含 fork+exec 的全量导出 wall time"
         echo "  （空 socket 表口径）"
-        echo "- K3 未运行时显示 \"-\""
     } > "$SUMMARY_MD"
 
     echo "摘要报告:"
@@ -549,21 +558,19 @@ compare_and_report() {
     log_section "Performance Comparison Report"
 
     local k0_file="$LOG_DIR/perf-K0-${TIMESTAMP}.log"
-    local k2_file="$LOG_DIR/perf-K2-${TIMESTAMP}.log"
-    # K0R/K2R：交错重复启动（20260817），结果并入 K0/K2 中位数，
-    # 且 (K0,K0R)/(K2,K2R) 构成同二进制启动对，参与噪声地板估计
-    local k0r_file="" k2r_file=""
+    local k3_file="$LOG_DIR/perf-K3-${TIMESTAMP}.log"
+    # K0R/K3R：交错重复启动（20260817），结果并入 K0/K3 中位数，
+    # 且 (K0,K0R)/(K3,K3R) 构成同二进制启动对，参与噪声地板估计
+    local k0r_file="" k3r_file=""
     [ -f "$LOG_DIR/perf-K0R-${TIMESTAMP}.log" ] && k0r_file="$LOG_DIR/perf-K0R-${TIMESTAMP}.log"
-    [ -f "$LOG_DIR/perf-K2R-${TIMESTAMP}.log" ] && k2r_file="$LOG_DIR/perf-K2R-${TIMESTAMP}.log"
-    local k3_file=""
-    [ -f "$LOG_DIR/perf-K3-${TIMESTAMP}.log" ] && k3_file="$LOG_DIR/perf-K3-${TIMESTAMP}.log"
-    # K0B（B5/B6 噪声地板）：同 OFF 内核在批次末尾再跑一遍，
+    [ -f "$LOG_DIR/perf-K3R-${TIMESTAMP}.log" ] && k3r_file="$LOG_DIR/perf-K3R-${TIMESTAMP}.log"
+    # K0B：同 OFF 内核在批次末尾再跑一遍，
     # K0(首) vs K0B(尾) 差值 = 时段漂移 + 测量噪声的合成下界
     local k0b_file=""
     [ -f "$LOG_DIR/perf-K0B-${TIMESTAMP}.log" ] && k0b_file="$LOG_DIR/perf-K0B-${TIMESTAMP}.log"
 
-    if [ ! -f "$k0_file" ] || [ ! -f "$k2_file" ]; then
-        echo "${RED}Missing result files (K0/K2)${NC}"
+    if [ ! -f "$k0_file" ] || [ ! -f "$k3_file" ]; then
+        echo "${RED}Missing result files (K0/K3)${NC}"
         PERF_EXIT=1
         return 1
     fi
@@ -572,66 +579,66 @@ compare_and_report() {
     # 键格式: "${mode}|${metric}_vals"，值为空格分隔的多次运行结果
     declare -A values
     # 摘要表存储：按 metric 存各列，verdict 段回填 threshold/verdict 后统一生成摘要行
-    declare -A SUM_UNIT SUM_RAW0 SUM_RAW2 SUM_RAW3 SUM_MED0 SUM_MED2 SUM_MED3
-    declare -A SUM_D02 SUM_D03 SUM_D23 VERDICTS THRESHOLDS
+    declare -A SUM_UNIT SUM_RAW0 SUM_RAW3 SUM_MED0 SUM_MED3
+    declare -A SUM_D03 VERDICTS THRESHOLDS
 
-    local mode metric val
+    local mode metric val dropped=0
     while IFS='|=' read -r mode metric val; do
         # 跳过 SKIP 值，不参与中位数计算
         [ "$val" = "SKIP" ] && continue
         [ -z "$val" ] && continue
+        # 串口污染防护（run#179 实证）：启动初期内核 console 消息会拼进
+        # PERF 行（"2240[ 3.87] input: ..."），非纯数值样本丢弃并计数告警
+        if ! printf '%s' "$val" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+            dropped=$((dropped+1))
+            continue
+        fi
         values["${mode}|${metric}_vals"]="${values[${mode}|${metric}_vals]:+${values[${mode}|${metric}_vals]} }$val"
     done < <(
         parse_results "$k0_file" K0
         [ -n "$k0r_file" ] && parse_results "$k0r_file" K0
-        parse_results "$k2_file" K2
-        [ -n "$k2r_file" ] && parse_results "$k2r_file" K2
-        [ -n "$k3_file" ] && parse_results "$k3_file" K3
+        parse_results "$k3_file" K3
+        [ -n "$k3r_file" ] && parse_results "$k3r_file" K3
         [ -n "$k0b_file" ] && parse_results "$k0b_file" K0B
     )
+    if [ "$dropped" -gt 0 ]; then
+        echo "${YELLOW}WARNING: dropped ${dropped} corrupted (non-numeric) PERF samples — serial console interleaving${NC}"
+    fi
 
     # 模式检测（PERF: mode= 和 PERF: query_mode=）
-    local k0_mode k2_mode k3_mode k0_qmode k2_qmode k3_qmode k0b_mode
+    local k0_mode k3_mode k0_qmode k3_qmode k0b_mode
     k0_mode=$(grep "^PERF: mode=" "$k0_file" | head -1 | cut -d= -f2 | tr -d '\r')
-    k2_mode=$(grep "^PERF: mode=" "$k2_file" | head -1 | cut -d= -f2 | tr -d '\r')
+    k3_mode=$(grep "^PERF: mode=" "$k3_file" | head -1 | cut -d= -f2 | tr -d '\r')
     k0_qmode=$(grep "^PERF: query_mode=" "$k0_file" | head -1 | cut -d= -f2 | tr -d '\r')
-    k2_qmode=$(grep "^PERF: query_mode=" "$k2_file" | head -1 | cut -d= -f2 | tr -d '\r')
-    if [ -n "$k3_file" ]; then
-        k3_mode=$(grep "^PERF: mode=" "$k3_file" | head -1 | cut -d= -f2 | tr -d '\r')
-        k3_qmode=$(grep "^PERF: query_mode=" "$k3_file" | head -1 | cut -d= -f2 | tr -d '\r')
-    fi
+    k3_qmode=$(grep "^PERF: query_mode=" "$k3_file" | head -1 | cut -d= -f2 | tr -d '\r')
     if [ -n "$k0b_file" ]; then
         k0b_mode=$(grep "^PERF: mode=" "$k0b_file" | head -1 | cut -d= -f2 | tr -d '\r')
         if [ "$k0b_mode" != "OFF" ]; then
             echo "${YELLOW}WARNING: K0B kernel log reports mode='${k0b_mode}', expected 'OFF' (noise floor invalid)${NC}"
         fi
     fi
-    local k0r_mode k2r_mode
+    local k0r_mode k3r_mode
     if [ -n "$k0r_file" ]; then
         k0r_mode=$(grep "^PERF: mode=" "$k0r_file" | head -1 | cut -d= -f2 | tr -d '\r')
         if [ "$k0r_mode" != "OFF" ]; then
             echo "${YELLOW}WARNING: K0R kernel log reports mode='${k0r_mode}', expected 'OFF'${NC}"
         fi
     fi
-    if [ -n "$k2r_file" ]; then
-        k2r_mode=$(grep "^PERF: mode=" "$k2r_file" | head -1 | cut -d= -f2 | tr -d '\r')
-        if [ "$k2r_mode" != "ON" ]; then
-            echo "${YELLOW}WARNING: K2R kernel log reports mode='${k2r_mode}', expected 'ON'${NC}"
+    if [ -n "$k3r_file" ]; then
+        k3r_mode=$(grep "^PERF: mode=" "$k3r_file" | head -1 | cut -d= -f2 | tr -d '\r')
+        if [ "$k3r_mode" != "ON" ]; then
+            echo "${YELLOW}WARNING: K3R kernel log reports mode='${k3r_mode}', expected 'ON'${NC}"
         fi
     fi
 
     echo "K0: mode=$k0_mode query=$k0_qmode"
-    echo "K2: mode=$k2_mode query=$k2_qmode"
-    [ -n "$k3_file" ] && echo "K3: mode=$k3_mode query=$k3_qmode"
+    echo "K3: mode=$k3_mode query=$k3_qmode"
 
     # mode sanity check：确认 QEMU 输出与预期一致
     if [ "$k0_mode" != "OFF" ]; then
         echo "${YELLOW}WARNING: K0 kernel log reports mode='${k0_mode}', expected 'OFF'${NC}"
     fi
-    if [ "$k2_mode" != "ON" ]; then
-        echo "${YELLOW}WARNING: K2 kernel log reports mode='${k2_mode}', expected 'ON'${NC}"
-    fi
-    if [ -n "$k3_file" ] && [ "$k3_mode" != "ON" ]; then
+    if [ "$k3_mode" != "ON" ]; then
         echo "${YELLOW}WARNING: K3 kernel log reports mode='${k3_mode}', expected 'ON'${NC}"
     fi
     echo ""
@@ -673,7 +680,7 @@ compare_and_report() {
 
     # 构建要显示的指标列表（20260816 方案重建后的指标集）
     # 格式: "metric:unit:direction"，direction: increase/abs
-    #   bench_*：Perf-A 微基准，verdict 主判定（increase，K2>K0 = 更差）
+    #   bench_*：Perf-A 微基准，verdict 主判定（increase，K3>K0 = 更差）
     #   ftrace_*：Perf-B 对账，info（Δns/op ≈ hooks_per_op × hook_ns 的锚点）
     #   dump_*：Perf-D K3 导出计时，info
     #   sock_objsize：Perf-C slab，确定性判定
@@ -682,12 +689,10 @@ compare_and_report() {
     table_metrics+=("bench_tcprw_ns_per_op:ns/op:increase")
     table_metrics+=("sock_objsize_bytes:bytes:abs")
     # ftrace 对账指标仅 ON 内核产出（K0/OFF 无符号），列存在即显示
-    if [ -n "${values[K2|ftrace_hooks_per_op_vals]:-}" ] || \
-       [ -n "${values[K3|ftrace_hooks_per_op_vals]:-}" ]; then
+    if [ -n "${values[K3|ftrace_hooks_per_op_vals]:-}" ]; then
         table_metrics+=("ftrace_hooks_per_op:hooks:info")
     fi
-    if [ -n "${values[K2|ftrace_hook_ns_p50_vals]:-}" ] || \
-       [ -n "${values[K3|ftrace_hook_ns_p50_vals]:-}" ]; then
+    if [ -n "${values[K3|ftrace_hook_ns_p50_vals]:-}" ]; then
         table_metrics+=("ftrace_hook_ns_p50:ns:info")
     fi
     # K3 dump 计时（含 fork+exec 口径）
@@ -696,13 +701,12 @@ compare_and_report() {
     fi
 
     # ---- 打印对比表 + 收集摘要行 ----
-    # 摘要行格式（tab 分隔 13 列）:
-    # metric unit k0_raw k2_raw k3_raw k0_med k2_med k3_med delta_k0k2 delta_k0k3 delta_k2k3 threshold verdict
+    # 摘要行格式（tab 分隔 9 列）:
+    # metric unit k0_raw k3_raw k0_med k3_med delta_k0k3 threshold verdict
     local SUMMARY_ROWS=""
     local entry m_metric m_unit m_dir
-    local k0_med k2_med k3_med k0_raw k2_raw k3_raw
-    local d_k0k2 d_k0k3 d_k2k3
-    local k3_disp
+    local k0_med k3_med k0_raw k3_raw
+    local d_k0k3
 
     for entry in "${table_metrics[@]}"; do
         m_metric="${entry%%:*}"
@@ -711,32 +715,12 @@ compare_and_report() {
         m_dir="${_rest##*:}"
 
         k0_raw=$(_raw_of K0 "$m_metric")
-        k2_raw=$(_raw_of K2 "$m_metric")
+        k3_raw=$(_raw_of K3 "$m_metric")
         k0_med=$(_med_of K0 "$m_metric")
-        k2_med=$(_med_of K2 "$m_metric")
-
-        if [ -n "$k3_file" ]; then
-            k3_raw=$(_raw_of K3 "$m_metric")
-            k3_med=$(_med_of K3 "$m_metric")
-            k3_disp="${k3_med:--}"
-        else
-            k3_raw="-"
-            k3_med=""
-            k3_disp="-"
-        fi
+        k3_med=$(_med_of K3 "$m_metric")
 
         # 计算 deltas
-        if [ -n "$k0_med" ] && [ -n "$k2_med" ]; then
-            if [ "$m_dir" = "abs" ]; then
-                d_k0k2=$(calc_delta_abs "$k0_med" "$k2_med")
-            else
-                d_k0k2=$(calc_delta_pct "$m_metric" "$k0_med" "$k2_med")
-            fi
-        else
-            d_k0k2="-"
-        fi
-
-        if [ -n "$k3_file" ] && [ -n "$k0_med" ] && [ -n "$k3_med" ]; then
+        if [ -n "$k0_med" ] && [ -n "$k3_med" ]; then
             if [ "$m_dir" = "abs" ]; then
                 d_k0k3=$(calc_delta_abs "$k0_med" "$k3_med")
             else
@@ -746,47 +730,25 @@ compare_and_report() {
             d_k0k3="-"
         fi
 
-        if [ -n "$k3_file" ] && [ -n "$k2_med" ] && [ -n "$k3_med" ]; then
-            if [ "$m_dir" = "abs" ]; then
-                d_k2k3=$(calc_delta_abs "$k2_med" "$k3_med")
-            else
-                d_k2k3=$(calc_delta_pct "$m_metric" "$k2_med" "$k3_med")
-            fi
-        else
-            d_k2k3="-"
-        fi
-
-        # 显示值（中位数为空则 SKIP）
-        local k0_disp k2_disp
-        k0_disp="${k0_med:-SKIP}"
-        k2_disp="${k2_med:-SKIP}"
-
-        # verdict 占位（实际 verdict 在下方按 K0→K2 计算；非 verdict 指标显示 info）
-        # 控制台行延后到 verdict 段后统一打印，此处只存摘要数组
-
         # 存入摘要数组：threshold/verdict 在 verdict 段回填，最后统一生成摘要行
         SUM_UNIT[$m_metric]="$m_unit"
         SUM_RAW0[$m_metric]="$k0_raw"
-        SUM_RAW2[$m_metric]="$k2_raw"
         SUM_RAW3[$m_metric]="$k3_raw"
-        SUM_MED0[$m_metric]="$k0_disp"
-        SUM_MED2[$m_metric]="$k2_disp"
-        SUM_MED3[$m_metric]="$k3_disp"
-        SUM_D02[$m_metric]="$d_k0k2"
+        SUM_MED0[$m_metric]="${k0_med:-SKIP}"
+        SUM_MED3[$m_metric]="${k3_med:-SKIP}"
         SUM_D03[$m_metric]="$d_k0k3"
-        SUM_D23[$m_metric]="$d_k2k3"
     done
 
     # ---- 启动间噪声地板（多对同二进制估计，20260817）----
     # 同二进制启动对的 |Δ| = QEMU 线程放置 + 时段漂移 + 测量噪声。
     # 单对估不准：run#178 K0↔K0B=1% 而 K2↔K3=13%（同为同二进制对），
-    # 取所有可用对的最大值作为地板（保守上界）。verdict 中 |K0→K2 Δ|
+    # 取所有可用对的最大值作为地板（保守上界）。verdict 中 |K0→K3 Δ|
     # 低于地板 → INVALID（差异不可分辨于启动漂移）。
     declare -A FLOOR FLOOR_DETAIL
     local pf_m pf_a pf_b pf_d pf_max pf_detail pf_fa pf_fb pf_lbl
     for pf_m in bench_udp64_ns_per_op bench_tcprw_ns_per_op; do
         pf_max=""; pf_detail=""
-        # 四个同二进制启动对（K2R↔K3 相邻且同为 ON；K0↔K0B 覆盖首尾长程漂移）
+        # 三个同二进制启动对（K0↔K0B 覆盖首尾长程漂移）
         while IFS='|' read -r pf_fa pf_fb pf_lbl; do
             [ -z "$pf_lbl" ] && continue
             pf_a=$(_file_med "$pf_fa" "$pf_m")
@@ -801,8 +763,7 @@ compare_and_report() {
             fi
         done <<EOF
 ${k0_file}|${k0r_file}|K0-K0R
-${k2_file}|${k2r_file}|K2-K2R
-${k2r_file}|${k3_file}|K2R-K3
+${k3_file}|${k3r_file}|K3-K3R
 ${k0_file}|${k0b_file}|K0-K0B
 EOF
         FLOOR[$pf_m]="${pf_max:-}"
@@ -811,34 +772,34 @@ EOF
 
     echo ""
     echo "Pass criteria (initial, subject to noise-floor calibration):"
-    echo "  Perf-A bench UDP64 ns/op increase (K0→K2):  < 25%"
-    echo "  Perf-A bench TCP rw ns/op increase (K0→K2):  < 25%"
+    echo "  Perf-A bench UDP64 ns/op increase (K0→K3):  < 25%"
+    echo "  Perf-A bench TCP rw ns/op increase (K0→K3):  < 25%"
     echo "  Perf-C Per-socket memory:                    <= 192 bytes (slab-aligned, raw struct ~72B)"
     echo "  (ftrace 对账: Δns/op ≈ hooks_per_op × hook_ns_p50，info 级不判定)"
     echo ""
 
     # ---- 自动判定（三态：PASS / FAIL / INVALID）----
-    # verdict 基于 K0→K2 为主判定（与现有 ON/OFF 对比行为一致）
-    # net_delayacct 是加开销工具，K2 合法优于 K0 不可能；若 K2 反超 K0
+    # verdict 基于 K0→K3 为主判定（K3 = ON 内核最坏情形：插桩 + dump）
+    # net_delayacct 是加开销工具，K3 合法优于 K0 不可能；若 K3 反超 K0
     # （degradation<0）说明测量被噪声主导 → INVALID（非 FAIL，避免误报回归方向）。
-    # degradation 统一约定：正值=K2 更差（预期方向），负值=K2 更优（噪声）。
+    # degradation 统一约定：正值=K3 更差（预期方向），负值=K3 更优（噪声）。
     # 20260817：|Δ| 低于启动间噪声地板也 → INVALID（差异不可分辨于启动漂移）
-    echo "Verdict (K0 → K2 primary):"
+    echo "Verdict (K0 → K3 primary):"
     local verdict_pass=0 verdict_fail=0 verdict_invalid=0 verdict_skip=0 status
-    local v_m v_t v_dir v_unit v_k0 v_k2 v_k0m v_k2m v_drop v_delta_abs
+    local v_m v_t v_dir v_unit v_k0 v_k3 v_k0m v_k3m v_drop v_delta_abs
     local v_floor v_below_floor
 
-    # Perf-A 微基准：degradation = (K2-K0)/K0*100，阈值 25%（初始值）。
+    # Perf-A 微基准：degradation = (K3-K0)/K0*100，阈值 25%（初始值）。
     # 理论 hook 开销在 64B 路径 ~5-20%（单次 hook ~50-150ns × 4 次 /
     # 单循环 2-5us）；阈值待启动间噪声地板数据积累后收紧
     for v_entry in "bench_udp64_ns_per_op:25" "bench_tcprw_ns_per_op:25"; do
         IFS=':' read -r v_m v_t <<< "$v_entry"
         THRESHOLDS[$v_m]="${v_t}%"
-        v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
-        if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
-            v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
-            v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_k2m}-${v_k0m})/${v_k0m}*100}")
-            v_delta_abs=$(awk "BEGIN {printf \"%.2f\", ${v_k2m}-${v_k0m}}")
+        v_k0="${values[K0|${v_m}_vals]:-}"; v_k3="${values[K3|${v_m}_vals]:-}"
+        if [ -n "$v_k0" ] && [ -n "$v_k3" ]; then
+            v_k0m=$(_median "$v_k0"); v_k3m=$(_median "$v_k3")
+            v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_k3m}-${v_k0m})/${v_k0m}*100}")
+            v_delta_abs=$(awk "BEGIN {printf \"%.2f\", ${v_k3m}-${v_k0m}}")
             v_floor="${FLOOR[$v_m]:-}"
             v_below_floor=false
             if [ -n "$v_floor" ]; then
@@ -857,7 +818,7 @@ EOF
                     if [ "$v_below_floor" = true ]; then
                         echo "  ${YELLOW}INVALID${NC} $v_m: +${v_drop}% below launch-to-launch noise floor ${v_floor}% (indistinguishable from drift, rerun)"
                     else
-                        echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"
+                        echo "  ${YELLOW}INVALID${NC} $v_m: K3<K0 by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"
                     fi
                     verdict_invalid=$((verdict_invalid+1));;
             esac
@@ -876,15 +837,15 @@ EOF
     #   Δns/op(实测) ≈ hooks_per_op × hook_ns_p50(单次)
     # 数量级吻合则微基准差值可归因到 hook，不吻合提示测量异常
     local ft_hooks ft_ns ft_delta b_delta
-    ft_hooks="${values[K2|ftrace_hooks_per_op_run1_vals]:-}${values[K3|ftrace_hooks_per_op_run1_vals]:-}"
+    ft_hooks="${values[K3|ftrace_hooks_per_op_run1_vals]:-}"
     ft_hooks=$(printf '%s' "$ft_hooks" | awk '{print $1}')
-    ft_ns="${values[K2|ftrace_hook_ns_p50_run1_vals]:-}${values[K3|ftrace_hook_ns_p50_run1_vals]:-}"
+    ft_ns="${values[K3|ftrace_hook_ns_p50_run1_vals]:-}"
     ft_ns=$(printf '%s' "$ft_ns" | awk '{print $1}')
     v_k0m=$(_med_of K0 bench_udp64_ns_per_op)
-    v_k2m=$(_med_of K2 bench_udp64_ns_per_op)
-    if [ -n "$ft_hooks" ] && [ -n "$ft_ns" ] && [ -n "$v_k0m" ] && [ -n "$v_k2m" ]; then
+    v_k3m=$(_med_of K3 bench_udp64_ns_per_op)
+    if [ -n "$ft_hooks" ] && [ -n "$ft_ns" ] && [ -n "$v_k0m" ] && [ -n "$v_k3m" ]; then
         ft_delta=$(awk -v h="$ft_hooks" -v n="$ft_ns" 'BEGIN {printf "%.0f", h * n}')
-        b_delta=$(awk -v a="$v_k0m" -v b="$v_k2m" 'BEGIN {printf "%.0f", b - a}')
+        b_delta=$(awk -v a="$v_k0m" -v b="$v_k3m" 'BEGIN {printf "%.0f", b - a}')
         echo ""
         echo "  ftrace cross-check (UDP64): measured Δ=${b_delta} ns/op, predicted ≈ hooks/op(${ft_hooks}) × ${ft_ns}ns = ${ft_delta} ns/op"
         # 实测为负（加开销工具反向变快）= 启动漂移压过 hook 信号的直接证据
@@ -893,29 +854,28 @@ EOF
         fi
     fi
 
-    # Perf-4 每 socket 内存：degradation = K2-K0 (bytes)，阈值 192
+    # Perf-C 每 socket 内存：degradation = K3-K0 (bytes)，阈值 192
     # 阈值 192 = 72(struct net_delayacct) + 56(SLAB_HWCACHE_ALIGN 64B 对齐填充) + 64(余量)
     # /proc/slabinfo 第 4 列是 s->size（含 64 字节缓存行对齐），非 s->object_size（原始 struct）
     # TCP slab 用 SLAB_HWCACHE_ALIGN（tcp.c kmem_cache_create），ON struct 增加 72B 后
     # 跨 64B 边界 → 对齐填充 56B → slab delta 128B。原始 struct 开销仅 72B（<= 80 理论阈值）。
     v_m="sock_objsize_bytes"; v_t=192
     THRESHOLDS[$v_m]="${v_t}B"
-    local k0_sock k2_sock k3_sock
+    local k0_sock k3_sock
     # tr -d '\r': QEMU 串口输出为 \r\n，提取的值末尾带 \r 会导致
     # grep -qE '^[0-9]+$' 失败，内存 delta 误显示为 "-"
-    k0_sock=$(grep "^PERF: sock_objsize_bytes_run1=" "$k0_file" | head -1 | cut -d= -f2 | tr -d '\r')
-    k2_sock=$(grep "^PERF: sock_objsize_bytes_run1=" "$k2_file" | head -1 | cut -d= -f2 | tr -d '\r')
-    if [ -n "$k3_file" ]; then
-        k3_sock=$(grep "^PERF: sock_objsize_bytes_run1=" "$k3_file" | head -1 | cut -d= -f2 | tr -d '\r')
-    fi
-    if [ -n "$k0_sock" ] && [ -n "$k2_sock" ] && \
-       echo "$k0_sock" | grep -qE '^[0-9]+$' && echo "$k2_sock" | grep -qE '^[0-9]+$'; then
-        v_drop=$((k2_sock - k0_sock))
+    # grep -oE '^PERF: sock_objsize_bytes_run1=[0-9]+': 只取数值前缀，
+    # 防串口污染（run#179: "2240[ 3.87] input: ..." 拼接内核日志）
+    k0_sock=$(grep -oE "^PERF: sock_objsize_bytes_run1=[0-9]+" "$k0_file" | head -1 | cut -d= -f2 | tr -d '\r')
+    k3_sock=$(grep -oE "^PERF: sock_objsize_bytes_run1=[0-9]+" "$k3_file" | head -1 | cut -d= -f2 | tr -d '\r')
+    if [ -n "$k0_sock" ] && [ -n "$k3_sock" ] && \
+       echo "$k0_sock" | grep -qE '^[0-9]+$' && echo "$k3_sock" | grep -qE '^[0-9]+$'; then
+        v_drop=$((k3_sock - k0_sock))
         status=$(_verdict3 "$v_drop" "$v_t")
         case "$status" in
             PASS)    echo "  ${GREEN}PASS${NC} sock_objsize: +${v_drop} bytes <= ${v_t} threshold (raw struct ~72B + slab align)"; verdict_pass=$((verdict_pass+1));;
             FAIL)    echo "  ${RED}FAIL${NC} sock_objsize: +${v_drop} bytes > ${v_t} threshold"; verdict_fail=$((verdict_fail+1));;
-            INVALID) echo "  ${YELLOW}INVALID${NC} sock_objsize: K2<K0 (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
+            INVALID) echo "  ${YELLOW}INVALID${NC} sock_objsize: K3<K0 (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
         esac
     else
         status="SKIP"
@@ -924,9 +884,8 @@ EOF
     fi
     VERDICTS[$v_m]="$status"
 
-    # ---- 信息性指标（K0→K3 / K2→K3，不影响 verdict）----
-    # 新方案 K3 的导出开销直接由 Perf-D dump_per_call_us 量化，
-    # 对比表中已含 K0→K3 / K2→K3 列，此处不再重复输出
+    # ---- 信息性指标（ftrace/dump，不影响 verdict）----
+    # K3 的导出开销直接由 Perf-D dump_per_call_us 量化，对比表中已含列
 
     # ---- 总结论（优先级：FAIL > INVALID(视strict) > NO-DATA > PASS）----
     # exit code: 0=PASS/warn通过, 1=FAIL(strict=fail)/INVALID(strict=fail), 2=数据不可信(全SKIP或INVALID>50%)
@@ -987,26 +946,25 @@ EOF
     echo ""
     echo "Note: QEMU relative values only. For absolute data, run on physical hardware."
     echo "Note: Thresholds are initial values, subject to calibration with multiple runs."
-    echo "Full logs: $LOG_DIR/perf-{K0,K0R,K2,K2R,K3,K0B}-${TIMESTAMP}.log"
+    echo "Full logs: $LOG_DIR/perf-{K0,K0R,K3,K3R,K0B}-${TIMESTAMP}.log"
 
     # ---- 打印对比表（verdict 计算完成后，回填真实 Thresh/Verdict）----
     echo ""
-    echo "+----------------------------------------------------------------------------------------+"
-    echo "|          NET_DELAYACCT Performance Comparison (K0 vs K2 vs K3)                          |"
-    echo "+----------------------------------------------------------------------------------------+"
-    printf "| %-26s | %8s | %8s | %8s | %8s | %8s | %8s | %8s | %-6s |\n" \
-        "Metric" "K0" "K2" "K3" "K0→K2" "K0→K3" "K2→K3" "Thresh" "Verdict"
-    echo "+----------------------------------------------------------------------------------------+"
+    echo "+--------------------------------------------------------------------------+"
+    echo "|          NET_DELAYACCT Performance Comparison (K0 vs K3)                 |"
+    echo "+--------------------------------------------------------------------------+"
+    printf "| %-26s | %9s | %9s | %9s | %7s | %-6s |\n" \
+        "Metric" "K0" "K3" "K0→K3" "Thresh" "Verdict"
+    echo "+--------------------------------------------------------------------------+"
     local entry _t_metric
     for entry in "${table_metrics[@]}"; do
         _t_metric="${entry%%:*}"
-        printf "| %-26s | %8s | %8s | %8s | %8s | %8s | %8s | %8s | %-6s |\n" \
-            "$_t_metric" "${SUM_MED0[$_t_metric]:-SKIP}" "${SUM_MED2[$_t_metric]:-SKIP}" \
-            "${SUM_MED3[$_t_metric]:--}" \
-            "${SUM_D02[$_t_metric]:- -}" "${SUM_D03[$_t_metric]:- -}" "${SUM_D23[$_t_metric]:- -}" \
+        printf "| %-26s | %9s | %9s | %9s | %7s | %-6s |\n" \
+            "$_t_metric" "${SUM_MED0[$_t_metric]:-SKIP}" "${SUM_MED3[$_t_metric]:-SKIP}" \
+            "${SUM_D03[$_t_metric]:--}" \
             "${THRESHOLDS[$_t_metric]:--}" "${VERDICTS[$_t_metric]:-info}"
     done
-    echo "+----------------------------------------------------------------------------------------+"
+    echo "+--------------------------------------------------------------------------+"
     echo ""
 
     # 生成结构化摘要报告（Markdown + CSV）
@@ -1014,9 +972,9 @@ EOF
     SUMMARY_ROWS=""
     for entry in "${table_metrics[@]}"; do
         m_metric="${entry%%:*}"
-        SUMMARY_ROWS+="${m_metric}	${SUM_UNIT[$m_metric]}	${SUM_RAW0[$m_metric]}	${SUM_RAW2[$m_metric]}	${SUM_RAW3[$m_metric]}	${SUM_MED0[$m_metric]}	${SUM_MED2[$m_metric]}	${SUM_MED3[$m_metric]}	${SUM_D02[$m_metric]}	${SUM_D03[$m_metric]}	${SUM_D23[$m_metric]}	${THRESHOLDS[$m_metric]:--}	${VERDICTS[$m_metric]:-info}"$'\n'
+        SUMMARY_ROWS+="${m_metric}	${SUM_UNIT[$m_metric]}	${SUM_RAW0[$m_metric]}	${SUM_RAW3[$m_metric]}	${SUM_MED0[$m_metric]}	${SUM_MED3[$m_metric]}	${SUM_D03[$m_metric]}	${THRESHOLDS[$m_metric]:--}	${VERDICTS[$m_metric]:-info}"$'\n'
     done
-    write_summary_files "$SUMMARY_ROWS" "$k0_mode" "$k2_mode" "${k3_mode:--}"
+    write_summary_files "$SUMMARY_ROWS" "$k0_mode" "${k3_mode:--}"
 
     # ---- 噪声地板节（多对同二进制启动，20260817）----
     # 每对 = 同一 bzImage 的两次 QEMU 启动，|Δ| = 启动放置 + 时段漂移 +
@@ -1049,11 +1007,11 @@ EOF
             printf "| %-26s | %-46s | %6s%% | %5s%% | %-6s |\n" \
                 "$nf_metric" "${FLOOR_DETAIL[$nf_metric]:--}" "$nf_floor" "$nf_thr" "$nf_ok"
             floor_md+="| ${nf_metric} | ${FLOOR_DETAIL[$nf_metric]:--} | ${nf_floor}% | ${nf_thr}% | ${nf_ok} |"$'\n'
-            floor_csv+="${nf_metric}__noise_floor	${SUM_UNIT[$nf_metric]:--}	${FLOOR_DETAIL[$nf_metric]:--}	-	-	-	-	-	-	${nf_floor}%	-	-	${nf_thr}%	FLOOR"$'\n'
+            floor_csv+="${nf_metric}__noise_floor	${SUM_UNIT[$nf_metric]:--}	${FLOOR_DETAIL[$nf_metric]:--}	-	-	-	${nf_floor}%	${nf_thr}%	FLOOR"$'\n'
         done
         echo "+----------------------------------------------------------------------------------------------------------+"
-        echo "Note: NOISY = floor >= threshold -> K0->K2 verdict for this metric is noise-dominated."
-        echo "Note: verdict already treats |K0->K2 delta| < floor as INVALID (indistinguishable from launch drift)."
+        echo "Note: NOISY = floor >= threshold -> K0->K3 verdict for this metric is noise-dominated."
+        echo "Note: verdict already treats |K0->K3 delta| < floor as INVALID (indistinguishable from launch drift)."
         echo ""
 
         # 追加到 Markdown / CSV 摘要
@@ -1085,9 +1043,6 @@ while [[ $# -gt 0 ]]; do
         --skip-build)
             SKIP_BUILD=true
             ;;
-        --with-k3)
-            WITH_K3=true
-            ;;
         --runs=*)
             PERF_RUNS="${1#--runs=}"
             ;;
@@ -1113,14 +1068,11 @@ Usage: $0 [OPTIONS]
 
 模式说明:
   K0: OFF 内核（CONFIG_NET_DELAYACCT=n）— 基线
-  K2: ON 内核，检测开启，无主动查询（纯插桩开销）
-  K3: ON 内核，检测开启 + 主动查询（导出开销，需 get_sockdelays）
-
-默认运行 K0 vs K2；--with-k3 额外运行 K3。
+  K3: ON 内核，检测开启 + dump 导出计时（最坏情形，需 get_sockdelays）
+  （K2 已移除 20260817：与 K3 同 bzImage 且 bench 阶段一致，纯冗余）
 
 Options:
   --skip-build              复用已有 bzImage-on/off（不重新构建内核）
-  --with-k3                 额外运行 K3 模式（ON 内核 + 主动查询）
   --runs=N                  bench-net 每项测试轮数（默认 5，每轮自动校准 ~1s）
   --strict                  INVALID 视作 FAIL 阻断（等同 --strict=fail）
   --strict=warn             INVALID 告警不阻断，但 >50% 时 exit 2（默认）
@@ -1135,11 +1087,8 @@ Exit codes:
   2 = 数据不可信（全 SKIP 或 INVALID > 50%）
 
 Examples:
-  # 默认：K0 vs K2
+  # K0 vs K3（默认）
   $0 --skip-build --strict=warn
-
-  # 三版本对比：K0 vs K2 vs K3
-  $0 --skip-build --with-k3
 EOF
             exit 0
             ;;
@@ -1155,7 +1104,7 @@ done
     echo "=== NET_DELAYACCT Performance Test $(date) ==="
     echo "Linux source: $LINUX_SRC"
     echo "Log dir: $LOG_DIR"
-    echo "Modes: K0 (OFF) + K2 (ON, no query)$([ "$WITH_K3" = true ] && echo " + K3 (ON, with query)")"
+    echo "Modes: K0 (OFF) + K3 (ON, with dump query)"
     echo "Bench runs per metric: $PERF_RUNS (auto-calibrated ~1s each)"
     echo ""
 
@@ -1188,8 +1137,8 @@ done
     # "每次 QEMU 启动"的宿主放置差异（QEMU vCPU 线程被 VM 调度器随机
     # 放置到不同 VM CPU/物理核）。对策：
     #   1) 宿主侧绑核（下方 PERF_PIN_CPU）：所有启动用同一 CPU
-    #   2) 交错重复：K0/K2 各启动 2 次，时漂对两者等权；K0R/K2R 结果
-    #      并入 K0/K2 参与中位数，同时提供同二进制启动对给噪声地板
+    #   2) 交错重复：K0/K3 各启动 2 次，时漂对两者等权；K0R/K3R 结果
+    #      并入 K0/K3 参与中位数，同时提供同二进制启动对给噪声地板
     # 宿主绑核 CPU 选择：online ∩ allowed 交集的最大号（避开 CPU0 的
     # IRQ/内核线程聚集），逐个降序用 taskset 试探（某些环境 status 与实际
     # 可用不一致：如 allowed=0-127 但 online 仅 0-3，绑 127 直接 EINVAL）。
@@ -1215,23 +1164,25 @@ done
         echo "NOTE: no pinnable CPU >0 (single-CPU or restricted), QEMU runs unpinned"
     fi
 
+    # WARM 预热启动（run#179 实证）：批次前 1-2 次 QEMU 启动处于慢态
+    # （tcprw 15769/15078 vs 稳定区 11073-11697，+30%），属频率/缓存预热
+    # 瞬态 → 一次 1 轮的丢弃启动吸收瞬态，正式样本全部落在稳定区。
+    # WARM 日志落盘但不参与解析/判定。
+    run_perf_in_qemu "$BZIMAGE_OFF" "WARM" "K0" 1
+    echo ""
+
     run_perf_in_qemu "$BZIMAGE_OFF" "K0" "K0"
     echo ""
-    # K2: ON 内核，检测开启，无查询
-    run_perf_in_qemu "$BZIMAGE_ON" "K2" "K2"
+    # K3: ON 内核，检测开启 + dump 导出计时（最坏情形口径）
+    run_perf_in_qemu "$BZIMAGE_ON" "K3" "K3"
     echo ""
-    # K0R/K2R: 交错重复（同二进制第二次启动，合并进 K0/K2 并构成地板对）
+    # K0R/K3R: 交错重复（同二进制第二次启动，合并进 K0/K3 并构成地板对）
     run_perf_in_qemu "$BZIMAGE_OFF" "K0R" "K0"
     echo ""
-    run_perf_in_qemu "$BZIMAGE_ON" "K2R" "K2"
+    run_perf_in_qemu "$BZIMAGE_ON" "K3R" "K3"
     echo ""
-    # K3: ON 内核，检测开启 + 主动查询（可选）
-    if [ "$WITH_K3" = true ]; then
-        run_perf_in_qemu "$BZIMAGE_ON" "K3" "K3"
-        echo ""
-    fi
     # K0B: 同 OFF 内核批次末尾再跑一遍：K0(首) vs K0B(尾) 提供首尾长程
-    # 漂移地板对（与 K0-K0R/K2-K2R/K2R-K3 一起取最大值 = 噪声地板）
+    # 漂移地板对（与 K0-K0R/K3-K3R 一起取最大值 = 噪声地板）
     run_perf_in_qemu "$BZIMAGE_OFF" "K0B" "K0"
     echo ""
 

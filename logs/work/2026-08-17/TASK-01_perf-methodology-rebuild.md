@@ -109,6 +109,75 @@ ftrace 绝对测量（v6.5.2）已锚定 hook 真实开销 = 每包 4 次 × 0.4
 2. **单对同二进制对比不是噪声地板**：K0↔K0B=1% vs K2↔K3=13%（同轮次、同性质），
    地板估计必须多对取 max（保守上界）
 
+## 批次 3：run #179 复盘 —— 冷启动瞬态 + 串口污染（同日）
+
+### run #179（1a3c182）观测
+
+- 绑核生效（6 次启动全部 pinned CPU3），但地板反而 13-25%：
+  按启动顺序 tcprw 中位数 15769 → 15078 → 11654 → 11515 → 11073 → 11697
+- **根因 1（冷启动瞬态）**：批次前 1-2 次启动偏慢 +30%（频率/缓存预热），
+  污染 K0/K2 首样本与 K0-K0R/K0-K0B 地板对；稳定区（后 4 次启动）离散仅 ~3%
+- **根因 2（串口污染）**：启动初期内核 console 日志与 PERF: 行交错拼接
+  （`sock_objsize=2240[ 3.87] input: ImExPS/2 Generic Explorer Mouse`、
+  `2368[ 4.02] sched: RT throttling activated`）→ sock_objsize K0="Generic"、K3="RT"
+- **物理结论**：稳定区 |K0-K2| ≈ 1.2-1.6%，远小于 ftrace 预测 13%（4.2×360ns）
+  → function_graph 的 360ns 含 tracer 自身开销，真实 hook 开销 ~1% 级。
+  该环境下微基准的角色 = 回归护栏（floor 门控），绝对开销以 ftrace 上界口径汇报
+
+### 修复
+
+1. **WARM 预热启动**：正式序列前一次 1 轮的丢弃启动（OFF 内核，日志落盘不解析），
+  吸收冷启动瞬态；run_perf_in_qemu 增加第 4 参 runs
+2. **guest 顺序防御**：run-perf-tests.sh 主流程改为 bench→ftrace→slab→dump
+  （slab 挪到 console 静默后，此前它排在启动后第一位，正处内核探测日志高峰）
+3. **host 解析防御**：values 累积时非纯数值样本丢弃 + 计数告警；
+  sock 提取改 `grep -oE '=[0-9]+'` 数值前缀
+4. ci.yml：timeout 40→45min（7 次 QEMU）；诊断表/artifact 加 WARM
+
+### 验证状态（批次 3）
+
+- 语法/单元：bash -n + yaml ✅；数值过滤/顺序逻辑静态走查 ✅
+- CI：待 push 后回填（预期：地板降至稳定区 ~3% 量级，verdict 可判或诚实 INVALID）
+
+## 批次 4：矩阵简化 K0/K3-only + RT 节流根因修复（同日，用户决策）
+
+### run #179 原始数据复盘（未推送前的进一步分析）
+
+- **轮内离散 10-25%**（如 K0 udp64 五轮 5352~6670）——绑核 + FIFO 后单次启动
+  内部仍然发散，说明噪声源在 runner VM 宿主层（外层 hypervisor 抢占），VM 内
+  绑核约束不到物理 CPU
+- **K0 日志实证 `sched: RT throttling activated`（[4.83s]）**：bench 的 SCHED_FIFO
+  在 loopback 上不睡眠（send 路径 softirq 已将数据入队，recv 立即返回），
+  950ms/s 配额耗尽后被强制停 50ms/s，每轮 ~1s 的测量被随机截入 5% 停顿
+  → 轮内 10-25% 离散中存在自伤成分（可消除），宿主抢占成分（不可消除）
+- 稳定区 ON vs OFF 符号仍矛盾（tcprw -3.3% / udp64 +6.2%）→ n=2 无统计意义
+
+### 用户决策与依据
+
+用户拍板"只要 K0 和 K3"。依据：K2 与 K3 本就是同一个 bzImage-on，guest 侧
+顺序 bench→ftrace→slab→dump（dump 在 bench 之后），K3 的 bench 阶段与 K2
+逐字节一致 → K2 是纯冗余启动，砍掉省 1 次 QEMU（7→6），主判定 K0→K3
+（最坏情形口径：插桩 + dump 都在的 ON 内核）。
+
+### 修复（随批次 3 一并推送）
+
+1. **矩阵简化**：WARM→K0→K3→K0R→K3R→K0B；K2/K2R 移除，--with-k3 参数移除
+  （K3 必跑，get_sockdelays 缺失时 dump 自动 SKIP）；噪声地板对改
+  K0-K0R / K3-K3R / K0-K0B；摘要表/CSV 从 13 列（K0/K2/K3 三列+三 delta）
+  收敛为 9 列（K0/K3+K0→K3）
+2. **RT 节流禁用**：guest cmdline 追加 `sysctl.kernel.sched_rt_runtime_us=-1`
+  （内核 6.6 支持 sysctl.* cmdline 参数；单用途测量 guest，卡死由 QEMU
+  timeout 兜底）——消除 bench FIFO 每秒 50ms 的强制停顿
+3. ci.yml：去 --with-k3；诊断表/artifact 改 WARM/K0/K3/K0R/K3R/K0B；
+  timeout 45→40min（6 次 QEMU）
+4. run-perf-tests.sh：QUERY_MODE 默认 K3（K2 语义随矩阵移除），注释同步
+
+### 验证状态（批次 4）
+
+- 语法：bash -n ✅
+- CI：待 push 后回填（预期：轮内离散显著收窄、地板回落、K0→K3 符号恢复正向
+  或诚实 INVALID）
+
 ## 遗留
 
 - 阈值校准：积累 5+ 轮 CI 噪声地板数据后收紧 25% 初始阈值

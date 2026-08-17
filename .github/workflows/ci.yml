@@ -520,9 +520,9 @@ jobs:
     runs-on: [self-hosted, linux, kvm]
     needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    # timeout-minutes=40: 微基准方案 6 次 QEMU（K0/K2/K0R/K2R/K3/K0B，交错重复
-    #   + 绑核抑制启动间漂移，20260817），KVM 实测单次 ~60s；TCG 上限
-    #   6×360s=36min + apt/download ~3min → 40min 封顶
+    # timeout-minutes=40: 微基准方案 6 次 QEMU（WARM 预热 + K0/K3/K0R/K3R/K0B
+    #   交错重复 + 绑核，K2 已移除——与 K3 同 bzImage 且 bench 阶段一致，纯冗余），
+    #   KVM 实测单次 ~60s；TCG 上限 6×360s=36min + apt/download ~3min → 40min 封顶
     timeout-minutes: 40
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
@@ -581,7 +581,7 @@ jobs:
           chmod +x userspace/get_sockdelays/get_sockdelays
           echo "get_sockdelays placed: $(file userspace/get_sockdelays/get_sockdelays)"
 
-      - name: Run perf-test (KVM, --strict=warn, --with-k3)
+      - name: Run perf-test (KVM, --strict=warn)
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
@@ -591,15 +591,14 @@ jobs:
           echo "=== KVM availability ==="
           ls -la /dev/kvm 2>/dev/null && echo "  /dev/kvm: exists" || echo "  /dev/kvm: not found (will fallback to TCG)"
           echo ""
-          # K0=OFF内核(基线), K2=ON内核(检测开启,无查询), K3=ON内核+主动查询
-          # --with-k3: 启用 K3 模式（需 get_sockdelays 已就位）
+          # K0=OFF内核(基线), K3=ON内核+dump查询(最坏情形)；K2 已移除(20260817)
           # --strict=warn: FAIL/INVALID 均为告警（exit 0），不阻断；
           #   仅 NO-DATA（全 SKIP）或 INVALID>50%（数据不可信）才 exit 2。
           # 20260816 方案重建：固定工作量微基准（bench-net）替代 iperf3，
           #   无 --test-duration/--warmup 参数（bench 自动校准每轮 ~1s）
           # exit code: 0=PASS/warn通过, 2=数据不可信(NO-DATA/INVALID>50%)
           #   continue-on-error 保证 exit 2 也不阻断 workflow
-          ./perf-test.sh --skip-build --with-k3 --strict=warn \
+          ./perf-test.sh --skip-build --strict=warn \
             --bzimage-on=/tmp/artifacts/on/bzImage \
             --bzimage-off=/tmp/artifacts/off/bzImage
 
@@ -612,11 +611,11 @@ jobs:
             tests/reports/perf/perf-test-*.log
             tests/reports/perf/perf-summary-*.md
             tests/reports/perf/perf-summary-*.csv
+            tests/reports/perf/perf-WARM-*.log
             tests/reports/perf/perf-K0-*.log
             tests/reports/perf/perf-K0R-*.log
-            tests/reports/perf/perf-K2-*.log
-            tests/reports/perf/perf-K2R-*.log
             tests/reports/perf/perf-K3-*.log
+            tests/reports/perf/perf-K3R-*.log
             tests/reports/perf/perf-K0B-*.log
           retention-days: 30
 
@@ -631,7 +630,7 @@ jobs:
             PERF_LOG=$(ls -t tests/reports/perf/perf-test-*.log 2>/dev/null | head -1)
             if [ -n "$PERF_LOG" ]; then
               {
-                echo "## Performance Test Results (K0 vs K2 vs K3)"
+                echo "## Performance Test Results (K0 vs K3)"
                 echo ""
                 echo "### Verdict Summary"
                 echo '```'
@@ -655,8 +654,8 @@ jobs:
               echo ""
               echo "| Mode | PERF lines | QEMU rc | Note |"
               echo "|------|-----------|---------|------|"
-              # K0R/K2R = 交错重复启动（同二进制第二次，并入 K0/K2 中位数）
-              for mode in K0 K2 K0R K2R K3 K0B; do
+              # WARM = 预热启动（不参与判定）；K0R/K3R = 交错重复启动（并入 K0/K3）
+              for mode in WARM K0 K3 K0R K3R K0B; do
                 # K3 log 可能不存在（get_sockdelays 缺失或构建失败时降级），加 || true 避免 set -e 中断 summary
                 mode_log=$(ls -t tests/reports/perf/perf-${mode}-*.log 2>/dev/null | head -1 || true)
                 [ -z "$mode_log" ] && { echo "| ${mode} | - | - | 未运行 |"; continue; }

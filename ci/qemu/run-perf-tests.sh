@@ -15,7 +15,7 @@
 #
 # 新方案四支柱：
 #   Perf-A bench-net：固定循环微基准（UDP64 自发自收 + TCP 1KB rw），
-#           绑核 + SCHED_FIFO + QEMU -smp 1，K0/K2 总耗时差 = 插桩
+#           绑核 + SCHED_FIFO + QEMU -smp 1，K0/K3 总耗时差 = 插桩
 #           开销，分辨率 ~0.1%，hook 信号在 64B 小包路径放大到 5-20%
 #   Perf-B ftrace 对账（仅 ON 内核）：hook 调用计数（function tracer，
 #           hooks_per_op = trace_count / bench_n）+ 单次 hook 耗时分布
@@ -32,14 +32,15 @@
 #
 # 环境变量:
 #   PERF_RUNS (默认 5): bench-net 轮数（每轮自动校准 ~1s）
-#   QUERY_MODE (默认 K2): K2=纯插桩, K3=附加 dump 计时
+#   QUERY_MODE (默认 K3): K3=插桩+dump 计时（K2 已随 20260817 矩阵简化移除，
+#                         dump 在 bench 之后执行，与纯插桩口径 bench 等价）
 #
 # 输出: PERF: key=value 行（host 侧 perf-test.sh 消费）
 
 set -uo pipefail
 
 RUNS="${PERF_RUNS:-5}"
-QUERY_MODE="${QUERY_MODE:-K2}"
+QUERY_MODE="${QUERY_MODE:-K3}"
 
 echo "=== NET_DELAYACCT Performance Tests (microbenchmark) ==="
 echo "Kernel: $(uname -r)"
@@ -237,9 +238,13 @@ perf_d_dump() {
 # ----------------------------------------------------------------------------
 echo "PERF: start=1"
 
-perf_c_slab 1
+# 顺序即防御（run#179 实证）：启动初期内核探测日志（PS/2、RT throttling
+# 等）仍在向 console 打印，会与早期 PERF: 行串行交错拼接
+# （"2240[ 3.872921] input: ..."），数值被污染 → slab/dump 放到
+# bench/ftrace 之后（此时 console 已静默 ~15s+）
 perf_a_bench
 perf_b_ftrace
+perf_c_slab 1
 perf_d_dump
 
 echo "PERF: end=1"
