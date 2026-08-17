@@ -512,24 +512,24 @@ jobs:
     name: Performance test (KVM, K0 vs K2 vs K3)
     # self-hosted runner（本地 VM，有 KVM 加速）
     # 注册 runner 时需加 linux + kvm 标签：./config.sh --labels linux,kvm
-    # 前置条件：VM 需安装 qemu-system-x86, iperf3, busybox-static, ncat, cpio, iproute2, libmnl0
+    # 前置条件：VM 需安装 qemu-system-x86, busybox-static, cpio, iproute2, libmnl0, gcc
     runs-on: [self-hosted, linux, kvm]
     needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    # timeout-minutes=60: self-hosted KVM 下单次 QEMU ~280s，三次 ~920s + setup < 20min
-    #   保留 60min 上限兼容 TCG 回退（KVM 不可用时 3 × 900s + setup ~2780s）
-    timeout-minutes: 60
+    # timeout-minutes=30: 微基准方案 4 次 QEMU（K0/K2/K3/K0B），KVM 实测单次 ~60s，
+    #   TCG ~150-200s；TCG 上限 4×360s=24min + apt/download ~3min → 30min 封顶
+    timeout-minutes: 30
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
     # --strict=warn 下 FAIL → exit 0（告警），仅 NO-DATA/INVALID>50% → exit 2（job 失败）。
     # continue-on-error: exit 2 时 workflow 仍 success，CI 界面显示 ⚠️
     continue-on-error: true
     env:
-      # CI 专用 QEMU timeout（每次 QEMU 运行的上限，K0/K2/K3 各一次）：
-      # KVM 360s: 内核 boot ~10s + perf 测试 ~280s（含 idle 15s + 6项测试×3轮×13s）
-      # TCG 900s: TCG 回退（无 KVM 时），-smp 2 下 boot ~120s + 测试 ~420s + 余量
-      QEMU_TIMEOUT_KVM: 360
-      QEMU_TIMEOUT_TCG: 900
+      # CI 专用 QEMU timeout（每次 QEMU 运行的上限，K0/K2/K3/K0B 各一次）：
+      # KVM 240s: boot ~10s + bench 2项×5轮×~1s + ftrace 对账 + dump ≈ 60s
+      # TCG 360s: TCG 回退（无 KVM 时），boot ~120s + 慢速 ftrace buffer 操作
+      QEMU_TIMEOUT_KVM: 240
+      QEMU_TIMEOUT_TCG: 360
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -540,7 +540,8 @@ jobs:
         run: |
           sudo apt-get update
           # libmnl0: get_sockdelays 运行时依赖，ldd 需要它才能解析并拷贝 libmnl.so.0 到 initramfs
-          sudo apt-get install -y qemu-system-x86 iperf3 busybox-static ncat cpio iproute2 libmnl0
+          # gcc: bench-net 微基准在 runner 上编译后打入 initramfs（perf-test.sh 内完成）
+          sudo apt-get install -y qemu-system-x86 busybox-static cpio iproute2 libmnl0 gcc
 
       - name: Download bzImage-on
         uses: actions/download-artifact@v4
@@ -584,14 +585,13 @@ jobs:
           # --with-k3: 启用 K3 模式（需 get_sockdelays 已就位）
           # --strict=warn: FAIL/INVALID 均为告警（exit 0），不阻断；
           #   仅 NO-DATA（全 SKIP）或 INVALID>50%（数据不可信）才 exit 2。
-          # --test-duration=10: CI 用较短时长（本地可设 60s 做完整验证）
-          # --warmup=3: iperf3 --omit 3 跳过 slow-start
+          # 20260816 方案重建：固定工作量微基准（bench-net）替代 iperf3，
+          #   无 --test-duration/--warmup 参数（bench 自动校准每轮 ~1s）
           # exit code: 0=PASS/warn通过, 2=数据不可信(NO-DATA/INVALID>50%)
           #   continue-on-error 保证 exit 2 也不阻断 workflow
           ./perf-test.sh --skip-build --with-k3 --strict=warn \
             --bzimage-on=/tmp/artifacts/on/bzImage \
-            --bzimage-off=/tmp/artifacts/off/bzImage \
-            --test-duration=10 --warmup=3
+            --bzimage-off=/tmp/artifacts/off/bzImage
 
       - name: Upload perf report
         if: always()

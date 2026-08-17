@@ -6,23 +6,28 @@
 # 对比 K0/K2/K3 三种模式的性能开销：
 #   K0: OFF 内核（CONFIG_NET_DELAYACCT=n）— 基线，无插桩开销
 #   K2: ON 内核，检测开启，无主动查询（纯插桩开销）
-#   K3: ON 内核，检测开启 + 主动查询（导出开销，需 get_sockdelays）
+#   K3: ON 内核，检测开启 + dump 导出计时（导出开销，需 get_sockdelays）
 #
-# 默认运行 K0 vs K2；--with-k3 额外运行 K3。
+# 20260816 方案重建（iperf3 速率驱动 → 固定工作量微基准）：
+# 旧方案信噪比倒挂（信号 ~1% < 噪声 5-50%，见 run-perf-tests.sh 头注释），
+# 测得 delta 无法归因。新方案：
+#   Perf-A bench-net：固定循环微基准（UDP64 + TCP 1KB rw，绑核+FIFO，
+#           -smp 1），ns/op 差值 = 插桩开销，分辨率 ~0.1%
+#   Perf-B ftrace 对账（ON 内核，info）：hooks/op × 单次耗时 与 A 交叉验证
+#   Perf-C slab objsize（确定性）
+#   Perf-D dump per-call 计时（K3）
+# 旧 iperf3 指标（吞吐/PPS/延迟百分位/CPU）全部移除。
 #
 # 流程：
 #   1. 构建 ON 内核 (CONFIG_NET_DELAYACCT=y) → bzImage-on（K2/K3 共用）
-#   2. 构建 OFF 内核 (CONFIG_NET_DELAYACCT=n) → bzImage-off（K0）
-#   3. 创建 perf initramfs（含 run-perf-tests.sh + get_sockdelays + 可选 perf）
-#   4. QEMU 启动 K0 (OFF) → 收集性能数据
-#   5. QEMU 启动 K2 (ON, QUERY_MODE=K2) → 收集性能数据
-#   6. [--with-k3] QEMU 启动 K3 (ON, QUERY_MODE=K3) → 收集性能数据
-#   7. 对比并生成报告（K0 为基线，K0→K2 为主判定）
+#   2. 构建 OFF 内核 (CONFIG_NET_DELAYACCT=n) → bzImage-off（K0/K0B）
+#   3. 创建 perf initramfs（bench-net 静态编译 + run-perf-tests.sh + get_sockdelays）
+#   4. QEMU(-smp 1) 启动 K0 → K2 → [K3] → K0B 收集性能数据
+#   5. 对比并生成报告（K0 为基线，K0→K2 为主判定；K0 vs K0B = 噪声地板）
 #
-# 用法: ./perf-test.sh [--skip-build] [--with-k3] [--test-duration=10] ...
+# 用法: ./perf-test.sh [--skip-build] [--with-k3] [--runs=5] ...
 #
 # 注意: 需写入内核源码树 (../linux-6.6)，须在非沙箱环境运行
-# 注意: v6.4.0 性能测试仅本地运行，CI 暂不接入（方案C）
 
 set -euo pipefail
 
@@ -36,12 +41,13 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SUMMARY_MD="$LOG_DIR/perf-summary-${TIMESTAMP}.md"
 SUMMARY_CSV="$LOG_DIR/perf-summary-${TIMESTAMP}.csv"
 
-QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
-# KVM 360s: 内核 boot ~10s + perf 测试 ~280s
-# TCG 900s: TCG 单线程模拟慢，-smp 2 + 加重测试矩阵（100 采样/10s/+idle）需更大余量；
-#   原 600/700s 在 GH Actions 共享 runner（无 KVM）下 rc=124 超时（K0/K2 全 SKIP）
-QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-360}"
-QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-900}"
+QEMU_MEMORY="${QEMU_MEMORY:-512M}"
+# 微基准矩阵单次 QEMU 时长（-smp 1）：boot ~10s + bench 10×~1s + ftrace
+# 对账 ~15s + dump ~5s ≈ 50s（KVM）。
+# KVM 240s / TCG 600s：TCG boot ~120s + bench 自动校准（每轮仍 ~1s）
+#   + ftrace buffer 操作慢，600s 含余量
+QEMU_TIMEOUT_KVM="${QEMU_TIMEOUT_KVM:-240}"
+QEMU_TIMEOUT_TCG="${QEMU_TIMEOUT_TCG:-600}"
 
 # --strict 模式控制 FAIL/INVALID 的判定行为（参数解析可覆盖）：
 #   warn（默认）：FAIL/INVALID 均为告警（exit 0），不阻断。共享 runner 噪声大，
@@ -74,20 +80,11 @@ trap 'rm -f "$PERF_EXIT_FILE"' EXIT
 # 测试参数（可被命令行参数覆盖）
 # ============================================================================
 
-# 是否额外运行 K3 模式
+# 是否额外运行 K3 模式（附加 dump 导出计时）
 WITH_K3=false
 
-# iperf3 测试时长（秒）
-TEST_DURATION="${TEST_DURATION:-10}"
-
-# iperf3 预热时长（秒，--omit）
-WARMUP_DURATION="${WARMUP_DURATION:-3}"
-
-# 是否采集 cycles/packet（需 perf 二进制）
-ENABLE_CYCLES="${ENABLE_CYCLES:-0}"
-
-# 固定负载速率列表（Mbps，空格分隔；空则不测）
-FIXED_LOAD_RATES="${FIXED_LOAD_RATES:-}"
+# bench-net 每项测试轮数（每轮自动校准 ~1s，中位数抗噪）
+PERF_RUNS="${PERF_RUNS:-5}"
 
 # ============================================================================
 # 辅助函数
@@ -257,21 +254,26 @@ create_perf_initramfs() {
         done
     fi
 
-    # iperf3（性能测试核心工具）
-    if command -v iperf3 >/dev/null 2>&1; then
-        copy_binary_with_libs "$(command -v iperf3)" "$INITRD_DIR"
-        echo "Packed iperf3"
+    # bench-net（固定工作量微基准，20260816 方案重建的核心测量器）
+    # 静态编译进 initramfs，无运行时库依赖；缺失则 perf 测试无法运行
+    if command -v gcc >/dev/null 2>&1; then
+        if gcc -O2 -static -o "$INITRD_DIR/bin/bench-net" \
+                "$PROJECT_DIR/ci/qemu/bench-net.c" 2>/dev/null; then
+            echo "Packed bench-net (microbenchmark)"
+        else
+            # 静态链接失败（缺 glibc-static）时退化为动态链接 + 拷贝依赖
+            if gcc -O2 -o "$INITRD_DIR/bin/bench-net" \
+                    "$PROJECT_DIR/ci/qemu/bench-net.c"; then
+                copy_binary_with_libs "$INITRD_DIR/bin/bench-net" "$INITRD_DIR"
+                echo "Packed bench-net (dynamic)"
+            else
+                echo "${RED}bench-net build failed — perf tests cannot run${NC}"
+                exit 1
+            fi
+        fi
     else
-        echo "${RED}iperf3 not found — perf tests cannot run${NC}"
+        echo "${RED}gcc not found — bench-net cannot be built${NC}"
         exit 1
-    fi
-
-    # nc（Perf-3 TCP 延迟测试需要）
-    if command -v nc >/dev/null 2>&1; then
-        copy_binary_with_libs "$(command -v nc)" "$INITRD_DIR"
-        echo "Packed nc"
-    else
-        echo "${YELLOW}WARNING: nc not found, Perf-3 will SKIP${NC}"
     fi
 
     # ip 命令（网络配置）
@@ -297,17 +299,6 @@ create_perf_initramfs() {
         echo "Packed get_sockdelays (for K3 mode)"
     else
         echo "${YELLOW}WARNING: get_sockdelays not built, K3 mode will fall back to K2 behavior${NC}"
-    fi
-
-    # perf 二进制 — cycles/packet 测试（Perf-7）需要
-    # 仅当 --enable-cycles 且主机上 perf 可用时打包；缺失则 run-perf-tests.sh 中 Perf-7 SKIP
-    if [ "$ENABLE_CYCLES" = "1" ]; then
-        if command -v perf >/dev/null 2>&1; then
-            copy_binary_with_libs "$(command -v perf)" "$INITRD_DIR"
-            echo "Packed perf (for cycles/packet test)"
-        else
-            echo "${YELLOW}WARNING: perf not found on host, cycles/packet test will SKIP${NC}"
-        fi
     fi
 
     # perf 测试脚本
@@ -339,30 +330,35 @@ run_perf_in_qemu() {
     log_section "Booting QEMU ($mode_label)"
 
     # 构造内核 cmdline：基础参数 + perf 测试参数
-    # fixed_load_rates 用逗号分隔（避免空格破坏 cmdline tokenization），
-    # guest 侧 guest-init-perf.sh 会转换为空格分隔
-    local append_str="console=ttyS0,115200n8 rdinit=/init"
+    # nokaslr：本地旧 .config 增量构建的内核会卡在 KASLR 阶段（v6.5.2 坑1），
+    # CI fresh clone 构建的内核无此问题；KASLR 只影响启动，禁用不改变运行时基准
+    local append_str="console=ttyS0,115200n8 rdinit=/init nokaslr"
     append_str+=" query_mode=${query_mode}"
-    append_str+=" test_duration=${TEST_DURATION}"
-    append_str+=" warmup_duration=${WARMUP_DURATION}"
-    append_str+=" enable_cycles=${ENABLE_CYCLES}"
-    if [ -n "$FIXED_LOAD_RATES" ]; then
-        append_str+=" fixed_load_rates=$(echo "$FIXED_LOAD_RATES" | tr ' ' ',')"
-    fi
+    append_str+=" perf_runs=${PERF_RUNS}"
+
+    # QEMU 串口输出直接落文件（-serial file:），进程 stderr 单独捕获：
+    # 用户终端环境下 -nographic(stdio 多路复用) 与 e1000 会致 QEMU 进程级
+    # 卡死（0 串口输出），CI systemd 环境正常；-display none + -serial file:
+    # 两种环境均稳定（v6.5.2 坑2，logs/work/2026-08-16/TASK-01）。
+    # 启动报错（KVM 不可用等）走 stderr → qemu_err，串口数据走 qemu_out。
+    local qemu_err="/tmp/perf-qemu-${mode_label}-$$.err"
 
     local qemu_common_args=(
         -m "$QEMU_MEMORY"
-        # -smp 2: 与功能测试 (qemu-test) 一致。TCG 下 -smp 1 单线程模拟极慢
-        # （GH Actions 无 KVM 时 rc=124 超时，K0/K2 全 SKIP），-smp 2 多 vCPU 线程
-        # 显著加速 boot 与测试。CPU 利用率指标用 /proc/stat 聚合行，K0/K2 相对对比不受影响。
-        -smp 2
+        # -smp 1（20260816 方案重建）：单 vCPU 消除 vCPU 间迁移/调度相位噪声，
+        # bench-net 单进程绑 CPU0 + SCHED_FIFO，配合固定循环次数，
+        # K0/K2 的 ns/op 差值即插桩开销（分辨率 ~0.1%）。
+        # TCG 回退无需 -smp 2 加速：bench 自动校准每轮 ~1s，矩阵总时长可控
+        -smp 1
         -kernel "$kernel_img"
         -initrd "$PERF_INITRD"
         -append "$append_str"
-        -nographic
+        -display none
+        -serial "file:$qemu_out"
         -no-reboot
-        -netdev user,id=net0
-        -device e1000,netdev=net0
+        # 微基准仅用 loopback，无 NIC 需求；-nic none 阻止 QEMU 默认建 e1000
+        # （省去 e1000 探测，且规避用户终端环境的 e1000 卡死坑）
+        -nic none
     )
 
     local qemu_rc=0
@@ -373,21 +369,21 @@ run_perf_in_qemu() {
     timeout "$QEMU_TIMEOUT_KVM" qemu-system-x86_64 \
         -machine q35,accel=kvm,smm=off \
         -cpu host,-sgx \
-        "${qemu_common_args[@]}" > "$qemu_out" 2>&1
+        "${qemu_common_args[@]}" 2> "$qemu_err"
     qemu_rc=$?
     set -e
 
     # KVM 失败则回退 TCG
-    # 模式与功能测试 (ci.yml qemu-test) 对齐：覆盖不同 QEMU 版本的报错措辞
+    # 报错在 stderr（qemu_err）；串口文件（qemu_out）兜底再查一次：
     #   "Could not access KVM" (模块不可访问) / "failed to initialize kvm" (初始化失败)
     #   / "/dev/kvm" / "Permission denied"
-    if [ "$qemu_rc" -ne 0 ] && grep -Eq '(Could not access KVM|failed to initialize kvm|/dev/kvm|Permission denied)' "$qemu_out" 2>/dev/null; then
+    if [ "$qemu_rc" -ne 0 ] && { grep -Eq '(Could not access KVM|failed to initialize kvm|/dev/kvm|Permission denied)' "$qemu_err" 2>/dev/null || grep -Eq '(Could not access KVM|failed to initialize kvm|/dev/kvm|Permission denied)' "$qemu_out" 2>/dev/null; }; then
         echo "KVM unavailable, falling back to TCG (timeout=${QEMU_TIMEOUT_TCG}s)..."
         set +e
         timeout "$QEMU_TIMEOUT_TCG" qemu-system-x86_64 \
             -machine q35,accel=tcg,smm=off \
             -cpu qemu64,-sgx \
-            "${qemu_common_args[@]}" > "$qemu_out" 2>&1
+            "${qemu_common_args[@]}" 2> "$qemu_err"
         qemu_rc=$?
         set -e
     fi
@@ -412,8 +408,14 @@ run_perf_in_qemu() {
     if [ "$perf_n" -eq 0 ] || [ "$qemu_rc" -ne 0 ]; then
         echo "${YELLOW}--- QEMU output tail (last 30 lines) for diagnosis ---${NC}"
         tail -30 "$result_file" 2>/dev/null | sed 's/^/    /'
+        # QEMU 进程级错误（KVM 初始化失败/参数错误等走 stderr，串口文件里没有）
+        if [ -s "$qemu_err" ]; then
+            echo "${YELLOW}--- QEMU stderr (first 10 lines) ---${NC}"
+            head -10 "$qemu_err" | sed 's/^/    /'
+        fi
         echo "${YELLOW}--- end tail ---${NC}"
     fi
+    rm -f "$qemu_err"
 
     # 输出 PERF: 行
     grep "^PERF:" "$result_file" || echo "${YELLOW}No PERF: lines found in output${NC}"
@@ -424,8 +426,7 @@ run_perf_in_qemu() {
 # ============================================================================
 
 # 解析 PERF: *_runN= 行，输出 mode|metric=value
-# $1 = 文件, $2 = 模式前缀 (K0/K2/K3)
-# 向后兼容：同时支持新指标名（tcp_latency_p50 等）和旧格式（tcp_latency_us）
+# $1 = 文件, $2 = 模式前缀 (K0/K2/K3/K0B)
 parse_results() {
     local file="$1"
     local prefix="$2"
@@ -442,30 +443,13 @@ parse_results() {
 # 计算 delta 百分比（带符号），用于 K0→Kx 对比
 # $1 = metric, $2 = baseline (K0) 值, $3 = compared (Kx) 值
 # 输出: ±N.N% 或 "N/A"
-# delta 方向（正值语义）：
-#   throughput/PPS: (K0 - Kx) / K0 * 100（正值=吞吐下降，Kx 更差）
-#   latency/CPU/cycles: (Kx - K0) / K0 * 100（正值=延迟/CPU 增加，Kx 更差）
-#   idle_cpu: (Kx - K0)（百分点差，正值=idle增加=好事）
-#   sock_objsize: 用 calc_delta_abs（字节差），不调本函数
-#
-# 注意：idle_cpu_pct 为真实 idle 占比（≈100% 为完全空闲），高基线下相对 % 无意义，
-# 故改用百分点差 (Kx - K0)，输出 "+N.Npp" 格式。正值=idle 增加=好事。
+# delta 方向（正值语义）：bench ns/op 等 latency 类指标
+#   (Kx - K0) / K0 * 100（正值 = 耗时增加，Kx 更差）
+# sock_objsize 用 calc_delta_abs（字节差），不调本函数
 calc_delta_pct() {
     local metric="$1" base="$2" comp="$3"
-    case "$metric" in
-        tcp_throughput_mbps|udp_pps)
-            # 吞吐/PPS：下降百分比 = (K0 - Kx) / K0 * 100（正值=Kx 下降=更差）
-            awk "BEGIN {if(${base}+0>0) printf \"%+.1f%%\", (${base}-${comp})/${base}*100; else print \"N/A\"}"
-            ;;
-        idle_cpu_pct)
-            # 百分点差（pp）：idle 是接近 100% 的高基线，相对 % 无意义（1%→6% 会显示 +500%）
-            awk "BEGIN {printf \"%+.1fpp\", ${comp}-${base}}"
-            ;;
-        *)
-            # 默认（latency/CPU/cycles/fixed_load）：(Kx - K0) / K0 * 100（正值=增加=更差）
-            awk "BEGIN {if(${base}+0>0) printf \"%+.1f%%\", (${comp}-${base})/${base}*100; else print \"N/A\"}"
-            ;;
-    esac
+    # metric 参数保留以兼容调用方签名；方向统一为 (Kx - K0)/K0（正值=更差）
+    awk "BEGIN {if(${base}+0>0) printf \"%+.1f%%\", (${comp}-${base})/${base}*100; else print \"N/A\"}"
 }
 
 # 计算 delta 绝对值（字节），用于 sock_objsize_bytes
@@ -506,9 +490,7 @@ write_summary_files() {
         echo "- **K0 内核模式**: ${k0_mode:-unknown}（OFF 内核，基线）"
         echo "- **K2 内核模式**: ${k2_mode:-unknown}（ON 内核，检测开启，无查询）"
         echo "- **K3 内核模式**: ${k3_mode:--}（ON 内核，检测+查询）"
-        echo "- **测试时长**: ${TEST_DURATION}s（预热 ${WARMUP_DURATION}s）"
-        [ "$ENABLE_CYCLES" = "1" ] && echo "- **cycles/packet**: 启用"
-        [ -n "$FIXED_LOAD_RATES" ] && echo "- **固定负载速率**: ${FIXED_LOAD_RATES} Mbps"
+        echo "- **bench 轮数**: ${PERF_RUNS}（每轮自动校准 ~1s）"
         echo ""
         echo "## 指标详情"
         echo ""
@@ -521,24 +503,18 @@ write_summary_files() {
         echo ""
         echo "## Delta 计算方向"
         echo ""
-        echo "- TCP 吞吐量: (K0 - Kx) / K0 * 100（正值 = 吞吐下降，Kx 更差）"
-        echo "- UDP PPS: (K0 - Kx) / K0 * 100（正值 = PPS 下降，Kx 更差）"
-        echo "- TCP 延迟: (Kx - K0) / K0 * 100（正值 = 延迟增加，Kx 更差）"
-        echo "- CPU 利用率: (Kx - K0) / K0 * 100（正值 = CPU 增加，Kx 更差）"
-        echo "- Idle CPU: (Kx - K0)（百分点差，正值 = idle 增加 = 好事）"
-        echo "- cycles/packet: (Kx - K0) / K0 * 100（正值 = cycles 增加，Kx 更差）"
+        echo "- bench ns/op: (Kx - K0) / K0 * 100（正值 = 每循环耗时增加，Kx 更差）"
         echo "- Socket 对象大小: Kx - K0（字节，正值 = 内存增加）"
         echo ""
         echo "## 判定说明"
         echo ""
-        echo "- 主判定基于 K0→K2（与现有 ON/OFF 对比行为一致）"
-        echo "- K0→K3 / K2→K3 差值仅供参考，不影响 verdict"
-        echo "- K3 = ON 内核 + 每 50ms 全表查询：吞吐/PPS 的 K3 差值是 2 vCPU 环境"
-        echo "  下的查询干扰（真实多核会被稀释），后台查询自身的 CPU 开销直接读"
-        echo "  idle_cpu_pct 的 K3 差值（约 -6pp）；cpu_per_gbps 在不同吞吐点非线性，"
-        echo "  K3 的归一化值仅供参考"
-        echo "- p95/p99/p999/max 为 info：QEMU 单机环境尾延迟由 vCPU 调度主导"
-        echo "  （K0 vs K0B 噪声地板实测远超阈值，ftrace 证实 hook 仅占 p99 的 0.06%）"
+        echo "- 主判定基于 K0→K2 的 Perf-A 微基准（bench_udp64 / bench_tcprw ns/op）"
+        echo "- K2 < K0（负 delta）→ INVALID：加开销工具不可能反向提升，"
+        echo "  负值说明测量被噪声主导，建议重跑"
+        echo "- ftrace 对账为 info：Δns/op(实测) 应与 hooks/op × 单次 hook 耗时"
+        echo "  数量级吻合，用于把微基准差值归因到 hook 开销"
+        echo "- K3 dump_per_call_us 为 info：含 fork+exec 的全量导出 wall time"
+        echo "  （空 socket 表口径）"
         echo "- K3 未运行时显示 \"-\""
     } > "$SUMMARY_MD"
 
@@ -621,13 +597,6 @@ compare_and_report() {
     # 对比表数据行在 verdict 段计算完成后再统一打印（表头/数据/表尾延后），
     # 以便回填真实的 Thresh/Verdict 列（此前硬编码 "-" / "info" 与 md/csv 不一致）。
 
-    # 判定延迟指标格式：新格式（p50/p95/p99/p999/max）还是旧格式（tcp_latency_us）
-    # 新格式优先；仅当新格式缺失且旧格式存在时回退到旧格式（向后兼容）
-    local use_new_latency=false
-    if [ -n "${values[K0|tcp_latency_p50_vals]:-}" ] || [ -n "${values[K2|tcp_latency_p50_vals]:-}" ]; then
-        use_new_latency=true
-    fi
-
     # ---- 对比表辅助 ----
     # 取某 mode 某 metric 的中位数；空则回显空串
     _med_of() {
@@ -643,58 +612,29 @@ compare_and_report() {
         echo "${v:-SKIP}"
     }
 
-    # 构建要显示的指标列表
-    # 格式: "metric:unit:direction"
-    #   direction: drop/increase/idle/abs
-    # 条件性指标（cycles_per_packet, fixed_load_*）按数据存在性动态添加
+    # 构建要显示的指标列表（20260816 方案重建后的指标集）
+    # 格式: "metric:unit:direction"，direction: increase/abs
+    #   bench_*：Perf-A 微基准，verdict 主判定（increase，K2>K0 = 更差）
+    #   ftrace_*：Perf-B 对账，info（Δns/op ≈ hooks_per_op × hook_ns 的锚点）
+    #   dump_*：Perf-D K3 导出计时，info
+    #   sock_objsize：Perf-C slab，确定性判定
     local table_metrics=()
-    table_metrics+=("tcp_throughput_mbps:Mbps:drop")
-    table_metrics+=("udp_pps:pps:drop")
-    # udp_loss_pct：UDP 丢包率（receiver 口径，B8 修复后输出），仅 info 展示
-    # （loopback 正常 <0.1%，不参与 verdict）
-    table_metrics+=("udp_loss_pct:%:increase")
-    if [ "$use_new_latency" = true ]; then
-        table_metrics+=("tcp_latency_p50:us:increase")
-        table_metrics+=("tcp_latency_p95:us:increase")
-        table_metrics+=("tcp_latency_p99:us:increase")
-        table_metrics+=("tcp_latency_p999:us:increase")
-        table_metrics+=("tcp_latency_max:us:increase")
-    else
-        table_metrics+=("tcp_latency_us:us:increase")
-    fi
-    table_metrics+=("cpu_util_pct:%:increase")
-    # cpu_per_gbps：归一化 CPU 代价（%/Gbps，B3 修复引入）。verdict 判此指标，
-    # cpu_util_pct（iperf3 host_percent，绝对 busy%）降为 info——绝对 busy% 正比
-    # 吞吐，跨模式吞吐不同时不可比（K3 吞吐低会假性"更省 CPU"）
-    table_metrics+=("cpu_per_gbps:%/Gbps:increase")
-    table_metrics+=("idle_cpu_pct:%:idle")
-    # cycles_per_packet：仅当至少一个 mode 有数据时显示
-    if [ -n "${values[K0|cycles_per_packet_vals]:-}" ] || \
-       [ -n "${values[K2|cycles_per_packet_vals]:-}" ] || \
-       [ -n "${values[K3|cycles_per_packet_vals]:-}" ]; then
-        table_metrics+=("cycles_per_packet:cycles:increase")
-    fi
-    # fixed_load_*：按 FIXED_LOAD_RATES 列表动态添加
-    # metric 名格式: fixed_load_<rate>mbps_p50 / fixed_load_<rate>mbps_p99
-    if [ -n "$FIXED_LOAD_RATES" ]; then
-        local _rate
-        for _rate in $FIXED_LOAD_RATES; do
-            local _rate_label
-            _rate_label=$(awk -v r="$_rate" 'BEGIN{printf "%d", r}')
-            # 仅当至少一个 mode 有数据时显示
-            if [ -n "${values[K0|fixed_load_${_rate_label}mbps_p50_vals]:-}" ] || \
-               [ -n "${values[K2|fixed_load_${_rate_label}mbps_p50_vals]:-}" ] || \
-               [ -n "${values[K3|fixed_load_${_rate_label}mbps_p50_vals]:-}" ]; then
-                table_metrics+=("fixed_load_${_rate_label}mbps_p50:us:increase")
-            fi
-            if [ -n "${values[K0|fixed_load_${_rate_label}mbps_p99_vals]:-}" ] || \
-               [ -n "${values[K2|fixed_load_${_rate_label}mbps_p99_vals]:-}" ] || \
-               [ -n "${values[K3|fixed_load_${_rate_label}mbps_p99_vals]:-}" ]; then
-                table_metrics+=("fixed_load_${_rate_label}mbps_p99:us:increase")
-            fi
-        done
-    fi
+    table_metrics+=("bench_udp64_ns_per_op:ns/op:increase")
+    table_metrics+=("bench_tcprw_ns_per_op:ns/op:increase")
     table_metrics+=("sock_objsize_bytes:bytes:abs")
+    # ftrace 对账指标仅 ON 内核产出（K0/OFF 无符号），列存在即显示
+    if [ -n "${values[K2|ftrace_hooks_per_op_vals]:-}" ] || \
+       [ -n "${values[K3|ftrace_hooks_per_op_vals]:-}" ]; then
+        table_metrics+=("ftrace_hooks_per_op:hooks:info")
+    fi
+    if [ -n "${values[K2|ftrace_hook_ns_p50_vals]:-}" ] || \
+       [ -n "${values[K3|ftrace_hook_ns_p50_vals]:-}" ]; then
+        table_metrics+=("ftrace_hook_ns_p50:ns:info")
+    fi
+    # K3 dump 计时（含 fork+exec 口径）
+    if [ -n "${values[K3|dump_per_call_us_vals]:-}" ]; then
+        table_metrics+=("dump_per_call_us:us:info")
+    fi
 
     # ---- 打印对比表 + 收集摘要行 ----
     # 摘要行格式（tab 分隔 13 列）:
@@ -779,14 +719,11 @@ compare_and_report() {
     done
 
     echo ""
-    echo "Pass criteria (initial, subject to calibration):"
-    echo "  Perf-1 TCP throughput drop (K0→K2):  < 5%"
-    echo "  Perf-2 UDP PPS drop (K0→K2):         < 15%"
-    echo "  Perf-3 TCP latency P50 increase:     < 10% (relative)"
-    echo "  Perf-3 TCP latency P99 increase:     < 10% (relative, new)"
-    echo "  Perf-4 Per-socket memory:            <= 192 bytes (slab-aligned, raw struct ~72B)"
-    echo "  Perf-5 CPU util increase (K0→K2):    < 10% (relative)"
-    echo "  Perf-6 Idle CPU K2 vs K0 diff:       < 2% (almost zero overhead)"
+    echo "Pass criteria (initial, subject to noise-floor calibration):"
+    echo "  Perf-A bench UDP64 ns/op increase (K0→K2):  < 25%"
+    echo "  Perf-A bench TCP rw ns/op increase (K0→K2):  < 25%"
+    echo "  Perf-C Per-socket memory:                    <= 192 bytes (slab-aligned, raw struct ~72B)"
+    echo "  (ftrace 对账: Δns/op ≈ hooks_per_op × hook_ns_p50，info 级不判定)"
     echo ""
 
     # ---- 自动判定（三态：PASS / FAIL / INVALID）----
@@ -798,20 +735,22 @@ compare_and_report() {
     local verdict_pass=0 verdict_fail=0 verdict_invalid=0 verdict_skip=0 status
     local v_m v_t v_dir v_unit v_k0 v_k2 v_k0m v_k2m v_drop v_delta_abs
 
-    # Perf-1/2 吞吐与 PPS：degradation = (K0-K2)/K0*100，阈值 5% / 15%
-    for v_entry in "tcp_throughput_mbps:5:drop:Mbps" "udp_pps:15:drop:pps"; do
-        IFS=':' read -r v_m v_t v_dir v_unit <<< "$v_entry"
+    # Perf-A 微基准：degradation = (K2-K0)/K0*100，阈值 25%（初始值）。
+    # 理论 hook 开销在 64B 路径 ~5-20%（单次 hook ~50-150ns × 4 次 /
+    # 单循环 2-5us）；阈值待 K0-vs-K0B 噪声地板数据积累后收紧
+    for v_entry in "bench_udp64_ns_per_op:25" "bench_tcprw_ns_per_op:25"; do
+        IFS=':' read -r v_m v_t <<< "$v_entry"
         THRESHOLDS[$v_m]="${v_t}%"
         v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
         if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
             v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
-            v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_k0m}-${v_k2m})/${v_k0m}*100}")
-            v_delta_abs=$(awk "BEGIN {printf \"%.2f\", ${v_k0m}-${v_k2m}}")
+            v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_k2m}-${v_k0m})/${v_k0m}*100}")
+            v_delta_abs=$(awk "BEGIN {printf \"%.2f\", ${v_k2m}-${v_k0m}}")
             status=$(_verdict3 "$v_drop" "$v_t")
             case "$status" in
-                PASS)    echo "  ${GREEN}PASS${NC} $v_m: drop ${v_drop}% <= ${v_t}% threshold"; verdict_pass=$((verdict_pass+1));;
-                FAIL)    echo "  ${RED}FAIL${NC} $v_m: drop ${v_drop}% > ${v_t}% threshold"; verdict_fail=$((verdict_fail+1));;
-                INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2>K0 by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
+                PASS)    echo "  ${GREEN}PASS${NC} $v_m: +${v_drop}% (Δ${v_delta_abs} ns/op) <= ${v_t}% threshold"; verdict_pass=$((verdict_pass+1));;
+                FAIL)    echo "  ${RED}FAIL${NC} $v_m: +${v_drop}% (Δ${v_delta_abs} ns/op) > ${v_t}% threshold"; verdict_fail=$((verdict_fail+1));;
+                INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
             esac
         else
             status="SKIP"
@@ -821,108 +760,25 @@ compare_and_report() {
         VERDICTS[$v_m]="$status"
     done
 
-    # Perf-3 TCP 延迟：阈值 10%
-    # 新格式：仅 p50 判定；旧格式：tcp_latency_us 单一判定
-    # p99 移出 verdict（20260816）：K0 vs K0B 噪声地板两轮实测 53.6%/90.2%，
-    # 远超 10% 阈值——QEMU 单机环境尾延迟由 vCPU 调度主导（ftrace 已证 hook
-    # 仅占 p99 的 0.06%），判定只会产出 INVALID/假 FAIL，降级 info 展示。
-    # 阈值校准依赖 Noise Floor 数据积累（p50 floor 1.1%~10.3% 仍在观察）。
-    if [ "$use_new_latency" = true ]; then
-        # P50: degradation = (K2-K0)/K0*100，阈值 10%
-        for v_entry in "tcp_latency_p50:10"; do
-            IFS=':' read -r v_m v_t <<< "$v_entry"
-            THRESHOLDS[$v_m]="${v_t}%"
-            v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
-            if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
-                v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
-                v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_k2m}-${v_k0m})/${v_k0m}*100}")
-                v_delta_abs=$(awk "BEGIN {printf \"%.2f\", ${v_k2m}-${v_k0m}}")
-                status=$(_verdict3 "$v_drop" "$v_t")
-                case "$status" in
-                    PASS)    echo "  ${GREEN}PASS${NC} $v_m: +${v_drop}% <= ${v_t}% threshold"; verdict_pass=$((verdict_pass+1));;
-                    FAIL)    echo "  ${RED}FAIL${NC} $v_m: +${v_drop}% > ${v_t}% threshold"; verdict_fail=$((verdict_fail+1));;
-                    INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
-                esac
-            else
-                status="SKIP"
-                echo "  ${YELLOW}SKIP${NC} $v_m: no data"
-                verdict_skip=$((verdict_skip+1))
-            fi
-            VERDICTS[$v_m]="$status"
-        done
-    else
-        # 旧格式：tcp_latency_us（向后兼容）
-        v_m="tcp_latency_us"; v_t=10
-        THRESHOLDS[$v_m]="${v_t}%"
-        v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
-        if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
-            v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
-            v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_k2m}-${v_k0m})/${v_k0m}*100}")
-            v_delta_abs=$(awk "BEGIN {printf \"%.2f\", ${v_k2m}-${v_k0m}}")
-            status=$(_verdict3 "$v_drop" "$v_t")
-            case "$status" in
-                PASS)    echo "  ${GREEN}PASS${NC} $v_m: +${v_drop}% <= 10% threshold"; verdict_pass=$((verdict_pass+1));;
-                FAIL)    echo "  ${RED}FAIL${NC} $v_m: +${v_drop}% > 10% threshold"; verdict_fail=$((verdict_fail+1));;
-                INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
-            esac
-        else
-            status="SKIP"
-            echo "  ${YELLOW}SKIP${NC} $v_m: no data"
-            verdict_skip=$((verdict_skip+1))
-        fi
-        VERDICTS[$v_m]="$status"
-    fi
+    # 旧 iperf3 指标（tcp_latency_* / cpu_per_gbps / idle_cpu_pct）随方案
+    # 重建移除：其噪声地板（5-90%）远超信号（0.5-2%），判定无物理意义
 
-    # Perf-5 CPU 代价（B3 修复）：判归一化指标 cpu_per_gbps（%/Gbps），
-    # 相对 % 阈值 10%。绝对 busy%（cpu_util_pct）正比吞吐不可跨模式比，降为 info。
-    # 阈值为初始值，待 K0 vs K0B 噪声地板数据积累后校准（见 Noise Floor 节）。
-    v_m="cpu_per_gbps"; v_t=10
-    THRESHOLDS[$v_m]="${v_t}%"
-    v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
-    if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
-        v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
-        v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_k2m}-${v_k0m})/${v_k0m}*100}")
-        v_delta_abs=$(awk "BEGIN {printf \"%.2f\", ${v_k2m}-${v_k0m}}")
-        status=$(_verdict3 "$v_drop" "$v_t")
-        case "$status" in
-            PASS)    echo "  ${GREEN}PASS${NC} $v_m: +${v_drop}% <= 10% threshold"; verdict_pass=$((verdict_pass+1));;
-            FAIL)    echo "  ${RED}FAIL${NC} $v_m: +${v_drop}% > 10% threshold"; verdict_fail=$((verdict_fail+1));;
-            INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
-        esac
-    else
-        status="SKIP"
-        echo "  ${YELLOW}SKIP${NC} $v_m: no data"
-        verdict_skip=$((verdict_skip+1))
+    # Perf-B ftrace 对账（info，不参与 verdict）：
+    #   Δns/op(实测) ≈ hooks_per_op × hook_ns_p50(单次)
+    # 数量级吻合则微基准差值可归因到 hook，不吻合提示测量异常
+    local ft_hooks ft_ns ft_delta b_delta
+    ft_hooks="${values[K2|ftrace_hooks_per_op_run1_vals]:-}${values[K3|ftrace_hooks_per_op_run1_vals]:-}"
+    ft_hooks=$(printf '%s' "$ft_hooks" | awk '{print $1}')
+    ft_ns="${values[K2|ftrace_hook_ns_p50_run1_vals]:-}${values[K3|ftrace_hook_ns_p50_run1_vals]:-}"
+    ft_ns=$(printf '%s' "$ft_ns" | awk '{print $1}')
+    v_k0m=$(_med_of K0 bench_udp64_ns_per_op)
+    v_k2m=$(_med_of K2 bench_udp64_ns_per_op)
+    if [ -n "$ft_hooks" ] && [ -n "$ft_ns" ] && [ -n "$v_k0m" ] && [ -n "$v_k2m" ]; then
+        ft_delta=$(awk -v h="$ft_hooks" -v n="$ft_ns" 'BEGIN {printf "%.0f", h * n}')
+        b_delta=$(awk -v a="$v_k0m" -v b="$v_k2m" 'BEGIN {printf "%.0f", b - a}')
+        echo ""
+        echo "  ftrace cross-check (UDP64): measured Δ=${b_delta} ns/op, predicted ≈ hooks/op(${ft_hooks}) × ${ft_ns}ns = ${ft_delta} ns/op"
     fi
-    VERDICTS[$v_m]="$status"
-
-    # Perf-6 Idle CPU：K2 vs K0 差异 < 2pp（几乎零开销）
-    # idle_cpu_pct 为真实 idle 占比（≈100% 为完全空闲），高基线下相对 % 无意义，
-    # 改用百分点差判定（|Δpp| <= 2 = PASS）。方向无关，不设 INVALID。
-    v_m="idle_cpu_pct"; v_t=2
-    THRESHOLDS[$v_m]="${v_t}pp"
-    v_k0="${values[K0|${v_m}_vals]:-}"; v_k2="${values[K2|${v_m}_vals]:-}"
-    if [ -n "$v_k0" ] && [ -n "$v_k2" ]; then
-        v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
-        # delta = K2 - K0（百分点差，正值=idle 增加=好事）
-        v_drop=$(awk "BEGIN {printf \"%.1f\", ${v_k2m}-${v_k0m}}")
-        local v_abs_drop
-        v_abs_drop=$(awk -v d="$v_drop" 'BEGIN {printf "%.1f", (d<0?-d:d)}')
-        if awk "BEGIN {exit !(${v_abs_drop} > ${v_t})}"; then
-            status="FAIL"
-            echo "  ${RED}FAIL${NC} $v_m: |${v_drop}pp| > ${v_t}pp threshold (idle overhead too high)"
-            verdict_fail=$((verdict_fail+1))
-        else
-            status="PASS"
-            echo "  ${GREEN}PASS${NC} $v_m: |${v_drop}pp| <= ${v_t}pp threshold (almost zero idle overhead)"
-            verdict_pass=$((verdict_pass+1))
-        fi
-    else
-        status="SKIP"
-        echo "  ${YELLOW}SKIP${NC} $v_m: no data"
-        verdict_skip=$((verdict_skip+1))
-    fi
-    VERDICTS[$v_m]="$status"
 
     # Perf-4 每 socket 内存：degradation = K2-K0 (bytes)，阈值 192
     # 阈值 192 = 72(struct net_delayacct) + 56(SLAB_HWCACHE_ALIGN 64B 对齐填充) + 64(余量)
@@ -956,21 +812,8 @@ compare_and_report() {
     VERDICTS[$v_m]="$status"
 
     # ---- 信息性指标（K0→K3 / K2→K3，不影响 verdict）----
-    if [ -n "$k3_file" ]; then
-        echo ""
-        echo "Info (K3 deltas, non-blocking):"
-        # 简要输出 K0→K3 的关键 delta
-        for v_m in tcp_throughput_mbps udp_pps tcp_latency_p50 tcp_latency_p99 cpu_util_pct; do
-            v_k0="${values[K0|${v_m}_vals]:-}"
-            v_k3="${values[K3|${v_m}_vals]:-}"
-            if [ -n "$v_k0" ] && [ -n "$v_k3" ]; then
-                v_k0m=$(_median "$v_k0"); v_k3m=$(_median "$v_k3")
-                local _d_k0k3
-                _d_k0k3=$(calc_delta_pct "$v_m" "$v_k0m" "$v_k3m")
-                echo "  $v_m: K0→K3 = $_d_k0k3"
-            fi
-        done
-    fi
+    # 新方案 K3 的导出开销直接由 Perf-D dump_per_call_us 量化，
+    # 对比表中已含 K0→K3 / K2→K3 列，此处不再重复输出
 
     # ---- 总结论（优先级：FAIL > INVALID(视strict) > NO-DATA > PASS）----
     # exit code: 0=PASS/warn通过, 1=FAIL(strict=fail)/INVALID(strict=fail), 2=数据不可信(全SKIP或INVALID>50%)
@@ -1075,13 +918,9 @@ compare_and_report() {
         echo "+----------------------------------------------------------------------------------------+"
         local nf_metric nf_k0m nf_k0bm nf_floor nf_thr nf_ok
         local floor_md="" floor_csv=""
-        # 静态阈值须与 verdict 段一致（p99 已降级 info，不在此列）
-        for nf_metric in tcp_throughput_mbps udp_pps tcp_latency_p50 cpu_per_gbps; do
-            case "$nf_metric" in
-                tcp_throughput_mbps) nf_thr=5;;
-                udp_pps)             nf_thr=15;;
-                *)                   nf_thr=10;;
-            esac
+        # 静态阈值须与 verdict 段一致（sock_objsize 确定性无噪声，不在此列）
+        for nf_metric in bench_udp64_ns_per_op bench_tcprw_ns_per_op; do
+            nf_thr=25
             nf_k0m="${SUM_MED0[$nf_metric]:-}"
             nf_k0bm=$(_median "${values[K0B|${nf_metric}_vals]:-}")
             if [ -n "$nf_k0m" ] && [ -n "$nf_k0bm" ] && \
@@ -1134,17 +973,8 @@ while [[ $# -gt 0 ]]; do
         --with-k3)
             WITH_K3=true
             ;;
-        --test-duration=*)
-            TEST_DURATION="${1#--test-duration=}"
-            ;;
-        --warmup=*)
-            WARMUP_DURATION="${1#--warmup=}"
-            ;;
-        --enable-cycles)
-            ENABLE_CYCLES=1
-            ;;
-        --fixed-load-rates=*)
-            FIXED_LOAD_RATES="${1#--fixed-load-rates=}"
+        --runs=*)
+            PERF_RUNS="${1#--runs=}"
             ;;
         --strict)
             STRICT_MODE="fail"
@@ -1176,11 +1006,7 @@ Usage: $0 [OPTIONS]
 Options:
   --skip-build              复用已有 bzImage-on/off（不重新构建内核）
   --with-k3                 额外运行 K3 模式（ON 内核 + 主动查询）
-  --test-duration=N         iperf3 测试时长（秒，默认 10）
-  --warmup=N                iperf3 预热时长（秒，默认 3）
-  --enable-cycles           启用 cycles/packet 采集（需 perf 二进制）
-  --fixed-load-rates="R1 R2 R3"
-                            固定负载速率列表（Mbps，空格分隔）
+  --runs=N                  bench-net 每项测试轮数（默认 5，每轮自动校准 ~1s）
   --strict                  INVALID 视作 FAIL 阻断（等同 --strict=fail）
   --strict=warn             INVALID 告警不阻断，但 >50% 时 exit 2（默认）
   --strict=fail             INVALID 阻断 exit 1（CI 严格回归）
@@ -1199,9 +1025,6 @@ Examples:
 
   # 三版本对比：K0 vs K2 vs K3
   $0 --skip-build --with-k3
-
-  # 启用 cycles/packet 和固定负载测试
-  $0 --skip-build --enable-cycles --fixed-load-rates="300 500"
 EOF
             exit 0
             ;;
@@ -1218,9 +1041,7 @@ done
     echo "Linux source: $LINUX_SRC"
     echo "Log dir: $LOG_DIR"
     echo "Modes: K0 (OFF) + K2 (ON, no query)$([ "$WITH_K3" = true ] && echo " + K3 (ON, with query)")"
-    echo "Test duration: ${TEST_DURATION}s (warmup: ${WARMUP_DURATION}s)"
-    echo "Enable cycles: $ENABLE_CYCLES"
-    echo "Fixed load rates: ${FIXED_LOAD_RATES:-none}"
+    echo "Bench runs per metric: $PERF_RUNS (auto-calibrated ~1s each)"
     echo ""
 
     # Step 1-2: 构建双内核
