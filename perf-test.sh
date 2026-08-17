@@ -20,10 +20,14 @@
 #
 # 流程：
 #   1. 构建 ON 内核 (CONFIG_NET_DELAYACCT=y) → bzImage-on（K2/K3 共用）
-#   2. 构建 OFF 内核 (CONFIG_NET_DELAYACCT=n) → bzImage-off（K0/K0B）
+#   2. 构建 OFF 内核 (CONFIG_NET_DELAYACCT=n) → bzImage-off（K0/K0R/K0B）
 #   3. 创建 perf initramfs（bench-net 静态编译 + run-perf-tests.sh + get_sockdelays）
-#   4. QEMU(-smp 1) 启动 K0 → K2 → [K3] → K0B 收集性能数据
-#   5. 对比并生成报告（K0 为基线，K0→K2 为主判定；K0 vs K0B = 噪声地板）
+#   4. QEMU(-smp 1, 宿主侧绑核) 交错启动 K0→K2→K0R→K2R→[K3]→K0B：
+#      同二进制"启动间"漂移实测 ~10%（run#178: K2↔K3 同 bzImage 差
+#      10.7-12.8%），单对 K0↔K0B=1% 是采样运气而非真实地板。交错重复
+#      使时漂对 K0/K2 等权，K0R/K2R 结果并入 K0/K2 中位数
+#   5. 对比并生成报告（K0 为基线，K0→K2 为主判定；全部同二进制启动对
+#      |Δ| 的最大值 = 启动间噪声地板，|Δ| 低于地板 → INVALID）
 #
 # 用法: ./perf-test.sh [--skip-build] [--with-k3] [--runs=5] ...
 #
@@ -320,7 +324,7 @@ create_perf_initramfs() {
 # Step 4: QEMU 启动并收集性能数据
 # ============================================================================
 
-# $1 = kernel_img, $2 = mode_label (K0/K2/K3), $3 = query_mode (传给 guest 的 cmdline 参数)
+# $1 = kernel_img, $2 = mode_label (K0/K2/K0R/K2R/K3/K0B), $3 = query_mode (传给 guest 的 cmdline 参数)
 run_perf_in_qemu() {
     local kernel_img="$1"
     local mode_label="$2"
@@ -328,6 +332,20 @@ run_perf_in_qemu() {
     local qemu_out="/tmp/perf-qemu-${mode_label}-$$.log"
 
     log_section "Booting QEMU ($mode_label)"
+
+    # 宿主侧绑核（20260817）：QEMU vCPU 线程每次启动被 VM 调度器随机放置
+    # （不同 VM CPU/物理核/SMT/turbo 状态），是同二进制启动间漂移的根源。
+    # -smp 1 只固定 guest 内 vCPU 数，不约束 QEMU 线程在宿主上的放置。
+    # 绑核失败（cpuset 受限/taskset 缺失）降级不绑并告警。
+    local pin_cmd=""
+    if [ -n "${PERF_PIN_CPU:-}" ]; then
+        if taskset -c "$PERF_PIN_CPU" true 2>/dev/null; then
+            pin_cmd="taskset -c ${PERF_PIN_CPU}"
+            echo "QEMU vCPU thread pinned to host CPU ${PERF_PIN_CPU}"
+        else
+            echo "${YELLOW}WARNING: pin to CPU ${PERF_PIN_CPU} failed (cpuset restricted?), running unpinned${NC}"
+        fi
+    fi
 
     # 构造内核 cmdline：基础参数 + perf 测试参数
     # nokaslr：本地旧 .config 增量构建的内核会卡在 KASLR 阶段（v6.5.2 坑1），
@@ -363,10 +381,10 @@ run_perf_in_qemu() {
 
     local qemu_rc=0
 
-    # 先尝试 KVM
+    # 先尝试 KVM（$pin_cmd 不加引号：空串展开为零个参数，见上注释）
     echo "Trying KVM (timeout=${QEMU_TIMEOUT_KVM}s)..."
     set +e
-    timeout "$QEMU_TIMEOUT_KVM" qemu-system-x86_64 \
+    timeout "$QEMU_TIMEOUT_KVM" $pin_cmd qemu-system-x86_64 \
         -machine q35,accel=kvm,smm=off \
         -cpu host,-sgx \
         "${qemu_common_args[@]}" 2> "$qemu_err"
@@ -380,7 +398,7 @@ run_perf_in_qemu() {
     if [ "$qemu_rc" -ne 0 ] && { grep -Eq '(Could not access KVM|failed to initialize kvm|/dev/kvm|Permission denied)' "$qemu_err" 2>/dev/null || grep -Eq '(Could not access KVM|failed to initialize kvm|/dev/kvm|Permission denied)' "$qemu_out" 2>/dev/null; }; then
         echo "KVM unavailable, falling back to TCG (timeout=${QEMU_TIMEOUT_TCG}s)..."
         set +e
-        timeout "$QEMU_TIMEOUT_TCG" qemu-system-x86_64 \
+        timeout "$QEMU_TIMEOUT_TCG" $pin_cmd qemu-system-x86_64 \
             -machine q35,accel=tcg,smm=off \
             -cpu qemu64,-sgx \
             "${qemu_common_args[@]}" 2> "$qemu_err"
@@ -509,8 +527,12 @@ write_summary_files() {
         echo "## 判定说明"
         echo ""
         echo "- 主判定基于 K0→K2 的 Perf-A 微基准（bench_udp64 / bench_tcprw ns/op）"
+        echo "- K0/K2 各交错启动 2 次（K0R/K2R 并入中位数），QEMU vCPU 线程"
+        echo "  宿主侧绑核，抑制同二进制启动间漂移（实测可达 10%+）"
         echo "- K2 < K0（负 delta）→ INVALID：加开销工具不可能反向提升，"
         echo "  负值说明测量被噪声主导，建议重跑"
+        echo "- |Δ| 低于启动间噪声地板（同二进制启动对 |Δ| 的最大值）→ INVALID："
+        echo "  差异不可分辨于启动漂移"
         echo "- ftrace 对账为 info：Δns/op(实测) 应与 hooks/op × 单次 hook 耗时"
         echo "  数量级吻合，用于把微基准差值归因到 hook 开销"
         echo "- K3 dump_per_call_us 为 info：含 fork+exec 的全量导出 wall time"
@@ -528,6 +550,11 @@ compare_and_report() {
 
     local k0_file="$LOG_DIR/perf-K0-${TIMESTAMP}.log"
     local k2_file="$LOG_DIR/perf-K2-${TIMESTAMP}.log"
+    # K0R/K2R：交错重复启动（20260817），结果并入 K0/K2 中位数，
+    # 且 (K0,K0R)/(K2,K2R) 构成同二进制启动对，参与噪声地板估计
+    local k0r_file="" k2r_file=""
+    [ -f "$LOG_DIR/perf-K0R-${TIMESTAMP}.log" ] && k0r_file="$LOG_DIR/perf-K0R-${TIMESTAMP}.log"
+    [ -f "$LOG_DIR/perf-K2R-${TIMESTAMP}.log" ] && k2r_file="$LOG_DIR/perf-K2R-${TIMESTAMP}.log"
     local k3_file=""
     [ -f "$LOG_DIR/perf-K3-${TIMESTAMP}.log" ] && k3_file="$LOG_DIR/perf-K3-${TIMESTAMP}.log"
     # K0B（B5/B6 噪声地板）：同 OFF 内核在批次末尾再跑一遍，
@@ -556,7 +583,9 @@ compare_and_report() {
         values["${mode}|${metric}_vals"]="${values[${mode}|${metric}_vals]:+${values[${mode}|${metric}_vals]} }$val"
     done < <(
         parse_results "$k0_file" K0
+        [ -n "$k0r_file" ] && parse_results "$k0r_file" K0
         parse_results "$k2_file" K2
+        [ -n "$k2r_file" ] && parse_results "$k2r_file" K2
         [ -n "$k3_file" ] && parse_results "$k3_file" K3
         [ -n "$k0b_file" ] && parse_results "$k0b_file" K0B
     )
@@ -575,6 +604,19 @@ compare_and_report() {
         k0b_mode=$(grep "^PERF: mode=" "$k0b_file" | head -1 | cut -d= -f2 | tr -d '\r')
         if [ "$k0b_mode" != "OFF" ]; then
             echo "${YELLOW}WARNING: K0B kernel log reports mode='${k0b_mode}', expected 'OFF' (noise floor invalid)${NC}"
+        fi
+    fi
+    local k0r_mode k2r_mode
+    if [ -n "$k0r_file" ]; then
+        k0r_mode=$(grep "^PERF: mode=" "$k0r_file" | head -1 | cut -d= -f2 | tr -d '\r')
+        if [ "$k0r_mode" != "OFF" ]; then
+            echo "${YELLOW}WARNING: K0R kernel log reports mode='${k0r_mode}', expected 'OFF'${NC}"
+        fi
+    fi
+    if [ -n "$k2r_file" ]; then
+        k2r_mode=$(grep "^PERF: mode=" "$k2r_file" | head -1 | cut -d= -f2 | tr -d '\r')
+        if [ "$k2r_mode" != "ON" ]; then
+            echo "${YELLOW}WARNING: K2R kernel log reports mode='${k2r_mode}', expected 'ON'${NC}"
         fi
     fi
 
@@ -610,6 +652,23 @@ compare_and_report() {
         local m="$1" mt="$2"
         local v="${values[${m}|${mt}_vals]:-}"
         echo "${v:-SKIP}"
+    }
+    # 从单次启动的日志文件取 metric 中位数（用于同二进制启动对地板计算）
+    _file_med() {
+        local f="$1" mt="$2"
+        [ -f "$f" ] || { echo ""; return; }
+        local v
+        v=$(parse_results "$f" X | awk -F'=' -v k="X|${mt}=" \
+            'index($0, k)==1 {print substr($0, length(k)+1)}' | tr '\n' ' ')
+        [ -z "${v// /}" ] && { echo ""; return; }
+        _median "$v"
+    }
+    # 同二进制两启动中位数的 |Δ|%；任一为空输出空串（该对不可用）
+    _pair_floor() {
+        if [ -n "$1" ] && [ -n "$2" ]; then
+            awk "BEGIN {if (${1}+0 > 0) {d=(${2}-${1}); if (d<0) d=-d; printf \"%.1f\", d/${1}*100}}"
+        fi
+        return 0
     }
 
     # 构建要显示的指标列表（20260816 方案重建后的指标集）
@@ -718,6 +777,38 @@ compare_and_report() {
         SUM_D23[$m_metric]="$d_k2k3"
     done
 
+    # ---- 启动间噪声地板（多对同二进制估计，20260817）----
+    # 同二进制启动对的 |Δ| = QEMU 线程放置 + 时段漂移 + 测量噪声。
+    # 单对估不准：run#178 K0↔K0B=1% 而 K2↔K3=13%（同为同二进制对），
+    # 取所有可用对的最大值作为地板（保守上界）。verdict 中 |K0→K2 Δ|
+    # 低于地板 → INVALID（差异不可分辨于启动漂移）。
+    declare -A FLOOR FLOOR_DETAIL
+    local pf_m pf_a pf_b pf_d pf_max pf_detail pf_fa pf_fb pf_lbl
+    for pf_m in bench_udp64_ns_per_op bench_tcprw_ns_per_op; do
+        pf_max=""; pf_detail=""
+        # 四个同二进制启动对（K2R↔K3 相邻且同为 ON；K0↔K0B 覆盖首尾长程漂移）
+        while IFS='|' read -r pf_fa pf_fb pf_lbl; do
+            [ -z "$pf_lbl" ] && continue
+            pf_a=$(_file_med "$pf_fa" "$pf_m")
+            pf_b=$(_file_med "$pf_fb" "$pf_m")
+            pf_d=$(_pair_floor "$pf_a" "$pf_b")
+            [ -n "$pf_d" ] || continue
+            pf_detail+="${pf_lbl} ${pf_d}%  "
+            if [ -z "$pf_max" ]; then
+                pf_max="$pf_d"
+            elif awk "BEGIN {exit !(${pf_d} > ${pf_max})}"; then
+                pf_max="$pf_d"
+            fi
+        done <<EOF
+${k0_file}|${k0r_file}|K0-K0R
+${k2_file}|${k2r_file}|K2-K2R
+${k2r_file}|${k3_file}|K2R-K3
+${k0_file}|${k0b_file}|K0-K0B
+EOF
+        FLOOR[$pf_m]="${pf_max:-}"
+        FLOOR_DETAIL[$pf_m]="${pf_detail%% }"
+    done
+
     echo ""
     echo "Pass criteria (initial, subject to noise-floor calibration):"
     echo "  Perf-A bench UDP64 ns/op increase (K0→K2):  < 25%"
@@ -731,13 +822,15 @@ compare_and_report() {
     # net_delayacct 是加开销工具，K2 合法优于 K0 不可能；若 K2 反超 K0
     # （degradation<0）说明测量被噪声主导 → INVALID（非 FAIL，避免误报回归方向）。
     # degradation 统一约定：正值=K2 更差（预期方向），负值=K2 更优（噪声）。
+    # 20260817：|Δ| 低于启动间噪声地板也 → INVALID（差异不可分辨于启动漂移）
     echo "Verdict (K0 → K2 primary):"
     local verdict_pass=0 verdict_fail=0 verdict_invalid=0 verdict_skip=0 status
     local v_m v_t v_dir v_unit v_k0 v_k2 v_k0m v_k2m v_drop v_delta_abs
+    local v_floor v_below_floor
 
     # Perf-A 微基准：degradation = (K2-K0)/K0*100，阈值 25%（初始值）。
     # 理论 hook 开销在 64B 路径 ~5-20%（单次 hook ~50-150ns × 4 次 /
-    # 单循环 2-5us）；阈值待 K0-vs-K0B 噪声地板数据积累后收紧
+    # 单循环 2-5us）；阈值待启动间噪声地板数据积累后收紧
     for v_entry in "bench_udp64_ns_per_op:25" "bench_tcprw_ns_per_op:25"; do
         IFS=':' read -r v_m v_t <<< "$v_entry"
         THRESHOLDS[$v_m]="${v_t}%"
@@ -746,11 +839,27 @@ compare_and_report() {
             v_k0m=$(_median "$v_k0"); v_k2m=$(_median "$v_k2")
             v_drop=$(awk "BEGIN {printf \"%.1f\", (${v_k2m}-${v_k0m})/${v_k0m}*100}")
             v_delta_abs=$(awk "BEGIN {printf \"%.2f\", ${v_k2m}-${v_k0m}}")
+            v_floor="${FLOOR[$v_m]:-}"
+            v_below_floor=false
+            if [ -n "$v_floor" ]; then
+                if awk -v d="$v_drop" -v f="$v_floor" 'BEGIN {exit !(d >= 0 && d < f)}'; then
+                    v_below_floor=true
+                fi
+            fi
             status=$(_verdict3 "$v_drop" "$v_t")
+            if [ "$v_below_floor" = true ]; then
+                status="INVALID"
+            fi
             case "$status" in
-                PASS)    echo "  ${GREEN}PASS${NC} $v_m: +${v_drop}% (Δ${v_delta_abs} ns/op) <= ${v_t}% threshold"; verdict_pass=$((verdict_pass+1));;
+                PASS)    echo "  ${GREEN}PASS${NC} $v_m: +${v_drop}% (Δ${v_delta_abs} ns/op) <= ${v_t}% threshold (floor ${v_floor:-n/a}%)"; verdict_pass=$((verdict_pass+1));;
                 FAIL)    echo "  ${RED}FAIL${NC} $v_m: +${v_drop}% (Δ${v_delta_abs} ns/op) > ${v_t}% threshold"; verdict_fail=$((verdict_fail+1));;
-                INVALID) echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"; verdict_invalid=$((verdict_invalid+1));;
+                INVALID)
+                    if [ "$v_below_floor" = true ]; then
+                        echo "  ${YELLOW}INVALID${NC} $v_m: +${v_drop}% below launch-to-launch noise floor ${v_floor}% (indistinguishable from drift, rerun)"
+                    else
+                        echo "  ${YELLOW}INVALID${NC} $v_m: K2<K0 by $(awk -v d="${v_drop}" 'BEGIN{printf "%.1f", (d<0?-d:d)}')% (noise-dominated)"
+                    fi
+                    verdict_invalid=$((verdict_invalid+1));;
             esac
         else
             status="SKIP"
@@ -778,6 +887,10 @@ compare_and_report() {
         b_delta=$(awk -v a="$v_k0m" -v b="$v_k2m" 'BEGIN {printf "%.0f", b - a}')
         echo ""
         echo "  ftrace cross-check (UDP64): measured Δ=${b_delta} ns/op, predicted ≈ hooks/op(${ft_hooks}) × ${ft_ns}ns = ${ft_delta} ns/op"
+        # 实测为负（加开销工具反向变快）= 启动漂移压过 hook 信号的直接证据
+        if [ "$b_delta" -lt 0 ] 2>/dev/null; then
+            echo "  ${YELLOW}note: measured Δ negative — launch-to-launch drift exceeded hook cost (see noise floor)${NC}"
+        fi
     fi
 
     # Perf-4 每 socket 内存：degradation = K2-K0 (bytes)，阈值 192
@@ -874,7 +987,7 @@ compare_and_report() {
     echo ""
     echo "Note: QEMU relative values only. For absolute data, run on physical hardware."
     echo "Note: Thresholds are initial values, subject to calibration with multiple runs."
-    echo "Full logs: $LOG_DIR/perf-{K0,K2,K3}-${TIMESTAMP}.log"
+    echo "Full logs: $LOG_DIR/perf-{K0,K0R,K2,K2R,K3,K0B}-${TIMESTAMP}.log"
 
     # ---- 打印对比表（verdict 计算完成后，回填真实 Thresh/Verdict）----
     echo ""
@@ -905,40 +1018,42 @@ compare_and_report() {
     done
     write_summary_files "$SUMMARY_ROWS" "$k0_mode" "$k2_mode" "${k3_mode:--}"
 
-    # ---- 噪声地板节（B5/B6）：K0(首) vs K0B(尾)，同 OFF 内核 ----
-    # |Δ%| = 宿主机时段漂移 + 测量固有噪声的合成下界。floor >= 静态阈值的
-    # 指标标 NOISY（该环境下判定不可信，需放宽阈值/加轮数/避开忙时段）。
-    # 数据积累多轮后再据此校准静态阈值（本节只报告，不改变判定逻辑）。
-    if [ -n "$k0b_file" ]; then
-        echo "+----------------------------------------------------------------------------------------+"
-        echo "| Noise Floor (K0 first vs K0B last, same OFF kernel)                                     |"
-        echo "+----------------------------------------------------------------------------------------+"
-        printf "| %-26s | %10s | %10s | %10s | %8s | %-6s |\n" \
-            "Metric" "K0(median)" "K0B(median)" "|delta|%" "Thresh" "Usable"
-        echo "+----------------------------------------------------------------------------------------+"
-        local nf_metric nf_k0m nf_k0bm nf_floor nf_thr nf_ok
+    # ---- 噪声地板节（多对同二进制启动，20260817）----
+    # 每对 = 同一 bzImage 的两次 QEMU 启动，|Δ| = 启动放置 + 时段漂移 +
+    # 测量噪声。floor = 全部可用对的最大值（保守上界）。
+    # floor >= 静态阈值的指标标 NOISY（该环境下判定不可信）；verdict 段已
+    # 用 floor 把 |Δ| 低于地板的差异降级 INVALID。数据积累多轮后再校准阈值。
+    local _any_floor=""
+    for nf_m in bench_udp64_ns_per_op bench_tcprw_ns_per_op; do
+        [ -n "${FLOOR[$nf_m]:-}" ] && _any_floor=1
+    done
+    if [ -n "$_any_floor" ]; then
+        echo "+----------------------------------------------------------------------------------------------------------+"
+        echo "| Noise Floor (same-binary launch pairs, floor = max |delta|)                                              |"
+        echo "+----------------------------------------------------------------------------------------------------------+"
+        printf "| %-26s | %-46s | %7s | %6s | %-6s |\n" \
+            "Metric" "pairs (|delta|%)" "floor" "Thresh" "Usable"
+        echo "+----------------------------------------------------------------------------------------------------------+"
+        local nf_metric nf_floor nf_thr nf_ok
         local floor_md="" floor_csv=""
         # 静态阈值须与 verdict 段一致（sock_objsize 确定性无噪声，不在此列）
         for nf_metric in bench_udp64_ns_per_op bench_tcprw_ns_per_op; do
             nf_thr=25
-            nf_k0m="${SUM_MED0[$nf_metric]:-}"
-            nf_k0bm=$(_median "${values[K0B|${nf_metric}_vals]:-}")
-            if [ -n "$nf_k0m" ] && [ -n "$nf_k0bm" ] && \
-               awk "BEGIN {exit !(${nf_k0m} > 0)}"; then
-                nf_floor=$(awk -v a="$nf_k0m" -v b="$nf_k0bm" \
-                    'BEGIN {d=(b-a); if (d<0) d=-d; printf "%.1f", d/a*100}')
+            nf_floor="${FLOOR[$nf_metric]:-}"
+            if [ -n "$nf_floor" ]; then
                 nf_ok=$(awk -v f="$nf_floor" -v t="$nf_thr" \
                     'BEGIN {print (f < t) ? "YES" : "NOISY"}')
             else
                 nf_floor="-"; nf_ok="-"
             fi
-            printf "| %-26s | %10s | %10s | %10s | %8s | %-6s |\n" \
-                "$nf_metric" "${nf_k0m:--}" "${nf_k0bm:--}" "${nf_floor}" "${nf_thr}%" "${nf_ok}"
-            floor_md+="| ${nf_metric} | ${nf_k0m:--} | ${nf_k0bm:--} | ${nf_floor}% | ${nf_thr}% | ${nf_ok} |"$'\n'
-            floor_csv+="${nf_metric}__noise_floor	${SUM_UNIT[$nf_metric]:--}	${SUM_RAW0[$nf_metric]:--}	-	-	${nf_k0m:--}	${nf_k0bm:--}	-	${nf_floor}%	-	-	${nf_thr}%	FLOOR"$'\n'
+            printf "| %-26s | %-46s | %6s%% | %5s%% | %-6s |\n" \
+                "$nf_metric" "${FLOOR_DETAIL[$nf_metric]:--}" "$nf_floor" "$nf_thr" "$nf_ok"
+            floor_md+="| ${nf_metric} | ${FLOOR_DETAIL[$nf_metric]:--} | ${nf_floor}% | ${nf_thr}% | ${nf_ok} |"$'\n'
+            floor_csv+="${nf_metric}__noise_floor	${SUM_UNIT[$nf_metric]:--}	${FLOOR_DETAIL[$nf_metric]:--}	-	-	-	-	-	-	${nf_floor}%	-	-	${nf_thr}%	FLOOR"$'\n'
         done
-        echo "+----------------------------------------------------------------------------------------+"
-        echo "Note: NOISY = |K0-K0B| >= threshold -> verdict for this metric is noise-dominated."
+        echo "+----------------------------------------------------------------------------------------------------------+"
+        echo "Note: NOISY = floor >= threshold -> K0->K2 verdict for this metric is noise-dominated."
+        echo "Note: verdict already treats |K0->K2 delta| < floor as INVALID (indistinguishable from launch drift)."
         echo ""
 
         # 追加到 Markdown / CSV 摘要
@@ -946,10 +1061,10 @@ compare_and_report() {
         local summary_csv_path="$LOG_DIR/perf-summary-${TIMESTAMP}.csv"
         {
             echo ""
-            echo "## Noise Floor (K0 first vs K0B last, same OFF kernel)"
+            echo "## Noise Floor (same-binary launch pairs)"
             echo ""
-            echo "| Metric | K0(median) | K0B(median) | floor(\\|delta\\|%) | Thresh | Usable |"
-            echo "|---|---|---|---|---|---|"
+            echo "| Metric | pairs (\\|delta\\|%) | floor | Thresh | Usable |"
+            echo "|---|---|---|---|---|"
             printf '%s' "$floor_md"
             echo ""
             echo "NOISY = verdict noise-dominated in this environment (threshold below floor)."
@@ -1066,20 +1181,57 @@ done
     # Step 3: 创建 perf initramfs
     create_perf_initramfs
 
-    # Step 4: QEMU 运行各模式
-    # K0: OFF 内核（基线）
+    # Step 4: QEMU 运行各模式（交错重复启动，20260817）
+    #
+    # 根因（run#178 实证）：同二进制启动间漂移 ~10%（K2↔K3 同 bzImage 差
+    # 10.7-12.8%），单次启动内 5 轮中位数却只有 ~1% —— 噪声全部来自
+    # "每次 QEMU 启动"的宿主放置差异（QEMU vCPU 线程被 VM 调度器随机
+    # 放置到不同 VM CPU/物理核）。对策：
+    #   1) 宿主侧绑核（下方 PERF_PIN_CPU）：所有启动用同一 CPU
+    #   2) 交错重复：K0/K2 各启动 2 次，时漂对两者等权；K0R/K2R 结果
+    #      并入 K0/K2 参与中位数，同时提供同二进制启动对给噪声地板
+    # 宿主绑核 CPU 选择：online ∩ allowed 交集的最大号（避开 CPU0 的
+    # IRQ/内核线程聚集），逐个降序用 taskset 试探（某些环境 status 与实际
+    # 可用不一致：如 allowed=0-127 但 online 仅 0-3，绑 127 直接 EINVAL）。
+    # 仅剩 CPU0 或全部不可绑时不绑。
+    PERF_PIN_CPU=""
+    _online=$(cat /sys/devices/system/cpu/online 2>/dev/null || true)
+    _allowed=$(awk '/^Cpus_allowed_list/ {print $2}' /proc/self/status 2>/dev/null || true)
+    _cands=$(awk -v on="${_online:-0-0}" -v al="${_allowed:-0-0}" 'BEGIN {
+        n1 = split(on, O, ","); for (i = 1; i <= n1; i++) { split(O[i], r1, "-"); for (c = r1[1]; c <= r1[2]; c++) online[c] = 1 }
+        n2 = split(al, A, ","); for (i = 1; i <= n2; i++) { split(A[i], r2, "-"); for (c = r2[1]; c <= r2[2]; c++) allowed[c] = 1 }
+        for (c = 0; c < 1024; c++) if (online[c] && allowed[c]) print c
+    }' | sort -rn)
+    for _c in $_cands; do
+        [ "$_c" -lt 1 ] && break
+        if taskset -c "$_c" true 2>/dev/null; then
+            PERF_PIN_CPU="$_c"
+            break
+        fi
+    done
+    if [ -n "$PERF_PIN_CPU" ]; then
+        echo "QEMU vCPU pin target: host CPU $PERF_PIN_CPU (online: ${_online:-?}, allowed: ${_allowed:-?})"
+    else
+        echo "NOTE: no pinnable CPU >0 (single-CPU or restricted), QEMU runs unpinned"
+    fi
+
     run_perf_in_qemu "$BZIMAGE_OFF" "K0" "K0"
     echo ""
     # K2: ON 内核，检测开启，无查询
     run_perf_in_qemu "$BZIMAGE_ON" "K2" "K2"
+    echo ""
+    # K0R/K2R: 交错重复（同二进制第二次启动，合并进 K0/K2 并构成地板对）
+    run_perf_in_qemu "$BZIMAGE_OFF" "K0R" "K0"
+    echo ""
+    run_perf_in_qemu "$BZIMAGE_ON" "K2R" "K2"
     echo ""
     # K3: ON 内核，检测开启 + 主动查询（可选）
     if [ "$WITH_K3" = true ]; then
         run_perf_in_qemu "$BZIMAGE_ON" "K3" "K3"
         echo ""
     fi
-    # K0B: 同 OFF 内核再跑一遍（批次末尾）。B5/B6：K0(首) vs K0B(尾) 提供
-    # 噪声地板（时段漂移 + 测量噪声下界），见 compare_and_report 的 Noise Floor 节
+    # K0B: 同 OFF 内核批次末尾再跑一遍：K0(首) vs K0B(尾) 提供首尾长程
+    # 漂移地板对（与 K0-K0R/K2-K2R/K2R-K3 一起取最大值 = 噪声地板）
     run_perf_in_qemu "$BZIMAGE_OFF" "K0B" "K0"
     echo ""
 

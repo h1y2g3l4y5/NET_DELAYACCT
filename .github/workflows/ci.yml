@@ -520,16 +520,17 @@ jobs:
     runs-on: [self-hosted, linux, kvm]
     needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    # timeout-minutes=30: 微基准方案 4 次 QEMU（K0/K2/K3/K0B），KVM 实测单次 ~60s，
-    #   TCG ~150-200s；TCG 上限 4×360s=24min + apt/download ~3min → 30min 封顶
-    timeout-minutes: 30
+    # timeout-minutes=40: 微基准方案 6 次 QEMU（K0/K2/K0R/K2R/K3/K0B，交错重复
+    #   + 绑核抑制启动间漂移，20260817），KVM 实测单次 ~60s；TCG 上限
+    #   6×360s=36min + apt/download ~3min → 40min 封顶
+    timeout-minutes: 40
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
     # --strict=warn 下 FAIL → exit 0（告警），仅 NO-DATA/INVALID>50% → exit 2（job 失败）。
     # continue-on-error: exit 2 时 workflow 仍 success，CI 界面显示 ⚠️
     continue-on-error: true
     env:
-      # CI 专用 QEMU timeout（每次 QEMU 运行的上限，K0/K2/K3/K0B 各一次）：
+      # CI 专用 QEMU timeout（每次 QEMU 运行的上限，K0/K2/K0R/K2R/K3/K0B 各一次）：
       # KVM 240s: boot ~10s + bench 2项×5轮×~1s + ftrace 对账 + dump ≈ 60s
       # TCG 360s: TCG 回退（无 KVM 时），boot ~120s + 慢速 ftrace buffer 操作
       QEMU_TIMEOUT_KVM: 240
@@ -612,8 +613,11 @@ jobs:
             tests/reports/perf/perf-summary-*.md
             tests/reports/perf/perf-summary-*.csv
             tests/reports/perf/perf-K0-*.log
+            tests/reports/perf/perf-K0R-*.log
             tests/reports/perf/perf-K2-*.log
+            tests/reports/perf/perf-K2R-*.log
             tests/reports/perf/perf-K3-*.log
+            tests/reports/perf/perf-K0B-*.log
           retention-days: 30
 
       - name: Generate perf summary
@@ -651,7 +655,8 @@ jobs:
               echo ""
               echo "| Mode | PERF lines | QEMU rc | Note |"
               echo "|------|-----------|---------|------|"
-              for mode in K0 K2 K3; do
+              # K0R/K2R = 交错重复启动（同二进制第二次，并入 K0/K2 中位数）
+              for mode in K0 K2 K0R K2R K3 K0B; do
                 # K3 log 可能不存在（get_sockdelays 缺失或构建失败时降级），加 || true 避免 set -e 中断 summary
                 mode_log=$(ls -t tests/reports/perf/perf-${mode}-*.log 2>/dev/null | head -1 || true)
                 [ -z "$mode_log" ] && { echo "| ${mode} | - | - | 未运行 |"; continue; }
