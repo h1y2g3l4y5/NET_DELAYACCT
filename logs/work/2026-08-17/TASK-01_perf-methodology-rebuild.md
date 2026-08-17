@@ -178,6 +178,35 @@ ftrace 绝对测量（v6.5.2）已锚定 hook 真实开销 = 每包 4 次 × 0.4
 - CI：待 push 后回填（预期：轮内离散显著收窄、地板回落、K0→K3 符号恢复正向
   或诚实 INVALID）
 
+### 批次 4 追加：codeload 429 三连杀与 action 缓存预填（同日晚）
+
+- **#180（ece6171）/ #181（d56e60c 重触发）perf job 均在 job 初始化阶段死**：
+  从 codeload 下载 `actions/download-artifact@v4`（SHA d3f86a1）3 次重试全 429，
+  连 checkout 都没执行；run 级 conclusion=success 是 continue-on-error 假象，
+  必须 jobs API 逐 job 核对
+- **第一次预填失败根因**：TRAE 沙箱禁写 `/home/lai/actions-runner/_work/_actions/`
+  （mkdir Permission denied → 沙箱拦截），指令静默未落地；且缓存目录名必须用
+  **ci.yml 里的 ref 字符串原样**（`v4`，不是 SHA）——runner 按路径存在性跳过下载
+- **正确预填法**（用户终端执行）：`git clone --branch v4 git@github.com:actions/download-artifact.git`
+  → cp -a 到 `_work/_actions/actions/<name>/v4`，删 .git（runner 走 tarball 口径，
+  不需要 git 元数据）；action 从 dist/index.js 运行，无需 node_modules
+- 重触发：8824b35（run #182），验证预填缓存能否让 perf job 真正跑起来
+
+### run #182 结果（20260818_011516 报告，首次全链路成功）
+
+- **预填缓存生效**：perf job 4m07s 真实执行（此前 429 死于初始化 1m46s），全 6 boot 落地
+- **bench_udp64 K0→K3 = +16.3% PASS**：K0 中位 4438.7 → K3 5161.05 ns/op；
+  K0 样本域 4074-4913 vs K3 4745-5247 接近不重叠；落在方案预测 5-20% 区间，
+  方向为正（加开销变慢）——**新方案首个物理自洽结果**
+- **ftrace 对账**：4.20 hooks/op × 383ns(p50) ≈ 1609ns vs 实测 Δ722ns，
+  同数量级（2.2x，ftrace 自身开销抬高 p50 属已知效应）
+- **RT 节流修复确认**：6 个 boot log 均无 "RT throttling"
+- bench_tcprw -0.3% INVALID：1KB 路径信号被稀释到地板以下，诚实判 INVALID（符合设计）
+- 噪声地板：udp64 13.9%（K0-K0R，首次 OFF boot 仍偏快 8-10%）、tcprw 7.7%；
+  信号 16.3% > 地板 13.9% → udp64 判定可用（Usable=YES）
+- 遗留小项：dump_per_call_us=0.0（疑似测量口径问题，info 级不阻断）；
+  K0 首 boot 偏快现象 → 阈值校准阶段评估是否丢弃各二进制首 boot
+
 ## 遗留
 
 - 阈值校准：积累 5+ 轮 CI 噪声地板数据后收紧 25% 初始阈值
