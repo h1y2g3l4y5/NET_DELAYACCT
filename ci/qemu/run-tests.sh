@@ -575,21 +575,21 @@ echo "|  核心指标: ①不崩溃 ②不遗漏socket ③计数无溢出 ④协
 echo "+--------------------------------------------------------------+"
 
 # ---- Test 09: 高并发多连接 ----
-_test_header "高并发多连接 (iperf3 -P 8)"
+_test_header "高并发多连接 (iperf3 -P 20)"
 if _require iperf3; then
-	_desc \
-		"大量并行连接测试 socket 枚举能力和计数正确性，同时验证方向分离语义（server TX 应远小）" \
-		"iperf3 -P 8 (8 条并行流) → 查 server 验 socket 枚举+RX，查 client 验 TX；反向: server TX 应远小于 client TX" \
-		"server: socket>=9 且 RX>0；client: TX>0；反向: server TX <= client TX/10（server 纯 ACK 不走 sendmsg/clone，TX≈0）"
-	IPERF_PORT=21409
-	iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
-	_SRV=$!
-	sleep 1
-	if kill -0 "$_SRV" 2>/dev/null; then
-		# 8 并行流
-		iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -P 8 -t 5 >/dev/null 2>&1 &
-		_CLI=$!
-		sleep 2
+        _desc \
+                "大量并行连接测试 socket 枚举能力和计数正确性，同时验证方向分离语义（server TX 应远小）" \
+                "iperf3 -P 20 (20 条并行流) → 查 server 验 socket 枚举+RX，查 client 验 TX；反向: server TX 应远小于 client TX" \
+                "server: socket>=21（1 监听 + 20 数据）且 RX>0；client: TX>0；反向: server TX <= client TX/10（server 纯 ACK 不走 sendmsg/clone，TX≈0）"
+        IPERF_PORT=21409
+        iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+        _SRV=$!
+        sleep 1
+        if kill -0 "$_SRV" 2>/dev/null; then
+                # 20 并行流（sleep 3：TCG 下 20 条流建立连接较慢，留足余量再查询）
+                iperf3 -c 127.0.0.1 -p "$IPERF_PORT" -P 20 -t 5 >/dev/null 2>&1 &
+                _CLI=$!
+                sleep 3
 		if kill -0 "$_CLI" 2>/dev/null; then
 			# server 侧：验证 socket 枚举 + RX 计数 + 反向 TX 约束
 			# server 是接收方，TX 以 ACK 为主（不走 sendmsg，按设计不计入），
@@ -610,10 +610,10 @@ if _require iperf3; then
 			CLI_RX_SUM=$(echo "$CLI_OUT" | awk '/RX  count=/{split($2,a,"="); s+=a[2]} END{print s+0}')
 
 			FAILS=0
-			# 正向断言
-			if [ "$SOCK_COUNT" -lt 9 ]; then
+			# 正向断言（21 = 1 监听 + 20 数据 socket）
+			if [ "$SOCK_COUNT" -lt 21 ]; then
 				FAILS=$((FAILS + 1))
-				echo "    server socket_count=$SOCK_COUNT (expect >=9)"
+				echo "    server socket_count=$SOCK_COUNT (expect >=21)"
 			fi
 			if [ "$RX_SUM" -le 0 ]; then
 				FAILS=$((FAILS + 1))
