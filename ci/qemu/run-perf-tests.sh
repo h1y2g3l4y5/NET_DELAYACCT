@@ -13,34 +13,40 @@
 #          p99 ±30-90%（K0-vs-K0B 噪声地板两轮实测 53.6%/90.2%）
 #   iperf3 固定 10s 时长：工作量不固定，调度扰动直接进结果
 #
-# 新方案四支柱：
-#   Perf-A bench-net：固定循环微基准（UDP64 自发自收 + TCP 1KB rw），
-#           绑核 + SCHED_FIFO + QEMU -smp 1，K0/K3 总耗时差 = 插桩
-#           开销，分辨率 ~0.1%，hook 信号在 64B 小包路径放大到 5-20%
-#   Perf-B ftrace 对账（仅 ON 内核）：hook 调用计数（function tracer，
-#           hooks_per_op = trace_count / bench_n）+ 单次 hook 耗时分布
-#           （function_graph 叶子 p50/p99），与 Perf-A 交叉验证：
-#           Δns/op ≈ hooks_per_op × hook_ns_p50
-#   Perf-C slab：TCP slab objsize（确定性，零噪声，保留）
+# 新方案四支柱（20260817 v2 矩阵化：指标收敛为「每包 CPU 成本」）：
+#   Perf-A bench-net：3 维矩阵微基准（路径 udp4/tcp4/udp6/tcp6 × 尺寸
+#           64/1400/65000B × 压力 1/16 流 = 24 格），K0/K3 每格总耗时差
+#           = 该场景每包 CPU 成本；矩阵扫描成本规律（绝对值随尺寸平稳、
+#           相对值 1/尺寸 摊薄）而非单点结论
+#   Perf-B ftrace 对账（仅 ON 内核）：
+#           B1 hooks/op：function tracer 按 path×size 12 格计数
+#              （hooks/op 与流数无关，f1 口径即可），
+#              Δns/op ≈ hooks_per_op × hook_ns_p50 逐格对账
+#           B2 单次耗时：function_graph 叶子 p50/p99，按 4 路径各测一轮
+#   Perf-C slab：TCP slab objsize（确定性，零噪声，单点不进矩阵）
 #   Perf-D dump 计时（K3）：get_sockdelays 全量导出 per-call 耗时
 #           （含 fork+exec；空 socket 表口径，sock 遍历开销另见
 #           功能测试的大数据集用例）
 #
-# K3 语义变更（相对旧方案）：不再跑"后台查询干扰 iperf3"——-smp 1 下
-# SCHED_FIFO 的 bench 会饿死 normal 查询进程，且干扰量 ∝ 环境争抢
-# 程度不可迁移到物理机；导出开销改由 Perf-D 直接量化。
+# K3 语义：dump 在 bench 之后执行，与纯插桩口径 bench 等价
+# （K2 已随 20260817 矩阵简化移除）。
 #
 # 环境变量:
-#   PERF_RUNS (默认 5): bench-net 轮数（每轮自动校准 ~1s）
-#   QUERY_MODE (默认 K3): K3=插桩+dump 计时（K2 已随 20260817 矩阵简化移除，
-#                         dump 在 bench 之后执行，与纯插桩口径 bench 等价）
+#   PERF_RUNS (默认 3): 每格 bench 轮数（24 格 × ~1s/轮 × RUNS 控制总时长；
+#                       host 侧 K0+K0R 跨 boot 合并中位数，6 样本起）
+#   QUERY_MODE (默认 K3): K3=插桩+dump 计时
 #
 # 输出: PERF: key=value 行（host 侧 perf-test.sh 消费）
 
 set -uo pipefail
 
-RUNS="${PERF_RUNS:-5}"
+RUNS="${PERF_RUNS:-3}"
 QUERY_MODE="${QUERY_MODE:-K3}"
+
+# 矩阵定义（与 bench-net.c -m=all 顺序一致）
+PATHS="udp4 tcp4 udp6 tcp6"
+SIZES="64 1400 65000"
+FLOWS_LIST="1 16"
 
 echo "=== NET_DELAYACCT Performance Tests (microbenchmark) ==="
 echo "Kernel: $(uname -r)"
@@ -60,125 +66,152 @@ echo "PERF: kernel=$(uname -r)"
 echo "PERF: runs=$RUNS"
 
 # ----------------------------------------------------------------------------
-# Perf-A: bench-net 固定工作量微基准（ns/op，越小越好）
+# Perf-A: bench-net 矩阵微基准（24 格，每格 RUNS 轮，ns/op 越小越好）
+# 每格独立调用 bench-net（独立校准 N），cell 名 = <path>_<size>f<flows>
 # ----------------------------------------------------------------------------
 perf_a_bench() {
     if ! command -v bench-net >/dev/null 2>&1; then
-        echo "PERF: bench_udp64_ns_per_op_run1=SKIP"
-        echo "PERF: bench_tcprw_ns_per_op_run1=SKIP"
+        local p s
+        for p in $PATHS; do
+            for s in $SIZES; do
+                echo "PERF: bench_${p}_${s}f1_ns_per_op_run1=SKIP"
+            done
+        done
         echo "WARNING: bench-net not found"
         return
     fi
 
-    local out run val
-    out=$(bench-net -r="$RUNS" 2>&1) || true
-    printf '%s\n' "$out" | grep '^BENCH:' | sed 's/^BENCH: /  bench /'
+    local p s f cell out run val bench_err=0
 
-    # 环境控制状态透传（rt=绑核+实时调度；判定口径一致性依赖 K0/K2 同 env）
-    val=$(printf '%s\n' "$out" | grep '^BENCH: env=' | head -1 | sed 's/^BENCH: env=//')
+    # 环境控制状态透传（rt=绑核+实时调度；判定口径一致性依赖 K0/K3 同 env）
+    out=$(bench-net -m=udp4 -s=64 -f=1 -r=1 -n=2000 2>&1) || true
+    val=$(printf '%s\n' "$out" | grep '^BENCH: env=' | head -1 | sed 's/^BENCH: env=//' | cut -d' ' -f1)
     [ -n "$val" ] && echo "PERF: bench_env=$val"
 
-    # 各轮 ns_per_op 转 PERF 协议（bench-net 第 i 行 → run{i}）
-    run=0
-    printf '%s\n' "$out" | grep '^BENCH: udp64 ' | grep -oE 'ns_per_op=[0-9.]+' | cut -d= -f2 | \
-    while read -r val; do
-        run=$((run+1))
-        echo "PERF: bench_udp64_ns_per_op_run${run}=$val"
+    for f in $FLOWS_LIST; do
+        for s in $SIZES; do
+            for p in $PATHS; do
+                cell="${p}_${s}f${f}"
+                out=$(bench-net -m="$p" -s="$s" -f="$f" -r="$RUNS" 2>&1) || true
+                printf '%s\n' "$out" | grep '^BENCH:' | sed 's/^BENCH: /  bench /'
+                if printf '%s\n' "$out" | grep -q '^BENCH: error='; then
+                    bench_err=1
+                    echo "PERF: bench_${cell}_ns_per_op_run1=SKIP"
+                    continue
+                fi
+                run=0
+                printf '%s\n' "$out" | grep "^BENCH: ${cell} " | \
+                    grep -oE 'ns_per_op=[0-9.]+' | cut -d= -f2 | \
+                while read -r val; do
+                    run=$((run+1))
+                    echo "PERF: bench_${cell}_ns_per_op_run${run}=$val"
+                done
+            done
+        done
     done
-    run=0
-    printf '%s\n' "$out" | grep '^BENCH: tcprw ' | grep -oE 'ns_per_op=[0-9.]+' | cut -d= -f2 | \
-    while read -r val; do
-        run=$((run+1))
-        echo "PERF: bench_tcprw_ns_per_op_run${run}=$val"
-    done
-
-    # bench-net 失败（error= 行）时补 SKIP 占位，host 侧解析才不会丢指标
-    if printf '%s\n' "$out" | grep -q '^BENCH: error='; then
-        echo "PERF: bench_error=1"
-    fi
+    [ "$bench_err" = 1 ] && echo "PERF: bench_error=1"
+    return 0
 }
 
 # ----------------------------------------------------------------------------
 # Perf-B: ftrace 对账（仅 ON 内核；信息性，不参与判定）
 #
-# B1 hook 计数：function tracer 只跟踪 net_delayacct_*，跑固定 N 循环，
-#    hooks_per_op = trace 行数 / N。注意 net_delayacct_rx_start 是 inline
-#    （头文件一行赋值，-O2 后无独立符号），计数只覆盖 out-of-line 符号
-#    （tx_start/tx_end/rx_end），hooks_per_op 是下界。
-# B2 单次耗时：function_graph 叶子耗时分布（tracer 自身有开销，此段
-#    bench 的 ns/op 不用于判定，只取 hook 自身 duration）。
+# B1 hooks/op（path×size 12 格，f1 口径）：function tracer 只跟踪
+#    net_delayacct_*，跑固定 N 循环，hooks_per_op = trace 行数 / N。
+#    注意 net_delayacct_rx_start 是 inline（头文件一行赋值，-O2 后无
+#    独立符号），计数只覆盖 out-of-line 符号，hooks_per_op 是下界。
+# B2 单次耗时（4 路径）：function_graph 叶子耗时分布（tracer 自身有
+#    开销，此段 bench 的 ns/op 不用于判定，只取 hook 自身 duration）。
 # ----------------------------------------------------------------------------
 perf_b_ftrace() {
     local TDIR=/sys/kernel/tracing
     [ -d "$TDIR" ] || TDIR=/sys/kernel/debug/tracing
 
     if [ "$DELAYACCT_MODE" != "ON" ]; then
-        echo "PERF: ftrace_hooks_per_op_run1=SKIP"
-        echo "PERF: ftrace_hook_ns_p50_run1=SKIP"
+        local p s
+        for p in $PATHS; do
+            for s in $SIZES; do
+                echo "PERF: ftrace_hooks_per_op_${p}_${s}f1_run1=SKIP"
+            done
+            echo "PERF: ftrace_hook_ns_p50_${p}_run1=SKIP"
+        done
         return
     fi
     if [ ! -e "$TDIR/current_tracer" ]; then
         mount -t tracefs none /sys/kernel/tracing 2>/dev/null || true
     fi
     if [ ! -w "$TDIR/current_tracer" ]; then
-        echo "PERF: ftrace_hooks_per_op_run1=SKIP"
-        echo "PERF: ftrace_hook_ns_p50_run1=SKIP"
+        local p s
+        for p in $PATHS; do
+            for s in $SIZES; do
+                echo "PERF: ftrace_hooks_per_op_${p}_${s}f1_run1=SKIP"
+            done
+            echo "PERF: ftrace_hook_ns_p50_${p}_run1=SKIP"
+        done
         return
     fi
 
-    # trace buffer 扩容：2 万循环 × 3-4 符号 × ~90B/行 ≈ 7MB
+    # trace buffer 扩容：5000 循环 × ~16 hook × ~90B/行 ≈ 7MB
     echo 8192 > "$TDIR/buffer_size_kb" 2>/dev/null || true
     echo 0 > "$TDIR/tracing_on"
 
-    # ---- B1: hook 调用计数（function tracer）----
+    # ---- B1: hooks/op 计数（function tracer，path×size 12 格）----
+    local nfun
     echo > "$TDIR/set_ftrace_filter" 2>/dev/null
     echo 'net_delayacct_*' > "$TDIR/set_ftrace_filter" 2>/dev/null
-    local nfun
     nfun=$(grep -c . "$TDIR/set_ftrace_filter" 2>/dev/null || echo 0)
-    local BENCH_N=5000
-    if [ "${nfun:-0}" -ge 1 ] 2>/dev/null; then
-        echo function > "$TDIR/current_tracer" 2>/dev/null
-        echo > "$TDIR/trace"
-        echo 1 > "$TDIR/tracing_on"
-        bench-net -m=udp64 -n="$BENCH_N" -r=1 >/dev/null 2>&1 || true
-        echo 0 > "$TDIR/tracing_on"
-        local cnt
-        cnt=$(grep -c 'net_delayacct' "$TDIR/trace" 2>/dev/null || echo 0)
-        echo "PERF: ftrace_hook_funcs=$nfun"
-        if [ "$cnt" -gt 0 ] 2>/dev/null; then
-            awk -v c="$cnt" -v n="$BENCH_N" \
-                'BEGIN {printf "PERF: ftrace_hooks_per_op_run1=%.2f\n", c/n}'
-        else
-            echo "PERF: ftrace_hooks_per_op_run1=SKIP"
-        fi
-    else
-        echo "PERF: ftrace_hooks_per_op_run1=SKIP"
-    fi
+    echo "PERF: ftrace_hook_funcs=$nfun"
 
-    # ---- B2: 单次 hook 耗时（function_graph 叶子 duration）----
-    if [ "${nfun:-0}" -ge 1 ] 2>/dev/null; then
-        echo > "$TDIR/set_graph_function" 2>/dev/null
-        echo 'net_delayacct_*' > "$TDIR/set_graph_function" 2>/dev/null
-        echo function_graph > "$TDIR/current_tracer" 2>/dev/null
-        echo > "$TDIR/trace"
-        echo 1 > "$TDIR/tracing_on"
-        bench-net -m=udp64 -n=20000 -r=1 >/dev/null 2>&1 || true
-        echo 0 > "$TDIR/tracing_on"
-        # 叶子行格式： "   0)   0.440 us    |  net_delayacct_tx_start();"
-        printf '%s\n' "$(grep 'net_delayacct' "$TDIR/trace" 2>/dev/null)" | \
-        awk '$3 == "us" {print $2 * 1000}' | sort -n | awk '
-            {a[NR]=$1}
-            END {
-                if (NR==0) {print "PERF: ftrace_hook_ns_p50_run1=SKIP"; exit}
-                p50=(NR%2==1)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2
-                p99=a[int((NR*99+99)/100)]
-                printf "PERF: ftrace_hook_ns_p50_run1=%.0f\n", p50
-                printf "PERF: ftrace_hook_ns_p99_run1=%.0f\n", p99
-                printf "PERF: ftrace_hook_ns_n_run1=%d\n", NR
-            }'
-    else
-        echo "PERF: ftrace_hook_ns_p50_run1=SKIP"
-    fi
+    local p s cell BENCH_N=5000 cnt
+    for p in $PATHS; do
+        for s in $SIZES; do
+            cell="${p}_${s}f1"
+            if [ "${nfun:-0}" -ge 1 ] 2>/dev/null; then
+                echo function > "$TDIR/current_tracer" 2>/dev/null
+                echo > "$TDIR/trace"
+                echo 1 > "$TDIR/tracing_on"
+                bench-net -m="$p" -s="$s" -f=1 -n="$BENCH_N" -r=1 >/dev/null 2>&1 || true
+                echo 0 > "$TDIR/tracing_on"
+                cnt=$(grep -c 'net_delayacct' "$TDIR/trace" 2>/dev/null || echo 0)
+                if [ "$cnt" -gt 0 ] 2>/dev/null; then
+                    awk -v c="$cnt" -v n="$BENCH_N" -v cell="$cell" \
+                        'BEGIN {printf "PERF: ftrace_hooks_per_op_%s_run1=%.2f\n", cell, c/n}'
+                else
+                    echo "PERF: ftrace_hooks_per_op_${cell}_run1=SKIP"
+                fi
+            else
+                echo "PERF: ftrace_hooks_per_op_${cell}_run1=SKIP"
+            fi
+        done
+    done
+
+    # ---- B2: 单次 hook 耗时（function_graph 叶子 duration，4 路径）----
+    local GR_N=20000
+    for p in $PATHS; do
+        if [ "${nfun:-0}" -ge 1 ] 2>/dev/null; then
+            echo > "$TDIR/set_graph_function" 2>/dev/null
+            echo 'net_delayacct_*' > "$TDIR/set_graph_function" 2>/dev/null
+            echo function_graph > "$TDIR/current_tracer" 2>/dev/null
+            echo > "$TDIR/trace"
+            echo 1 > "$TDIR/tracing_on"
+            bench-net -m="$p" -s=64 -f=1 -n="$GR_N" -r=1 >/dev/null 2>&1 || true
+            echo 0 > "$TDIR/tracing_on"
+            # 叶子行格式： "   0)   0.440 us    |  net_delayacct_tx_start();"
+            printf '%s\n' "$(grep 'net_delayacct' "$TDIR/trace" 2>/dev/null)" | \
+            awk '$3 == "us" {print $2 * 1000}' | sort -n | awk -v p="$p" '
+                {a[NR]=$1}
+                END {
+                    if (NR==0) {printf "PERF: ftrace_hook_ns_p50_%s_run1=SKIP\n", p; exit}
+                    p50=(NR%2==1)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2
+                    p99=a[int((NR*99+99)/100)]
+                    printf "PERF: ftrace_hook_ns_p50_%s_run1=%.0f\n", p, p50
+                    printf "PERF: ftrace_hook_ns_p99_%s_run1=%.0f\n", p, p99
+                    printf "PERF: ftrace_hook_ns_n_%s_run1=%d\n", p, NR
+                }'
+        else
+            echo "PERF: ftrace_hook_ns_p50_${p}_run1=SKIP"
+        fi
+    done
 
     # 清理：关 tracer、清 filter，避免残留影响后续测试
     echo nop > "$TDIR/current_tracer" 2>/dev/null

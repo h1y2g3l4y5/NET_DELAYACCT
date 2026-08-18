@@ -89,7 +89,7 @@ trap 'rm -f "$PERF_EXIT_FILE"' EXIT
 # ============================================================================
 
 # bench-net 每项测试轮数（每轮自动校准 ~1s，中位数抗噪）
-PERF_RUNS="${PERF_RUNS:-5}"
+PERF_RUNS="${PERF_RUNS:-3}"
 
 # ============================================================================
 # 辅助函数
@@ -534,7 +534,9 @@ write_summary_files() {
         echo ""
         echo "## 判定说明"
         echo ""
-        echo "- 主判定基于 K0→K3 的 Perf-A 微基准（bench_udp64 / bench_tcprw ns/op）"
+        echo "- 主判定基于 K0→K3 的 Perf-A 矩阵微基准（bench_<path>_<size>f<flows>"
+        echo "  ns/op，4 路径 × 3 尺寸 × 2 压力 = 24 格；每格 Δns/op = 该场景"
+        echo "  每包 CPU 成本，Δ% 随尺寸 1/size 摊薄属预期物理规律）"
         echo "- K0/K3 各交错启动 2 次（K0R/K3R 并入中位数），QEMU vCPU 线程"
         echo "  宿主侧绑核，抑制同二进制启动间漂移（实测可达 10%+）"
         echo "- K2 模式已移除（20260817）：与 K3 同 bzImage 且 bench 阶段一致，"
@@ -579,7 +581,7 @@ compare_and_report() {
     # 键格式: "${mode}|${metric}_vals"，值为空格分隔的多次运行结果
     declare -A values
     # 摘要表存储：按 metric 存各列，verdict 段回填 threshold/verdict 后统一生成摘要行
-    declare -A SUM_UNIT SUM_RAW0 SUM_RAW3 SUM_MED0 SUM_MED3
+    declare -A SUM_UNIT SUM_RAW0 SUM_RAW3 SUM_MED0 SUM_MED3 SUM_ABS
     declare -A SUM_D03 VERDICTS THRESHOLDS
 
     local mode metric val dropped=0
@@ -678,23 +680,41 @@ compare_and_report() {
         return 0
     }
 
-    # 构建要显示的指标列表（20260816 方案重建后的指标集）
+    # ---- 矩阵格动态发现（bench_<cell>_ns_per_op，cell=<path>_<size>f<flows>）----
+    # 以 K0 侧出现的键为准（K3 侧 ftrace 指标 K0 无）；顺序按字母排序
+    # （同路径格相邻：tcp4_* / tcp6_* / udp4_* / udp6_*）
+    local bench_cells=()
+    while IFS= read -r _cell; do
+        [ -n "$_cell" ] && bench_cells+=("$_cell")
+    done < <(printf '%s\n' "${!values[@]}" | sed -n 's/^K0|bench_\(.*\)_ns_per_op_vals$/\1/p' | sort -u)
+    if [ "${#bench_cells[@]}" -eq 0 ]; then
+        echo "${RED}No bench matrix cells found in K0 log (expected bench_<path>_<size>f<flows>)${NC}"
+        PERF_EXIT=2
+        return 1
+    fi
+    echo "Matrix cells: ${#bench_cells[@]} (paths x sizes x flows)"
+
+    # 构建要显示的指标列表（20260817 v2 矩阵化）
     # 格式: "metric:unit:direction"，direction: increase/abs
-    #   bench_*：Perf-A 微基准，verdict 主判定（increase，K3>K0 = 更差）
-    #   ftrace_*：Perf-B 对账，info（Δns/op ≈ hooks_per_op × hook_ns 的锚点）
+    #   bench_*：Perf-A 矩阵微基准（动态发现），verdict 主判定
+    #   ftrace_hooks_per_op_*：Perf-B 逐格 hook 计数，info
+    #   ftrace_hook_ns_*：Perf-B 逐路径单次耗时，info
     #   dump_*：Perf-D K3 导出计时，info
-    #   sock_objsize：Perf-C slab，确定性判定
+    #   sock_objsize：Perf-C slab，确定性判定（不进矩阵，单点）
     local table_metrics=()
-    table_metrics+=("bench_udp64_ns_per_op:ns/op:increase")
-    table_metrics+=("bench_tcprw_ns_per_op:ns/op:increase")
+    local _bc
+    for _bc in "${bench_cells[@]}"; do
+        table_metrics+=("bench_${_bc}_ns_per_op:ns/op:increase")
+    done
     table_metrics+=("sock_objsize_bytes:bytes:abs")
-    # ftrace 对账指标仅 ON 内核产出（K0/OFF 无符号），列存在即显示
-    if [ -n "${values[K3|ftrace_hooks_per_op_vals]:-}" ]; then
-        table_metrics+=("ftrace_hooks_per_op:hooks:info")
-    fi
-    if [ -n "${values[K3|ftrace_hook_ns_p50_vals]:-}" ]; then
-        table_metrics+=("ftrace_hook_ns_p50:ns:info")
-    fi
+    # ftrace 对账指标仅 ON 内核产出（K0/OFF 无符号），键存在即显示
+    local _fk
+    while IFS= read -r _fk; do
+        [ -n "$_fk" ] && table_metrics+=("${_fk}:hooks:info")
+    done < <(printf '%s\n' "${!values[@]}" | sed -n 's/^K3|\(ftrace_hooks_per_op_.*\)_vals$/\1/p' | sort -u)
+    while IFS= read -r _fk; do
+        [ -n "$_fk" ] && table_metrics+=("${_fk}:ns:info")
+    done < <(printf '%s\n' "${!values[@]}" | sed -n 's/^K3|\(ftrace_hook_ns_p50_.*\)_vals$/\1/p' | sort -u)
     # K3 dump 计时（含 fork+exec 口径）
     if [ -n "${values[K3|dump_per_call_us_vals]:-}" ]; then
         table_metrics+=("dump_per_call_us:us:info")
@@ -737,6 +757,13 @@ compare_and_report() {
         SUM_MED0[$m_metric]="${k0_med:-SKIP}"
         SUM_MED3[$m_metric]="${k3_med:-SKIP}"
         SUM_D03[$m_metric]="$d_k0k3"
+        # Δns/op：bench 格的每包 CPU 成本（主指标，绝对量）
+        if [[ "$m_metric" == bench_* ]] && [ -n "$k0_med" ] && [ -n "$k3_med" ]; then
+            SUM_ABS[$m_metric]=$(awk -v a="$k0_med" -v b="$k3_med" \
+                'BEGIN {printf "%+.0f", b-a}')
+        else
+            SUM_ABS[$m_metric]="-"
+        fi
     done
 
     # ---- 启动间噪声地板（多对同二进制估计，20260817）----
@@ -745,8 +772,9 @@ compare_and_report() {
     # 取所有可用对的最大值作为地板（保守上界）。verdict 中 |K0→K3 Δ|
     # 低于地板 → INVALID（差异不可分辨于启动漂移）。
     declare -A FLOOR FLOOR_DETAIL
-    local pf_m pf_a pf_b pf_d pf_max pf_detail pf_fa pf_fb pf_lbl
-    for pf_m in bench_udp64_ns_per_op bench_tcprw_ns_per_op; do
+    local pf_m pf_cell pf_a pf_b pf_d pf_max pf_detail pf_fa pf_fb pf_lbl
+    for pf_cell in "${bench_cells[@]}"; do
+        pf_m="bench_${pf_cell}_ns_per_op"
         pf_max=""; pf_detail=""
         # 三个同二进制启动对（K0↔K0B 覆盖首尾长程漂移）
         while IFS='|' read -r pf_fa pf_fb pf_lbl; do
@@ -772,10 +800,9 @@ EOF
 
     echo ""
     echo "Pass criteria (initial, subject to noise-floor calibration):"
-    echo "  Perf-A bench UDP64 ns/op increase (K0→K3):  < 25%"
-    echo "  Perf-A bench TCP rw ns/op increase (K0→K3):  < 25%"
+    echo "  Perf-A matrix bench ns/op increase (K0→K3):   < 25% per cell (24 cells)"
     echo "  Perf-C Per-socket memory:                    <= 192 bytes (slab-aligned, raw struct ~72B)"
-    echo "  (ftrace 对账: Δns/op ≈ hooks_per_op × hook_ns_p50，info 级不判定)"
+    echo "  (ftrace 对账: Δns/op ≈ hooks_per_op × hook_ns_p50，逐格交叉验证，info 级不判定)"
     echo ""
 
     # ---- 自动判定（三态：PASS / FAIL / INVALID）----
@@ -786,14 +813,14 @@ EOF
     # 20260817：|Δ| 低于启动间噪声地板也 → INVALID（差异不可分辨于启动漂移）
     echo "Verdict (K0 → K3 primary):"
     local verdict_pass=0 verdict_fail=0 verdict_invalid=0 verdict_skip=0 status
-    local v_m v_t v_dir v_unit v_k0 v_k3 v_k0m v_k3m v_drop v_delta_abs
+    local v_m v_t v_dir v_unit v_k0 v_k3 v_k0m v_k3m v_drop v_delta_abs v_cell
     local v_floor v_below_floor
 
-    # Perf-A 微基准：degradation = (K3-K0)/K0*100，阈值 25%（初始值）。
-    # 理论 hook 开销在 64B 路径 ~5-20%（单次 hook ~50-150ns × 4 次 /
-    # 单循环 2-5us）；阈值待启动间噪声地板数据积累后收紧
-    for v_entry in "bench_udp64_ns_per_op:25" "bench_tcprw_ns_per_op:25"; do
-        IFS=':' read -r v_m v_t <<< "$v_entry"
+    # Perf-A 矩阵微基准（逐格）：degradation = (K3-K0)/K0*100，阈值 25%（初始值）。
+    # 理论 hook 开销：64B 格 ~5-20%（信号最强），1400B 格 ~1-3%，
+    # 65000B 格 <0.5%（GSO 摊薄，预期多为 below-floor INVALID，属物理规律）
+    for v_cell in "${bench_cells[@]}"; do
+        v_m="bench_${v_cell}_ns_per_op"; v_t=25
         THRESHOLDS[$v_m]="${v_t}%"
         v_k0="${values[K0|${v_m}_vals]:-}"; v_k3="${values[K3|${v_m}_vals]:-}"
         if [ -n "$v_k0" ] && [ -n "$v_k3" ]; then
@@ -833,25 +860,34 @@ EOF
     # 旧 iperf3 指标（tcp_latency_* / cpu_per_gbps / idle_cpu_pct）随方案
     # 重建移除：其噪声地板（5-90%）远超信号（0.5-2%），判定无物理意义
 
-    # Perf-B ftrace 对账（info，不参与 verdict）：
-    #   Δns/op(实测) ≈ hooks_per_op × hook_ns_p50(单次)
-    # 数量级吻合则微基准差值可归因到 hook，不吻合提示测量异常
-    local ft_hooks ft_ns ft_delta b_delta
-    ft_hooks="${values[K3|ftrace_hooks_per_op_run1_vals]:-}"
-    ft_hooks=$(printf '%s' "$ft_hooks" | awk '{print $1}')
-    ft_ns="${values[K3|ftrace_hook_ns_p50_run1_vals]:-}"
-    ft_ns=$(printf '%s' "$ft_ns" | awk '{print $1}')
-    v_k0m=$(_med_of K0 bench_udp64_ns_per_op)
-    v_k3m=$(_med_of K3 bench_udp64_ns_per_op)
-    if [ -n "$ft_hooks" ] && [ -n "$ft_ns" ] && [ -n "$v_k0m" ] && [ -n "$v_k3m" ]; then
-        ft_delta=$(awk -v h="$ft_hooks" -v n="$ft_ns" 'BEGIN {printf "%.0f", h * n}')
-        b_delta=$(awk -v a="$v_k0m" -v b="$v_k3m" 'BEGIN {printf "%.0f", b - a}')
-        echo ""
-        echo "  ftrace cross-check (UDP64): measured Δ=${b_delta} ns/op, predicted ≈ hooks/op(${ft_hooks}) × ${ft_ns}ns = ${ft_delta} ns/op"
-        # 实测为负（加开销工具反向变快）= 启动漂移压过 hook 信号的直接证据
-        if [ "$b_delta" -lt 0 ] 2>/dev/null; then
-            echo "  ${YELLOW}note: measured Δ negative — launch-to-launch drift exceeded hook cost (see noise floor)${NC}"
+    # Perf-B ftrace 逐格对账（info，不参与 verdict）：
+    #   Δns/op(实测) ≈ hooks_per_op(该格) × hook_ns_p50(该路径)
+    # 数量级吻合则微基准差值可归因到 hook，不吻合提示测量异常。
+    # hooks_per_op 只测 f1 格（与流数无关），f16 格沿用同 path×size 计数
+    local ft_cell ft_path ft_hooks ft_ns ft_delta b_delta ft_k0m ft_k3m
+    local any_xcheck=0
+    echo ""
+    echo "  ftrace cross-check (per cell):"
+    for ft_cell in "${bench_cells[@]}"; do
+        # cell = <path>_<size>f<flows> → path×size 部分
+        ft_path="${ft_cell%f*}"           # "udp4_64"（f1 与 f16 共用）
+        ft_hooks="${values[K3|ftrace_hooks_per_op_${ft_path}f1_vals]:-}"
+        ft_hooks=$(printf '%s' "$ft_hooks" | awk '{print $1}')
+        # 单次耗时按路径取（cell 前缀去 _size）
+        local ft_ponly="${ft_path%%_*}"   # "udp4"
+        ft_ns="${values[K3|ftrace_hook_ns_p50_${ft_ponly}_vals]:-}"
+        ft_ns=$(printf '%s' "$ft_ns" | awk '{print $1}')
+        ft_k0m=$(_med_of K0 "bench_${ft_cell}_ns_per_op")
+        ft_k3m=$(_med_of K3 "bench_${ft_cell}_ns_per_op")
+        if [ -n "$ft_hooks" ] && [ -n "$ft_ns" ] && [ -n "$ft_k0m" ] && [ -n "$ft_k3m" ]; then
+            ft_delta=$(awk -v h="$ft_hooks" -v n="$ft_ns" 'BEGIN {printf "%.0f", h * n}')
+            b_delta=$(awk -v a="$ft_k0m" -v b="$ft_k3m" 'BEGIN {printf "%.0f", b - a}')
+            any_xcheck=1
+            echo "    ${ft_cell}: measured Δ=${b_delta} ns/op, predicted ≈ ${ft_hooks} hooks × ${ft_ns}ns = ${ft_delta} ns/op"
         fi
+    done
+    if [ "$any_xcheck" = 0 ]; then
+        echo "    (no ftrace hooks/hook-ns data — K3 log missing ftrace metrics?)"
     fi
 
     # Perf-C 每 socket 内存：degradation = K3-K0 (bytes)，阈值 192
@@ -949,22 +985,30 @@ EOF
     echo "Full logs: $LOG_DIR/perf-{K0,K0R,K3,K3R,K0B}-${TIMESTAMP}.log"
 
     # ---- 打印对比表（verdict 计算完成后，回填真实 Thresh/Verdict）----
+    # Δns/op 列 = 每包 CPU 成本（主指标，绝对量）；Δ% 列 = 相对开销量级
+    # bench 格显示短名（去 bench_ 前缀与 _ns_per_op 后缀）
     echo ""
-    echo "+--------------------------------------------------------------------------+"
-    echo "|          NET_DELAYACCT Performance Comparison (K0 vs K3)                 |"
-    echo "+--------------------------------------------------------------------------+"
-    printf "| %-26s | %9s | %9s | %9s | %7s | %-6s |\n" \
-        "Metric" "K0" "K3" "K0→K3" "Thresh" "Verdict"
-    echo "+--------------------------------------------------------------------------+"
-    local entry _t_metric
+    echo "+-----------------------------------------------------------------------------------------------+"
+    echo "|              NET_DELAYACCT Per-Packet CPU Cost Matrix (K0 vs K3)                              |"
+    echo "+-----------------------------------------------------------------------------------------------+"
+    printf "| %-28s | %9s | %9s | %7s | %8s | %6s | %-7s |\n" \
+        "Cell (path_size_flows)" "K0" "K3" "Δns/op" "Δ%" "Thresh" "Verdict"
+    echo "+-----------------------------------------------------------------------------------------------+"
+    local entry _t_metric _t_lbl
     for entry in "${table_metrics[@]}"; do
         _t_metric="${entry%%:*}"
-        printf "| %-26s | %9s | %9s | %9s | %7s | %-6s |\n" \
-            "$_t_metric" "${SUM_MED0[$_t_metric]:-SKIP}" "${SUM_MED3[$_t_metric]:-SKIP}" \
-            "${SUM_D03[$_t_metric]:--}" \
+        _t_lbl="$_t_metric"
+        [[ "$_t_lbl" == bench_* ]] && _t_lbl="${_t_lbl#bench_}" && _t_lbl="${_t_lbl%_ns_per_op}"
+        case "$_t_lbl" in
+            ftrace_hooks_per_op_*) _t_lbl="hooks/${_t_lbl#ftrace_hooks_per_op_}";;
+            ftrace_hook_ns_p50_*)  _t_lbl="hookns/${_t_lbl#ftrace_hook_ns_p50_}";;
+        esac
+        printf "| %-28s | %9s | %9s | %7s | %8s | %6s | %-7s |\n" \
+            "$_t_lbl" "${SUM_MED0[$_t_metric]:-SKIP}" "${SUM_MED3[$_t_metric]:-SKIP}" \
+            "${SUM_ABS[$_t_metric]:--}" "${SUM_D03[$_t_metric]:--}" \
             "${THRESHOLDS[$_t_metric]:--}" "${VERDICTS[$_t_metric]:-info}"
     done
-    echo "+--------------------------------------------------------------------------+"
+    echo "+-----------------------------------------------------------------------------------------------+"
     echo ""
 
     # 生成结构化摘要报告（Markdown + CSV）
@@ -982,8 +1026,9 @@ EOF
     # floor >= 静态阈值的指标标 NOISY（该环境下判定不可信）；verdict 段已
     # 用 floor 把 |Δ| 低于地板的差异降级 INVALID。数据积累多轮后再校准阈值。
     local _any_floor=""
-    for nf_m in bench_udp64_ns_per_op bench_tcprw_ns_per_op; do
-        [ -n "${FLOOR[$nf_m]:-}" ] && _any_floor=1
+    local _nf_cell
+    for _nf_cell in "${bench_cells[@]}"; do
+        [ -n "${FLOOR[bench_${_nf_cell}_ns_per_op]:-}" ] && _any_floor=1
     done
     if [ -n "$_any_floor" ]; then
         echo "+----------------------------------------------------------------------------------------------------------+"
@@ -995,7 +1040,8 @@ EOF
         local nf_metric nf_floor nf_thr nf_ok
         local floor_md="" floor_csv=""
         # 静态阈值须与 verdict 段一致（sock_objsize 确定性无噪声，不在此列）
-        for nf_metric in bench_udp64_ns_per_op bench_tcprw_ns_per_op; do
+        for _nf_cell in "${bench_cells[@]}"; do
+            nf_metric="bench_${_nf_cell}_ns_per_op"
             nf_thr=25
             nf_floor="${FLOOR[$nf_metric]:-}"
             if [ -n "$nf_floor" ]; then
@@ -1004,8 +1050,8 @@ EOF
             else
                 nf_floor="-"; nf_ok="-"
             fi
-            printf "| %-26s | %-46s | %6s%% | %5s%% | %-6s |\n" \
-                "$nf_metric" "${FLOOR_DETAIL[$nf_metric]:--}" "$nf_floor" "$nf_thr" "$nf_ok"
+            printf "| %-26s | %-46s | %7s | %6s | %-6s |\n" \
+                "$_nf_cell" "${FLOOR_DETAIL[$nf_metric]:--}" "$nf_floor" "$nf_thr" "$nf_ok"
             floor_md+="| ${nf_metric} | ${FLOOR_DETAIL[$nf_metric]:--} | ${nf_floor}% | ${nf_thr}% | ${nf_ok} |"$'\n'
             floor_csv+="${nf_metric}__noise_floor	${SUM_UNIT[$nf_metric]:--}	${FLOOR_DETAIL[$nf_metric]:--}	-	-	-	${nf_floor}%	${nf_thr}%	FLOOR"$'\n'
         done

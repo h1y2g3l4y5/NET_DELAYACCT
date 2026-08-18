@@ -522,7 +522,8 @@ jobs:
     if: github.event_name == 'push'
     # timeout-minutes=40: 微基准方案 6 次 QEMU（WARM 预热 + K0/K3/K0R/K3R/K0B
     #   交错重复 + 绑核，K2 已移除——与 K3 同 bzImage 且 bench 阶段一致，纯冗余），
-    #   KVM 实测单次 ~60s；TCG 上限 6×360s=36min + apt/download ~3min → 40min 封顶
+    #   20260817 v2 矩阵化：每 boot bench 24 格×3 轮 ≈ 75s（KVM）
+    #   KVM 单次 ~110s；TCG 上限 6×360s=36min + apt/download ~3min → 40min 封顶
     timeout-minutes: 40
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
@@ -530,8 +531,8 @@ jobs:
     # continue-on-error: exit 2 时 workflow 仍 success，CI 界面显示 ⚠️
     continue-on-error: true
     env:
-      # CI 专用 QEMU timeout（每次 QEMU 运行的上限，K0/K2/K0R/K2R/K3/K0B 各一次）：
-      # KVM 240s: boot ~10s + bench 2项×5轮×~1s + ftrace 对账 + dump ≈ 60s
+      # CI 专用 QEMU timeout（每次 QEMU 运行的上限，K0/K3/K0R/K3R/K0B 各一次）：
+      # KVM 240s: boot ~10s + bench 24格×3轮×~1s + ftrace 16格 + dump ≈ 110s
       # TCG 360s: TCG 回退（无 KVM 时），boot ~120s + 慢速 ftrace buffer 操作
       QEMU_TIMEOUT_KVM: 240
       QEMU_TIMEOUT_TCG: 360
