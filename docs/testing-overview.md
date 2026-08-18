@@ -210,9 +210,43 @@ WARM (OFF, 预热丢弃) → K0 (OFF 基线) → K3 (ON 带插桩) → K0R → K
 结论三依据：幅度落在理论预测区间（5-20%）；方向正确（变慢而非变快）；
 两条独立证据互相印证。
 
-## 6. 环境要求
+## 6. 测试环境
 
-- 功能测试：QEMU（KVM 优先，TCG 兜底），ON 内核 bzImage + initramfs
-- Test 23/24 需 CONFIG_FTRACE + 可写 tracefs（缺失时 SKIP）
-- 性能测试：KVM 强制（TCG 下 hook 耗时膨胀 10x，仅作冒烟）；self-hosted runner
-- 内核：基于 Linux 6.6，CONFIG_NET_DELAYACCT=y（on）/n（off）双构建
+### 6.1 被测内核
+
+| 项 | 值 |
+|----|-----|
+| 内核源码 | linux-stable `linux-6.6.y` 分支 |
+| 架构 | x86_64 |
+| ON 内核 | 6.6 + NET_DELAYACCT 补丁系列（CONFIG_NET_DELAYACCT=y） |
+| OFF 内核 | 同版本 6.6 原生（CONFIG_NET_DELAYACCT=n），性能基线 |
+| 构建配置 | defconfig + `ci/qemu/kernel-qemu.config`（QEMU 启动 + FTRACE + netem）+ `ci/qemu/kernel-delayacct.config`（仅 ON） |
+
+### 6.2 测试执行环境
+
+| 项 | 值 |
+|----|-----|
+| CI 平台 | GitHub Actions；构建 job 在 ubuntu-22.04 托管 runner |
+| 功能/性能执行 | self-hosted runner（Ubuntu 22.04 VM，VMware 虚拟化，4 vCPU） |
+| QEMU | 6.2.0（qemu-system-x86_64，KVM 加速，TCG 兜底） |
+| guest 介质 | bzImage + initramfs（busybox 提供 shell/工具） |
+
+### 6.3 工具版本（guest initramfs 内 + host 构建）
+
+| 工具 | 版本 | 用途 |
+|------|------|------|
+| busybox | 1.30.1 | guest 侧 shell 与基础工具 |
+| iperf3 | 3.9 | 功能测试流量源（T01-18, T22, T25） |
+| ncat (nc) | Ubuntu 22.04 仓库版 | T02/T08 socket 构造 |
+| gcc | 11.4.0 | 现场编译 bench-net 微基准与 get_sockdelays |
+| get_sockdelays | 本仓库 userspace/ 自研 | 查询工具（被测对象之一） |
+| bench-net | 本仓库 ci/qemu/ 自研 | 固定工作量微基准 |
+| tc netem / iptables | Ubuntu 22.04 仓库版 | T23 S7 丢包注入（双轨备选） |
+| ftrace / kprobe | 内核 6.6 自带 | T23/T24 动态验证 + 性能对账 |
+
+### 6.4 性能测试专属环境
+
+- QEMU `-smp 1`（单 vCPU），vCPU 线程宿主侧 taskset 绑核
+- guest cmdline 追加 `sysctl.kernel.sched_rt_runtime_us=-1`（禁 RT 节流）、`nokaslr`
+- KVM 强制；TCG 仅作冒烟（hook 耗时膨胀 ~10x，不作判定）
+- 每个 K 模式 5 轮 bench，每轮自动校准 ~1s；K0/K3 各 2 次开机取中位数
