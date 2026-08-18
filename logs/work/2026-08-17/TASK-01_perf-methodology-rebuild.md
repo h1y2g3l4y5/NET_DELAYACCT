@@ -212,3 +212,60 @@ ftrace 绝对测量（v6.5.2）已锚定 hook 真实开销 = 每包 4 次 × 0.4
 - 阈值校准：积累 5+ 轮 CI 噪声地板数据后收紧 25% 初始阈值
 - KVM 下 ftrace 单次 hook 耗时应回到 0.4-1.4us 量级（对账式更准），CI 首轮确认
 - v6.6.0：actions v4→v5 升级等顺延项不变
+
+## 批次 5：指标体系收敛 + 24 格矩阵化（2026-08-19，用户决策）
+
+### 用户决策链
+
+1. 用户质疑"现有性能测试存在很大问题需重新设计"，先厘清测什么：
+   CPU 占用率（导出量，不测）/ socket 内存（确定性单点）/ hook 单次+单包延迟
+   （本征量）/ 吞吐影响（导出量，不测——包大摊薄包大放大，运维可自算）
+2. 拍板：**只展示每包 CPU 成本（Δns/op）作为主指标**，吞吐百分比弃测；
+   tcprw 单点砍掉；内存单点不进矩阵
+3. 矩阵范围（AskUserQuestion 确认）：核心 4 路径（udp4/tcp4/udp6/tcp6）×
+   3 尺寸（64/1400/65000B）× 2 压力（1/16 流交错）= **24 格**；
+   冷门路径（splice/zerocopy/corked）不进矩阵（hook 同批函数，功能测试已覆盖）
+
+### 设计要点
+
+- **本征量 vs 导出量**：每包 CPU 成本（~700ns/包）是工具固有属性，一次测准
+  处处可用；吞吐 % = 固有成本 ÷ 包大小，是负载函数非工具属性——上游 cover
+  letter 惯例也是报绝对开销
+- **物理预期写进判定语义**：税按 skb 收不按字节收 → 各尺寸格 Δns 绝对值
+  应近似平稳（~500-800ns），Δ% 随 1/尺寸 摊薄（64B ~16% → 65000B <1%
+  落入噪声地板下判 INVALID 是预期形态，不是失败）——24 格矩阵就是
+  "包大影响小"论断的实证曲线
+- 压力维度 = 同核 16 socket 轮转（测统计结构 cache 局部性）；跨核锁争用
+  需 -smp>1 会重新引入调度噪声，明确不测（写进 bench-net.c 头注释）
+
+### 实现（commit b2e7312）
+
+- **bench-net.c v2**（61% 重写）：通用引擎 `-m=<path> -s=<size> -f=<flows>`；
+  UDP/TCP 均支持 v4/v6 + 16 流交错；TCP 65000B 单 write 走 1 个 GSO 大 skb
+  （验证"税按 skb 收"的关键格）；tcprw 模式删除。本机全路径验证：
+  udp4_64f1/tcp4_65000f2/udp6_1400f16/tcp6_1400f1 全通
+- **run-perf-tests.sh**：24 格独立调用编排；ftrace B1 升级为 path×size
+  12 格 hooks/op 计数（f1 口径，hooks/op 与流数无关）；B2 单次耗时按 4 路径
+  各测一轮；PERF_RUNS 5→3（24 格×3 轮 ≈ 旧 2 指标×5 轮同时长）
+- **perf-test.sh**：host 侧改为**动态发现矩阵格**（从 K0 log 键扫描
+  bench_*_ns_per_op，不再硬编码指标名）；逐格三态判定 + 逐格噪声地板；
+  对比表新增 **Δns/op 列**（主指标）+ Δ% 列；ftrace 对账逐格化；表名改为
+  "Per-Packet CPU Cost Matrix"
+- **验证方式**：TRAE 沙箱禁 QEMU/禁写内核树 → 端到端假数据 harness
+  （/tmp/t_report.sh：生成 5 份假 K0/K0R/K0B/K3/K3R log 驱动
+  compare_and_report 全链路）——24 格全发现、64B/1400B PASS、
+  65000B below-floor INVALID、地板表 24 行、PERF_EXIT=0 全部符合预期；
+  source <(...) 被沙箱拦（/dev/fd）→ 先落地 /tmp/perf-lib.sh 再 source
+
+### 踩坑
+
+- Edit 工具 old_string 必须与文件逐字节一致（注释里 K0/K2 vs K0/K3 一字之差
+  连续失败两次）——先 Read 再改，别凭记忆
+- 沙箱内 `source <(sed ...)` 会因 /dev/fd 受限报 "cannot create directory
+  /dev/fd/tests"——先写实体文件再 source
+
+### 状态
+
+- 本地：bash -n / gcc -fsyntax-only / 假数据端到端 全过
+- CI run 32165279912（b2e7312）验证中，预期形态：64B/1400B 格 PASS、
+  65000B 格 INVALID（below-floor）、每 boot ~110s（bench 24×3 ≈ 75s）
