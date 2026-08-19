@@ -24,9 +24,18 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libelf-dev libssl-dev \
-            bison flex libncurses-dev libmnl-dev ccache perl
+          # 托管 runner apt 镜像偶发拥堵/挂起（#188 三个 job 卡本步骤 40min 被迫取消）：
+          # timeout 防挂起 + 3 次重试；最终失败 fail fast（避免后续步骤混淆报错）
+          for i in 1 2 3; do
+            timeout 120 sudo apt-get update && break
+            echo "apt update retry $i"; sleep $((i*15))
+          done || true
+          for i in 1 2 3; do
+            timeout 300 sudo apt-get install -y build-essential libelf-dev libssl-dev \
+              bison flex libncurses-dev libmnl-dev ccache perl && break
+            echo "apt install retry $i"; sleep $((i*15))
+          done
+          command -v gcc >/dev/null || { echo "::error::apt install failed after 3 retries"; exit 1; }
 
       - name: Checkout linux-stable (shallow, with retry)
         run: |
@@ -82,9 +91,17 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libelf-dev libssl-dev \
-            bison flex libncurses-dev libmnl-dev ccache bc
+          # 托管 runner apt 镜像偶发拥堵/挂起（#188 卡本步骤 40min）：timeout 防挂起 + 重试
+          for i in 1 2 3; do
+            timeout 120 sudo apt-get update && break
+            echo "apt update retry $i"; sleep $((i*15))
+          done || true
+          for i in 1 2 3; do
+            timeout 300 sudo apt-get install -y build-essential libelf-dev libssl-dev \
+              bison flex libncurses-dev libmnl-dev ccache bc && break
+            echo "apt install retry $i"; sleep $((i*15))
+          done
+          command -v gcc >/dev/null || { echo "::error::apt install failed after 3 retries"; exit 1; }
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -185,8 +202,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libmnl-dev ccache
+          # 托管 runner apt 镜像偶发拥堵/挂起（#188 卡本步骤 40min）：timeout 防挂起 + 重试
+          for i in 1 2 3; do
+            timeout 120 sudo apt-get update && break
+            echo "apt update retry $i"; sleep $((i*15))
+          done || true
+          for i in 1 2 3; do
+            timeout 300 sudo apt-get install -y build-essential libmnl-dev ccache && break
+            echo "apt install retry $i"; sleep $((i*15))
+          done
+          command -v gcc >/dev/null || { echo "::error::apt install failed after 3 retries"; exit 1; }
 
       - name: Cache ccache
         uses: actions/cache@v4
