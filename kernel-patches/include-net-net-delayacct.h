@@ -6,12 +6,20 @@
  * Inline helpers are used at the RX/TX instrumentation points so that
  * when the option is disabled the compiler eliminates them entirely,
  * yielding zero runtime overhead.
+ *
+ * When the option is enabled, the hooks can additionally be turned
+ * off at runtime through the net_delayacct.enabled module parameter
+ * (backed by a static key).  With the switch off each hook body is
+ * skipped via a single patched jump while the binary stays identical
+ * to the fully-enabled build — the prerequisite for same-boot A/B
+ * measurement of the per-hook cost.
  */
 #ifndef _NET_DELAYACCT_H
 #define _NET_DELAYACCT_H
 
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
+#include <linux/jump_label.h>
 #include <linux/skbuff.h>
 #include <uapi/linux/net-delayacct.h>
 
@@ -33,6 +41,26 @@ struct net_delayacct {
 };
 
 #ifdef CONFIG_NET_DELAYACCT
+
+/*
+ * Runtime switch backing the net_delayacct.enabled module parameter
+ * (/sys/module/net_delayacct/parameters/enabled, default on).
+ * Defined in net/core/net-delayacct.c and enabled at boot unless the
+ * parameter was set to 0 on the kernel command line.
+ */
+extern struct static_key_false net_delayacct_key;
+
+/**
+ * net_delayacct_enabled - report whether delay accounting is active
+ *
+ * Backed by a static key: with the switch off this compiles to a
+ * patched no-op jump, so it is cheap enough to consult on every
+ * packet.
+ */
+static inline bool net_delayacct_enabled(void)
+{
+	return static_branch_unlikely(&net_delayacct_key);
+}
 
 /**
  * net_delayacct_init - initialize per-socket delay accounting state
@@ -58,6 +86,8 @@ static inline void net_delayacct_init(struct net_delayacct *n)
  * The timestamp is carried in skb->delayacct_start and consumed by
  * net_delayacct_rx_end() when the payload is delivered to user space.
  *
+ * No-op when the runtime switch (net_delayacct.enabled) is off.
+ *
  * Granularity note: when GRO merges multiple fragments into one skb,
  * rx_start is stamped on the merged skb and therefore captures the
  * arrival time of the last fragment, not the first.  This is a design
@@ -66,7 +96,8 @@ static inline void net_delayacct_init(struct net_delayacct *n)
  */
 static inline void net_delayacct_rx_start(struct sk_buff *skb)
 {
-	skb->delayacct_start = ktime_get_ns();
+	if (net_delayacct_enabled())
+		skb->delayacct_start = ktime_get_ns();
 }
 
 /**
@@ -78,6 +109,9 @@ static inline void net_delayacct_rx_start(struct sk_buff *skb)
  * to the per-socket RX total.  If skb->delayacct_start is 0 (the
  * start point was not hit, e.g. for locally generated loopback
  * traffic), the call is a no-op.
+ *
+ * Returns immediately when the runtime switch (net_delayacct.enabled)
+ * is off, without touching the per-socket state.
  *
  * Call-site semantics (deliberate asymmetry between TCP and UDP):
  *  - TCP: rx_end is recorded at skb dequeue time (found_ok_skb in
@@ -114,6 +148,8 @@ void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb);
  *    _frames() (covers all corked flush paths: do_append_data,
  *    splice_eof, setsockopt(UDP_CORK=0)).
  *
+ * No-op when the runtime switch (net_delayacct.enabled) is off.
+ *
  * Control packets (pure ACK, RST, zero-window probe) are allocated
  * via alloc_skb which zero-initializes delayacct_start; tx_end guards
  * against start==0 so they are not counted.
@@ -138,6 +174,9 @@ void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb);
  *
  * Computes the delta from skb->delayacct_start to "now" and adds it
  * to the per-socket TX total.  Called from dev_queue_xmit.
+ *
+ * Returns immediately when the runtime switch (net_delayacct.enabled)
+ * is off, without touching the per-socket state.
  *
  * Granularity note: tx_end runs in dev_queue_xmit, before qdisc
  * enqueue and GSO segmentation, so a GSO super-packet is accounted

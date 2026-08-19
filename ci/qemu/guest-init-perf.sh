@@ -3,19 +3,15 @@
 #
 # guest-init-perf.sh — 性能测试专用 guest init（简化版）
 #
-# 与 guest-init.sh 的区别：
-#   - 跳过 get_sockdelays 诊断（OFF 内核无 genl family，诊断会失败产生噪音）
-#   - 直接运行 /opt/run-perf-tests.sh
-#   - 适用于 K0/K2/K3 三模式对比测试
-#
-# K0/K2/K3 模式说明：
-#   K0: OFF 内核（CONFIG_NET_DELAYACCT=n），无插桩开销（基线）
-#   K2: ON 内核，检测开启，无主动查询（纯插桩开销）
-#   K3: ON 内核，检测开启 + 主动查询（导出开销，需 get_sockdelays）
+# 20260819 v3 同 boot A/B：
+#   AB  boot（ON 内核）：run-perf-tests.sh 检测到
+#       /sys/module/net_delayacct/parameters/enabled 后，在同一 boot 内
+#       交错翻转 OFF/ON 跑 24 格矩阵（消除启动间漂移与二进制布局差异）
+#   OFF boot（OFF 内核）：仅采集 slab 基线（sock_objsize，编译期确定值）
+#   K0/K2/K3 三模式 boot 编排已废弃（v2 跨 boot 对比不可归因）
 #
 # 内核 cmdline 参数（host 侧 perf-test.sh 传入）：
-#   query_mode=K0|K2|K3          K3 = 附加 dump 计时（Perf-D）
-#   perf_runs=N                  bench-net 轮数（默认 5）
+#   perf_runs=N                  AB 对数（默认 3，每对 = OFF 块 + ON 块）
 #
 # Invoked via kernel cmdline: init=/init
 
@@ -25,9 +21,12 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo "=== QEMU perf guest boot: $(date -u) ==="
 
-# Watchdog: force poweroff after 600s
-# 微基准矩阵单次 ~40s（bench 5 轮×2 项×~1s + ftrace 对账 + dump），余量充足
-( sleep 600; echo "WATCHDOG: forcing poweroff after 600s timeout"; poweroff -f ) &
+# Watchdog: force poweroff after 660s
+# AB 模式单 boot 时长：boot ~10s + 6 块×24 格×~1.3s ≈ 190s + ftrace ~15s
+# + dump ~5s ≈ 220s（KVM）；TCG ~3x（boot 120s + 同量级 bench）≈ 350-500s。
+# 660s 兜底覆盖 TCG；host 侧 QEMU timeout（KVM 300s / TCG 700s）为外层
+# 第二道防线，二者独立。
+( sleep 660; echo "WATCHDOG: forcing poweroff after 660s timeout"; poweroff -f ) &
 WATCHDOG_PID=$!
 
 # --- Mount essential filesystems ---
@@ -46,8 +45,7 @@ mount -t tmpfs  tmpfs  /dev/shm 2>/dev/null || true
 #       在 set -e 下会导致 init 退出 → 内核 panic（exitcode=0x100）
 # ----------------------------------------------------------------------------
 # 默认值与 run-perf-tests.sh 保持一致；仅在 cmdline 显式给出时覆盖
-export QUERY_MODE="${QUERY_MODE:-K2}"
-export PERF_RUNS="${PERF_RUNS:-5}"
+export PERF_RUNS="${PERF_RUNS:-3}"
 
 _cmdline_arg() {
     # 用 awk 从 /proc/cmdline 提取 key=value（仅取第一个匹配）
@@ -65,13 +63,11 @@ _cmdline_arg() {
 }
 
 # || true 防止 awk 读取失败时 set -e 终止 init（双重保险）
-_val=$(_cmdline_arg query_mode) || true
-[ -n "$_val" ] && export QUERY_MODE="$_val"
 _val=$(_cmdline_arg perf_runs) || true
 [ -n "$_val" ] && export PERF_RUNS="$_val"
 unset _val _cmdline_arg
 
-echo "[guest-init] perf params: QUERY_MODE=$QUERY_MODE PERF_RUNS=$PERF_RUNS"
+echo "[guest-init] perf params: PERF_RUNS=$PERF_RUNS (AB pairs)"
 
 # --- Bring up loopback ---
 ip link set lo up 2>/dev/null || true
@@ -84,24 +80,23 @@ RESULT_FILE="/root/test-output.txt"
 {
     echo "=== QEMU Perf Run: $(date -u) ==="
     echo "Kernel: $(uname -r)"
-    echo "Query mode: $QUERY_MODE"
-    echo "Bench rounds: $PERF_RUNS"
+    echo "AB pairs: $PERF_RUNS"
     echo ""
 
     if [ -x "/opt/run-perf-tests.sh" ]; then
         echo "--- Running run-perf-tests.sh ---"
         set +e
-        # perf test timeout 540s：微基准矩阵 ~40s（bench 2 项×RUNS 轮×~1s
-        # + ftrace 对账 + dump），大余量容纳 TCG 慢速路径
+        # perf test timeout 660s：同 boot A/B（bench 6 块×24 格×~1.3s
+        # + ftrace 对账 + dump），KVM ~220s，TCG ~500s，大余量兜底
         if command -v bash >/dev/null 2>&1; then
-            timeout 540 bash /opt/run-perf-tests.sh 2>&1
+            timeout 660 bash /opt/run-perf-tests.sh 2>&1
         else
-            timeout 540 sh /opt/run-perf-tests.sh 2>&1
+            timeout 660 sh /opt/run-perf-tests.sh 2>&1
         fi
         rc=$?
         set -e
         if [ "$rc" -eq 124 ]; then
-            echo "  (perf tests timed out after 540s)"
+            echo "  (perf tests timed out after 660s)"
         elif [ "$rc" -ne 0 ]; then
             echo "  (perf tests exited with rc=$rc)"
         fi

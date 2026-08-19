@@ -269,3 +269,137 @@ ftrace 绝对测量（v6.5.2）已锚定 hook 真实开销 = 每包 4 次 × 0.4
 - 本地：bash -n / gcc -fsyntax-only / 假数据端到端 全过
 - CI run 32165279912（b2e7312）验证中，预期形态：64B/1400B 格 PASS、
   65000B 格 INVALID（below-floor）、每 boot ~110s（bench 24×3 ≈ 75s）
+
+## 批次 6：CI 首轮矩阵结果验证（2026-08-19）
+
+### Run 32165279912 结果（report perf-test-20260819_013741）
+
+- perf job **success**（--strict=warn 下 22 INVALID 不阻塞），6 boot 全部完成
+  （WARM→K0→K3→K0R→K3R→K0B，每 boot ~110s 符合预算）
+- 24 格全发现，判定形态：**2 PASS / 22 INVALID** + sock_objsize PASS
+  - PASS：udp4_64f1 +665ns (+15.9%)、udp6_64f1 +784ns (+17.9%)
+  - 其余 22 格 |Δ| 均低于各自噪声地板（6-25%）→ INVALID（"测不出"，预期形态）
+- **核心信号两轮独立复现**：run #182 单点 udp64 = +16.3%，本轮 udp4_64f1 = +15.9%
+  —— 跨 CI run 一致，信号真实
+
+### 与批次 5 预期的偏差
+
+- 预期"64B/1400B PASS"过于乐观：本轮启动间噪声地板 6-25%（udp4_65000f16
+  K0-K0B 达 100%），1400B 格预期信号 ~+5-8%（税额 500-800ns 摊到 ~5μs 基线）
+  低于地板 → INVALID 是物理必然。run #182 时地板 ~3% 是宿主状态好的特例，
+  共享宿主地板在 3-25% 间波动——**只有 64B 格具备常判能力**，矩阵其余格
+  是"预期形态记录"而非判定格
+- ftrace 对账系统性高估：B2 hook_ns_p50 = 289-318ns 含 function tracer 自身
+  开销（每 hook 点插桩 ~150ns），udp4 预测 4.2×298 ≈ 1254ns vs 实测 +665ns
+  （52%）；反推真实裸 hook ≈ 665/4.2 ≈ 158ns/次。对账应视为**上界估计**，
+  文档需注明口径
+
+### 数据可信度交叉检查（原始 per-boot 中位数）
+
+- K0 合并 4163/4530/4577，K3 合并 4898/4258 —— K3R(4258) < K0R(4530)
+  出现"ON 比 OFF 快"，即启动间漂移（14%）可淹没 K0→K3 差值的铁证；
+  K3 主值 4898 与 K0 4163 差 +17.6% 仍显著 → 中位数口径下信号占优
+- hooks/op 两次 ON boot 完全一致（udp 4.20 / tcp 5.60）——确定性计数，稳定
+
+### 遗留问题（下批次）
+
+1. **QEMU runtime test job 被取消**：runs-on ubuntu-22.04（GitHub-hosted），
+   Install dependencies 步骤 cancelled（17:32-17:47），run 整体 cancelled；
+   矩阵化未动功能测试代码，需 re-run 确认无回归
+2. perf job display name 仍为 "K0 vs K2 vs K3"（K2 已删）→ 改 "K0 vs K3"
+3. 文档补充 ftrace hook_ns 口径说明（含 tracer 开销，真实值减半）
+4. INVALID>50% 阻塞规则与矩阵口径的适配待评估（当前 warn 模式未阻塞，
+   但 22/24 INVALID 若换 strict 模式会 exit 2）
+
+## 批次 7：v3 同 boot A/B —— static key 运行时开关（2026-08-19，用户决策）
+
+### 根因：v2 跨 boot 对比的"ON 比 OFF 快"物理矛盾
+
+批次 6 数据交叉检查发现 K3R(4258) < K0R(4530)：ON 内核比 OFF 内核快
+在物理上不可能（多干活不会更快），矛盾指向两重不可归因噪声：
+
+1. **二进制布局差异**：ON 内核 struct sock +128B → 全内核对象布局/
+   cache 局部性变化，性能影响可正可负，与 hook 开销（~158ns/次）混叠
+2. **启动间漂移**：QEMU vCPU 线程宿主放置随机（实测 10-14%），高于
+   多数格信号（1400B/65000B 格 <3%）
+
+对策（用户拍板）：内核补丁加**运行时开关**，同一 ON 内核 boot 内交错
+翻转 OFF/ON 测 24 格——二进制逐字节相同 → 布局差异归零；同 boot 差分
+→ 启动间漂移被抵消，残余噪声仅轮间抖动 ~1-3%。信噪比恢复后 24 格
+全部具备判定能力（v2 只有 64B 格可判的限制解除）。
+
+### 改动清单
+
+**内核补丁（kernel-patches/）**：
+- `include-net-net-delayacct.h`：`DEFINE_STATIC_KEY_FALSE(net_delayacct_key)`
+  声明 + `net_delayacct_enabled()` 内联判断（static_branch_unlikely）；
+  `net_delayacct_rx_start` 加开关检查
+- `net-core-net-delayacct.c`：static key 定义 + `enabled` 模块参数
+  （module_param_cb 自定义 setter，翻转 static_branch_enable/disable，
+  0644 权限）；rx_end/tx_start/tx_end 入口加开关检查；mod_init 按
+  cmdline 参数启用；0006/0007 补丁已重新生成
+- 开关接口：`/sys/module/net_delayacct/parameters/enabled`（Y/N）
+
+**guest 侧（ci/qemu/）**：
+- `run-perf-tests.sh`：boot 模式自检（switch 存在→AB；ON 内核无开关→
+  ON_NOSWITCH 防呆；OFF 内核→仅 slab）；开关往返自检（0→1→0→1 翻转
+  失败→switch_check=fail + 全 SKIP）；`perf_a_bench_ab` 交错翻转 OFF/ON
+  各跑 24 格（起始状态逐对交替），输出 `bench_<cell>_ns_per_op_{off,on}_run<k>`
+- `guest-init-perf.sh`：watchdog 660s（AB boot 更长）；cmdline 解析
+  perf_runs；移除 QUERY_MODE
+
+**host 侧（perf-test.sh）**：
+- boot 编排 6→2 次：K0（OFF 内核仅 slab，兼预热）+ AB（ON 内核全套）
+- `parse_ab_results`（off/on 双前缀样本分离）+ `parse_k0_results`
+- 逐格三态判定 `_verdict_ab`：Δ%>25 FAIL / [-5,25] PASS / <-5 INVALID
+  （同 boot 下 on 显著快于 off = 开关失效/异常，非噪声）
+- ftrace 对账用 AB boot 数据；sock_objsize 用 K0 vs AB（编译期确定值）
+- 移除噪声地板节（K0R/K3R/K0B 启动对不存在了，残余噪声由 off spread
+  随行输出）
+
+**ci.yml**：job 名 → "Performance test (KVM, same-boot A/B)"；
+timeout 40→30min；QEMU timeout KVM 240→280 / TCG 360→620（AB boot
+~220s KVM / ~500s TCG）；artifact 路径 K0/AB；诊断段 mode 自检
+（mode≠AB / switch_check=fail 提示）
+
+**文档**：testing-overview.md §4.4 重写（2 次 boot + 运行时开关原理）、
+§4.7 判定规则（INVALID 新语义 + 防呆链路）、§5 历史口径注记、§6.4 环境
+
+### 假数据 harness 验证（/tmp/gen_harness.sh）
+
+物理模型：Δns 恒定 158（税按 skb 收），off 基线按 path/size/flows 缩放，
+run 间 ±1% 抖动；ftrace hooks=3.5 × 45ns = 157.5 预测值。结果：
+
+- 24 格全发现；23 PASS + 1 INVALID（注入 udp6_65000f16 on=-12% 模拟
+  开关失效格）→ 三态判定正确
+- ftrace 对账逐格 matched（measured 158 ≈ predicted 158）
+- sock_objsize K0 2240 vs AB 2368 → +128 PASS
+- warn 模式 1/24 INVALID → exit 0；ALL-INVALID 变体（24/25）→ exit 2
+- 表格对齐、md/csv 摘要生成正常
+
+### 本批次发现并修复的 2 个既有 bug
+
+1. `parse_ab_results` 双前缀：key 去 `_ns_per_op_off_run` 后缀后已含
+   `bench_` 前缀，再拼 `bench_` → `bench_bench_*`，且 cell 名与
+   `ftrace_hooks_per_op_<cell>` 错位导致对账失配（v2 引入，对账行一直
+   没出现过就是这个原因）
+2. INVALID>50% 阻断失效：`[ "$verdict_invalid" * 2 -gt "$evaluated" ]`
+   非法算术（`*` 被 glob 展开，test 报错返回 2 → if 恒假）→ 该规则
+   自 v2 引入以来从未生效；改 `$((verdict_invalid * 2))`
+
+### 批次 6 遗留闭环
+
+- 遗留 #2（job 名）：已改 "same-boot A/B" ✓
+- 遗留 #3（ftrace 口径）：testing-overview.md §4.5 已有口径说明
+  （预测值是上界，反推裸 hook ≈158ns）✓
+- 遗留 #4（INVALID>50% 与矩阵口径适配）：v3 下 INVALID 语义收窄为
+  "开关失效/测量异常"，>50% 阻断合理；算术 bug 已修 ✓
+- 遗留 #1（功能测试 job 被取消 re-run）：待本次 push 的 CI 验证
+
+### 遗留问题（下批次）
+
+1. CI 首轮 v3 实测验证：观察 mode=AB 自检、开关翻转、24 格判定形态
+   （预期全部可判而非 22 INVALID）、AB boot 时长是否在 280s 内
+2. static key 开关对 checkpatch 的影响（0006/0007 已过本地检查，CI 复核）
+3. 阈值校准：v3 下残余噪声 ~1-3%，25% 阈值和 -5% 容差可在积累 3-5 轮
+   数据后收窄

@@ -16,6 +16,12 @@
  * one netlink message per socket (mirroring the dump style of
  * taskstats / sock_diag).
  *
+ * The hot-path hooks are guarded by a static key (net_delayacct_key)
+ * so they can be switched at runtime through the "enabled" module
+ * parameter: /sys/module/net_delayacct/parameters/enabled.  With the
+ * switch off the hooks reduce to a patched no-op jump, which allows
+ * measuring the per-hook cost with a same-boot A/B comparison.
+ *
  * Locking order:
  *   rcu_read_lock()
  *     -> task_lock(task)
@@ -28,6 +34,8 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/jump_label.h>
+#include <linux/moduleparam.h>
 #include <linux/spinlock.h>
 #include <linux/sched.h>
 #include <linux/sched/task.h>
@@ -50,6 +58,49 @@
 #include <net/netlink.h>
 #include <linux/net-delayacct.h>
 #include <net/net-delayacct.h>
+
+/*
+ * Runtime switch for the hot-path hooks (see include/net/net-delayacct.h).
+ * Starts disabled; net_delayacct_mod_init() turns it on at boot unless
+ * net_delayacct.enabled=0 was given on the kernel command line.  After
+ * boot it can be flipped through /sys/module/net_delayacct/parameters/
+ * enabled, so the hook cost can be measured with a same-boot A/B
+ * comparison on an otherwise identical binary.
+ */
+DEFINE_STATIC_KEY_FALSE(net_delayacct_key);
+
+/* Shadow value of the "enabled" module parameter, kept in sync by the
+ * param setter so an explicit cmdline value survives until late init.
+ */
+static bool net_delayacct_param_enabled = true;
+
+static int net_delayacct_enabled_set(const char *val,
+				     const struct kernel_param *kp)
+{
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(val, &enable);
+	if (ret)
+		return ret;
+
+	if (enable)
+		static_branch_enable(&net_delayacct_key);
+	else
+		static_branch_disable(&net_delayacct_key);
+
+	*(bool *)kp->arg = enable;
+	return 0;
+}
+
+static const struct kernel_param_ops net_delayacct_enabled_ops = {
+	.set	= net_delayacct_enabled_set,
+	.get	= param_get_bool,
+};
+
+module_param_cb(enabled, &net_delayacct_enabled_ops,
+		&net_delayacct_param_enabled, 0644);
+MODULE_PARM_DESC(enabled, "enable per-socket delay accounting hooks");
 
 static const struct nla_policy
 net_delayacct_policy[NET_DELAYACCT_A_MAX + 1] = {
@@ -762,6 +813,9 @@ void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb)
 	u64 start = skb->delayacct_start;
 	u64 delta;
 
+	if (!net_delayacct_enabled())
+		return;
+
 	if (!start)
 		return;
 
@@ -783,6 +837,9 @@ void net_delayacct_rx_end(struct sock *sk, struct sk_buff *skb)
 
 void net_delayacct_tx_start(struct sock *sk, struct sk_buff *skb)
 {
+	if (!net_delayacct_enabled())
+		return;
+
 	skb->delayacct_start = ktime_get_ns();
 	/*
 	 * Note on skb->sk lifetime: we intentionally do NOT call
@@ -809,6 +866,9 @@ void net_delayacct_tx_end(struct sock *sk, struct sk_buff *skb)
 	struct net_delayacct *n;
 	u64 start = skb->delayacct_start;
 	u64 delta;
+
+	if (!net_delayacct_enabled())
+		return;
 
 	if (!start || !sk)
 		return;
@@ -868,8 +928,17 @@ static int __init net_delayacct_mod_init(void)
 		       ret);
 		return ret;
 	}
-	pr_info("net_delayacct: framework registered v2 (family=%u)\n",
-		net_delayacct_genl_family.id);
+
+	/* Turn on the hot-path hooks unless net_delayacct.enabled=0 was
+	 * given on the kernel command line (the param setter already
+	 * synced the static key in that case).
+	 */
+	if (net_delayacct_param_enabled)
+		static_branch_enable(&net_delayacct_key);
+
+	pr_info("net_delayacct: framework registered v2 (family=%u, hooks %s)\n",
+		net_delayacct_genl_family.id,
+		static_key_enabled(&net_delayacct_key) ? "on" : "off");
 	return 0;
 }
 

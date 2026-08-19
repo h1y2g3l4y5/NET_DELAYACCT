@@ -513,29 +513,32 @@ jobs:
           retention-days: 30
 
   perf-test:
-    name: Performance test (KVM, K0 vs K2 vs K3)
+    name: Performance test (KVM, same-boot A/B)
     # self-hosted runner（本地 VM，有 KVM 加速）
     # 注册 runner 时需加 linux + kvm 标签：./config.sh --labels linux,kvm
     # 前置条件：VM 需安装 qemu-system-x86, busybox-static, cpio, iproute2, libmnl0, gcc
     runs-on: [self-hosted, linux, kvm]
     needs: [build-kernel, build-tool]
     if: github.event_name == 'push'
-    # timeout-minutes=40: 微基准方案 6 次 QEMU（WARM 预热 + K0/K3/K0R/K3R/K0B
-    #   交错重复 + 绑核，K2 已移除——与 K3 同 bzImage 且 bench 阶段一致，纯冗余），
-    #   20260817 v2 矩阵化：每 boot bench 24 格×3 轮 ≈ 75s（KVM）
-    #   KVM 单次 ~110s；TCG 上限 6×360s=36min + apt/download ~3min → 40min 封顶
-    timeout-minutes: 40
+    # timeout-minutes=30: 20260819 v3 同 boot A/B，boot 编排 6→2 次：
+    #   boot1 K0（OFF 内核，仅 slab 基线 ~15s KVM / ~130s TCG）
+    #   boot2 AB（ON 内核，同 boot 交错翻转 OFF/ON：bench 6 块×24 格
+    #   + ftrace 对账 + dump ≈ 220s KVM / ~500s TCG）
+    #   KVM 合计 ~4min；TCG 上限 2×620s≈21min + apt/download ~3min → 30min 封顶
+    timeout-minutes: 30
     # 性能回归不阻塞功能合并（v6.5.0 议题5 共识）：
     # perf-test 用于趋势监控，非功能正确性门禁。
     # --strict=warn 下 FAIL → exit 0（告警），仅 NO-DATA/INVALID>50% → exit 2（job 失败）。
     # continue-on-error: exit 2 时 workflow 仍 success，CI 界面显示 ⚠️
     continue-on-error: true
     env:
-      # CI 专用 QEMU timeout（每次 QEMU 运行的上限，K0/K3/K0R/K3R/K0B 各一次）：
-      # KVM 240s: boot ~10s + bench 24格×3轮×~1s + ftrace 16格 + dump ≈ 110s
-      # TCG 360s: TCG 回退（无 KVM 时），boot ~120s + 慢速 ftrace buffer 操作
-      QEMU_TIMEOUT_KVM: 240
-      QEMU_TIMEOUT_TCG: 360
+      # CI 专用 QEMU timeout（每次 QEMU 运行的上限，K0/AB 各一次）：
+      # KVM 280s: AB boot = boot ~10s + bench 6 块×24 格×~1.3s ≈ 190s
+      #   + ftrace ~15s + dump ~5s ≈ 220s，280s 含余量
+      # TCG 620s: TCG 回退（无 KVM 时），boot ~120s + 同量级 bench
+      #   + 慢速 ftrace buffer 操作 ≈ 500s；guest 侧 660s watchdog 为内层兜底
+      QEMU_TIMEOUT_KVM: 280
+      QEMU_TIMEOUT_TCG: 620
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -592,11 +595,12 @@ jobs:
           echo "=== KVM availability ==="
           ls -la /dev/kvm 2>/dev/null && echo "  /dev/kvm: exists" || echo "  /dev/kvm: not found (will fallback to TCG)"
           echo ""
-          # K0=OFF内核(基线), K3=ON内核+dump查询(最坏情形)；K2 已移除(20260817)
+          # 20260819 v3 同 boot A/B（static key 运行时开关）：
+          #   boot1 K0 = OFF 内核（仅 slab 基线，编译期确定值）
+          #   boot2 AB = ON 内核（同 boot 交错翻转 OFF/ON 测 24 格矩阵，
+          #   消除二进制布局差异与启动间漂移，Δ = 纯 hook 开销）
           # --strict=warn: FAIL/INVALID 均为告警（exit 0），不阻断；
           #   仅 NO-DATA（全 SKIP）或 INVALID>50%（数据不可信）才 exit 2。
-          # 20260816 方案重建：固定工作量微基准（bench-net）替代 iperf3，
-          #   无 --test-duration/--warmup 参数（bench 自动校准每轮 ~1s）
           # exit code: 0=PASS/warn通过, 2=数据不可信(NO-DATA/INVALID>50%)
           #   continue-on-error 保证 exit 2 也不阻断 workflow
           ./perf-test.sh --skip-build --strict=warn \
@@ -612,12 +616,8 @@ jobs:
             tests/reports/perf/perf-test-*.log
             tests/reports/perf/perf-summary-*.md
             tests/reports/perf/perf-summary-*.csv
-            tests/reports/perf/perf-WARM-*.log
             tests/reports/perf/perf-K0-*.log
-            tests/reports/perf/perf-K0R-*.log
-            tests/reports/perf/perf-K3-*.log
-            tests/reports/perf/perf-K3R-*.log
-            tests/reports/perf/perf-K0B-*.log
+            tests/reports/perf/perf-AB-*.log
           retention-days: 30
 
       - name: Generate perf summary
@@ -631,7 +631,7 @@ jobs:
             PERF_LOG=$(ls -t tests/reports/perf/perf-test-*.log 2>/dev/null | head -1)
             if [ -n "$PERF_LOG" ]; then
               {
-                echo "## Performance Test Results (K0 vs K3)"
+                echo "## Performance Test Results (same-boot A/B)"
                 echo ""
                 echo "### Verdict Summary"
                 echo '```'
@@ -645,7 +645,7 @@ jobs:
             fi
           fi
 
-          # 诊断段：把每个模式的 PERF 行数 + QEMU rc 写进 Summary，
+          # 诊断段：把每个 boot 的 PERF 行数 + QEMU rc 写进 Summary，
           # 全 SKIP / NO-DATA 时无需翻原始日志即可定位（rc=124=TCG 超时 / 0 行=guest 未启动）
           PERF_LOG=$(ls -t tests/reports/perf/perf-test-*.log 2>/dev/null | head -1)
           if [ -n "$PERF_LOG" ] && [ -f "$PERF_LOG" ]; then
@@ -653,11 +653,11 @@ jobs:
               echo ""
               echo "### QEMU Run Diagnostics"
               echo ""
-              echo "| Mode | PERF lines | QEMU rc | Note |"
+              echo "| Boot | PERF lines | QEMU rc | Note |"
               echo "|------|-----------|---------|------|"
-              # WARM = 预热启动（不参与判定）；K0R/K3R = 交错重复启动（并入 K0/K3）
-              for mode in WARM K0 K3 K0R K3R K0B; do
-                # K3 log 可能不存在（get_sockdelays 缺失或构建失败时降级），加 || true 避免 set -e 中断 summary
+              # K0 = OFF 内核（slab 基线）；AB = ON 内核（同 boot A/B 全套）
+              for mode in K0 AB; do
+                # AB log 可能不存在（ON 内核构建失败时降级），加 || true 避免 set -e 中断 summary
                 mode_log=$(ls -t tests/reports/perf/perf-${mode}-*.log 2>/dev/null | head -1 || true)
                 [ -z "$mode_log" ] && { echo "| ${mode} | - | - | 未运行 |"; continue; }
                 n=$(grep -c "^PERF:" "$mode_log" 2>/dev/null || true)
@@ -666,9 +666,15 @@ jobs:
                 note=""
                 [ "$rc" = "124" ] && note="TCG/KVM 超时"
                 [ "$n" = "0" ] && note="${note:+$note; }guest 未产出 PERF 行（启动/panic/超时）"
+                # AB boot 模式自检（旧 bzImage-on 无 static key 开关时提示）
+                if [ "$mode" = "AB" ]; then
+                  m=$(grep "^PERF: mode=" "$mode_log" 2>/dev/null | head -1 | cut -d= -f2 || true)
+                  [ -n "$m" ] && [ "$m" != "AB" ] && note="${note:+$note; }mode=${m}（预期 AB：开关缺失/旧内核？）"
+                  grep -q "^PERF: switch_check=fail" "$mode_log" 2>/dev/null && note="${note:+$note; }开关翻转失败"
+                fi
                 echo "| ${mode} | ${n} | ${rc} | ${note:--} |"
               done
               echo ""
-              echo "> K3 显示 \"-\" 表示 get_sockdelays 未就位或 QEMU 未产出数据"
+              echo "> AB 显示 \"-\" 表示 ON 内核未产出数据；mode≠AB 提示 bzImage-on 未含 static key 开关补丁"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
