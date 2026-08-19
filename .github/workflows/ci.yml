@@ -23,6 +23,10 @@ jobs:
           fetch-depth: 1
 
       - name: Install dependencies
+        # step 级 10min 兜底：劣化 runner 上 apt 会挂进不可杀状态（#188/#189
+        # 实测 SIGTERM 级 shell timeout 无效，31min 仍不退出），GitHub 原生
+        # 超时由 runner 杀整个进程组才有效
+        timeout-minutes: 10
         run: |
           # 托管 runner apt 镜像偶发拥堵/挂起（#188 三个 job 卡本步骤 40min 被迫取消）：
           # timeout 防挂起 + 3 次重试；最终失败 fail fast（避免后续步骤混淆报错）
@@ -90,8 +94,10 @@ jobs:
           fetch-depth: 1
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
-          # 托管 runner apt 镜像偶发拥堵/挂起（#188 卡本步骤 40min）：timeout 防挂起 + 重试
+          # 托管 runner apt 镜像偶发拥堵/挂起（#188/#189 卡本步骤 31min+）：
+          # timeout 防挂起 + 重试；step 级超时兜底不可杀挂起
           for i in 1 2 3; do
             timeout 120 sudo apt-get update && break
             echo "apt update retry $i"; sleep $((i*15))
@@ -201,8 +207,10 @@ jobs:
           fetch-depth: 1
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
-          # 托管 runner apt 镜像偶发拥堵/挂起（#188 卡本步骤 40min）：timeout 防挂起 + 重试
+          # 托管 runner apt 镜像偶发拥堵/挂起（#188/#189 卡本步骤 31min+）：
+          # timeout 防挂起 + 重试；step 级超时兜底不可杀挂起
           for i in 1 2 3; do
             timeout 120 sudo apt-get update && break
             echo "apt update retry $i"; sleep $((i*15))
